@@ -1,0 +1,11 @@
+[package]
+name = "esp-mint"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+mint-core = { git = "https://github.com/dav-anderson/mint-core" }
+mint-types = { git = "https://github.com/dav-anderson/mint-core" }
+bdhke = { git = "https://github.com/dav-anderson/mint-core" }
+sandbox-mint-server = { git = "https://github.com/dav-anderson/mint-core" }

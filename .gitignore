@@ -1,0 +1,7 @@
+/target
+/data
+mint_keys.json
+*.db
+.env
+.env.*
+.DS_Store
