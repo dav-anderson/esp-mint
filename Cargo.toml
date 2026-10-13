@@ -2,10 +2,15 @@
 name = "esp-mint"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 
 [dependencies]
-mint-core = { git = "https://github.com/dav-anderson/mint-core" }
-mint-types = { git = "https://github.com/dav-anderson/mint-core" }
-bdhke = { git = "https://github.com/dav-anderson/mint-core" }
-sandbox-mint-server = { git = "https://github.com/dav-anderson/mint-core" }
+mint-core = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+mint-types = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+bdhke = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+mint-server = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "rand"] }
+sha2 = "0.10"
+hex = "0.4.3"
+rand = "0.8.5"
