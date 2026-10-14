@@ -84,7 +84,7 @@ The fee notes are burned and not reissued. Each fee is 1 unit for now, a placeho
 - **Retries.** If the process dies after notes are burned and before the signatures are returned, the caller loses them. Storing the response by request hash would let a retry return the same signatures.
 - **Master secret protection.** It is a plain file with `0600` permissions. How the real secret is protected is not decided.
 - **Redeem window.** 365 days is a placeholder.
-- **Exchange rate.** 1 ESP per PSP is a placeholder.
+- **Exchange rate.** 1 ESP per PSP is a placeholder. Scaling up the unit ratio, so that ESP is issued at a higher ratio to PSP, is deferred. The ratio is not set, but it needs to be decided at some point.
 - **Fee amounts.** 1 unit per request is a placeholder.
 
 ## Not decided yet
