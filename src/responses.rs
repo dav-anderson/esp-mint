@@ -53,7 +53,6 @@ pub enum Entry {
     /// later day still issues the same notes.
     Pending {
         redeemable_after_day: u64,
-        credit_esp: u128,
     },
     Done(ExchangeResponse),
 }
@@ -135,7 +134,6 @@ mod tests {
         assert!(store.is_empty());
         let entry = Entry::Pending {
             redeemable_after_day: 21_100,
-            credit_esp: u128::from(u64::MAX) * 1_000,
         };
         store.put("abc", entry.clone()).unwrap();
         let again = Responses::open(&path).unwrap();
@@ -168,7 +166,6 @@ mod tests {
                 "h",
                 Entry::Pending {
                     redeemable_after_day: 1,
-                    credit_esp: 0,
                 },
             )
             .unwrap();

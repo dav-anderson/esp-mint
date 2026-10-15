@@ -6,6 +6,12 @@
 //! mint fee. The date is set by the mint (the day of issue plus 365), never by
 //! the requester.
 //!
+//! The exchange is exact: the PSP notes, times 10^12, must equal the total of
+//! the ESP outputs. There is no excess to keep and no credit. A request that
+//! does not match is refused before anything is burned. The smallest exchange is
+//! 1 PSP (10^12 ESP). Over and under thresholds belong to the PSP's BTC
+//! purchase only.
+//!
 //! Order of events, and why it is safe to retry at any point:
 //!
 //! 1. Check the request. Nothing is written yet, and the PSP notes and the ESP
@@ -60,9 +66,6 @@ pub struct ExchangeResponse {
     pub signatures: Vec<PublicKey>,
     /// The public key each output was signed with, for unblinding.
     pub keys: Vec<PublicKey>,
-    /// ESP units recorded as credit because the PSP notes were worth 10% or
-    /// more over the outputs. Zero otherwise.
-    pub credit_esp: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,8 +78,10 @@ pub enum Rejection {
     DuplicateBlindNonce,
     BlindNonceAlreadyUsed,
     Overflow,
-    /// The PSP notes are worth less than the outputs.
-    Underpaid { paid: u128, requested: u128 },
+    /// The outputs total less than 1 PSP (10^12 ESP units), the smallest exchange.
+    BelowMinimum { requested: u128 },
+    /// The PSP notes, times 10^12, do not equal the outputs' total.
+    NotExact { paid: u128, requested: u128 },
     /// A spend signature does not cover this request.
     BadSpendSignature,
     /// A PSP note is already spent.
@@ -94,10 +99,22 @@ impl fmt::Display for Rejection {
             Rejection::DuplicateBlindNonce => write!(f, "an output blind nonce is listed twice"),
             Rejection::BlindNonceAlreadyUsed => write!(f, "an output blind nonce was already used"),
             Rejection::Overflow => write!(f, "amounts are too large"),
-            Rejection::Underpaid { paid, requested } => write!(
+            Rejection::BelowMinimum { requested } => write!(
                 f,
-                "PSP notes are worth {paid} ESP units but the outputs total {requested}"
+                "the smallest exchange is 1 PSP ({ESP_PER_PSP} ESP units) but the outputs total {requested}"
             ),
+            Rejection::NotExact { paid, requested } => {
+                let (word, gap) = if paid > requested {
+                    ("over", paid - requested)
+                } else {
+                    ("short", requested - paid)
+                };
+                write!(
+                    f,
+                    "an exchange must be exact: the PSP notes are worth {paid} ESP units ({} PSP) and the outputs total {requested}, which is {word} by {gap}. Nothing was burned",
+                    paid / u128::from(ESP_PER_PSP)
+                )
+            }
             Rejection::BadSpendSignature => {
                 write!(f, "a spend signature does not cover this request")
             }
@@ -172,23 +189,20 @@ pub fn request_hash(request: &ExchangeRequest) -> Result<String, ExchangeError> 
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// The credit for a request: the excess of what was paid over what was
-/// requested if it is 10% or more of the request, otherwise zero (the mint
-/// keeps a smaller excess). Less than requested is an error.
-pub fn assess(paid: u128, requested: u128) -> Result<u128, Rejection> {
-    if paid < requested {
-        return Err(Rejection::Underpaid { paid, requested });
+/// The exact rule. `paid` is the PSP notes' value in ESP units and `requested`
+/// is the outputs' total. The smallest exchange is 1 PSP, and the two must be
+/// equal: the mint keeps no excess and records no credit.
+pub fn check_exact(paid: u128, requested: u128) -> Result<(), Rejection> {
+    if requested < u128::from(ESP_PER_PSP) {
+        return Err(Rejection::BelowMinimum { requested });
     }
-    let excess = paid - requested;
-    let ten_times = excess.checked_mul(10).ok_or(Rejection::Overflow)?;
-    Ok(if ten_times >= requested { excess } else { 0 })
+    if paid != requested {
+        return Err(Rejection::NotExact { paid, requested });
+    }
+    Ok(())
 }
 
-struct Plan {
-    credit: u128,
-}
-
-fn validate(request: &ExchangeRequest) -> Result<Plan, Rejection> {
+fn validate(request: &ExchangeRequest) -> Result<(), Rejection> {
     if request.psp_inputs.is_empty() {
         return Err(Rejection::NoInputs);
     }
@@ -218,9 +232,7 @@ fn validate(request: &ExchangeRequest) -> Result<Plan, Rejection> {
         .checked_mul(u128::from(ESP_PER_PSP))
         .ok_or(Rejection::Overflow)?;
     let requested = units::total(request.outputs.iter().map(|o| o.amount.units));
-    Ok(Plan {
-        credit: assess(paid, requested)?,
-    })
+    check_exact(paid, requested)
 }
 
 /// Run an exchange. `now_unix` sets the redeemable-after day for a new request.
@@ -232,7 +244,7 @@ pub fn exchange(
     now_unix: u64,
     request: &ExchangeRequest,
 ) -> Result<ExchangeResponse, ExchangeError> {
-    let plan = validate(request)?;
+    validate(request)?;
     let hash = request_hash(request)?;
     let memo = memo(&request.service, &request.outputs);
     let nonces: Vec<Nonce> = request.psp_inputs.iter().map(|i| i.note.nonce).collect();
@@ -281,7 +293,6 @@ pub fn exchange(
                 &hash,
                 Entry::Pending {
                     redeemable_after_day,
-                    credit_esp: plan.credit,
                 },
             )
             .map_err(internal)?;
@@ -321,7 +332,6 @@ pub fn exchange(
         redeemable_after_day,
         signatures,
         keys,
-        credit_esp: plan.credit,
     };
     responses
         .put(&hash, Entry::Done(response.clone()))
@@ -549,7 +559,6 @@ mod tests {
 
         assert_eq!(response.service, service());
         assert_eq!(response.redeemable_after_day, NOW / 86_400 + 365);
-        assert_eq!(response.credit_esp, 0);
         assert_eq!(s.esp_issued(), ONE_PSP);
         assert!(s.psp.logic.is_spent(note.nonce).unwrap());
 
@@ -661,44 +670,80 @@ mod tests {
     }
 
     #[test]
-    fn underpaying_is_refused_before_anything_is_burned() {
-        let mut s = setup("under");
-        let (note, keypair) = s.psp.note(1);
-        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP + 1], None);
+    fn a_mismatch_is_refused_before_anything_is_burned_whichever_way_it_is_off() {
+        let mut s = setup("mismatch");
+        let (note, keypair) = s.psp.note(2);
+        let paid = 2 * u128::from(ONE_PSP);
+        // one ESP unit short of the PSP value
+        let (request, _) = build(&[(note, &keypair, 2)], &[2 * ONE_PSP - 1], None);
         assert_eq!(
             rejection(s.run(&request)),
-            Rejection::Underpaid {
-                paid: u128::from(ONE_PSP),
-                requested: u128::from(ONE_PSP) + 1
-            }
+            Rejection::NotExact { paid, requested: paid - 1 }
         );
+        // one ESP unit over
+        let (request, _) = build(&[(note, &keypair, 2)], &[2 * ONE_PSP + 1], None);
+        assert_eq!(
+            rejection(s.run(&request)),
+            Rejection::NotExact { paid, requested: paid + 1 }
+        );
+        // too small an exchange, and one that is not exact, are both refused
+        let (request, _) = build(&[(note, &keypair, 2)], &[ONE_PSP], None);
+        assert!(matches!(rejection(s.run(&request)), Rejection::NotExact { .. }));
+        let (request, _) = build(&[(note, &keypair, 2)], &[ONE_PSP * 100 / 105], None);
+        assert!(matches!(rejection(s.run(&request)), Rejection::BelowMinimum { .. }));
         assert!(!s.psp.logic.is_spent(note.nonce).unwrap());
         assert_eq!(s.psp.melts.get(), 0);
         assert!(s.responses.is_empty());
+        assert_eq!(s.esp_issued(), 0);
+        // and the exact request still works afterwards
+        let (request, _) = build(&[(note, &keypair, 2)], &[ONE_PSP, ONE_PSP], None);
+        s.run(&request).unwrap();
+        assert_eq!(s.esp_issued(), 2 * ONE_PSP);
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
     #[test]
-    fn a_small_excess_is_kept_and_a_large_one_is_credit() {
-        let mut s = setup("excess");
-        // 5% over what was asked for: kept
+    fn the_error_says_which_way_it_is_off() {
+        let over = Rejection::NotExact { paid: 3 * u128::from(ONE_PSP), requested: 2 * u128::from(ONE_PSP) };
+        let short = Rejection::NotExact { paid: 2 * u128::from(ONE_PSP), requested: 3 * u128::from(ONE_PSP) };
+        assert!(over.to_string().contains("over by 1000000000000"));
+        assert!(short.to_string().contains("short by 1000000000000"));
+        assert!(over.to_string().contains("Nothing was burned"));
+        let low = Rejection::BelowMinimum { requested: 5 };
+        assert!(low.to_string().contains("smallest exchange is 1 PSP (1000000000000 ESP units)"));
+    }
+
+    #[test]
+    fn the_smallest_exchange_is_one_psp() {
+        assert_eq!(check_exact(u128::from(ONE_PSP), u128::from(ONE_PSP)), Ok(()));
+        assert_eq!(
+            check_exact(0, u128::from(ONE_PSP) - 1),
+            Err(Rejection::BelowMinimum { requested: u128::from(ONE_PSP) - 1 })
+        );
+        // below the minimum is reported as such even when the PSP side is larger
+        assert_eq!(
+            check_exact(u128::from(ONE_PSP), 1),
+            Err(Rejection::BelowMinimum { requested: 1 })
+        );
+        let mut s = setup("minimum");
         let (note, keypair) = s.psp.note(1);
-        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP * 100 / 105], None);
-        assert_eq!(s.run(&request).unwrap().credit_esp, 0);
-        // twice what was asked for: the excess is credit
-        let (note, keypair) = s.psp.note(1);
-        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP / 2], None);
-        assert_eq!(s.run(&request).unwrap().credit_esp, u128::from(ONE_PSP / 2));
+        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP - 1], None);
+        assert_eq!(
+            rejection(s.run(&request)),
+            Rejection::BelowMinimum { requested: u128::from(ONE_PSP) - 1 }
+        );
+        assert!(!s.psp.logic.is_spent(note.nonce).unwrap());
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
     #[test]
-    fn the_ten_percent_boundary_is_credit() {
-        assert_eq!(assess(100, 100), Ok(0));
-        assert_eq!(assess(109, 100), Ok(0));
-        assert_eq!(assess(110, 100), Ok(10));
-        assert_eq!(assess(111, 100), Ok(11));
-        assert_eq!(assess(99, 100), Err(Rejection::Underpaid { paid: 99, requested: 100 }));
+    fn exactness_is_checked_in_u128() {
+        let one = u128::from(ONE_PSP);
+        assert_eq!(check_exact(units::psp_to_esp(u64::MAX), units::psp_to_esp(u64::MAX)), Ok(()));
+        assert!(check_exact(units::psp_to_esp(u64::MAX), units::psp_to_esp(u64::MAX) - 1).is_err());
+        let many = units::total(std::iter::repeat(u64::MAX).take(MAX_ITEMS));
+        assert_eq!(check_exact(many, many), Ok(()));
+        assert_eq!(check_exact(many + one, many), Err(Rejection::NotExact { paid: many + one, requested: many }));
     }
 
     #[test]
@@ -824,16 +869,16 @@ mod tests {
         let (request, _) = build(&[(note, &keypair, 1)], &[u64::MAX, u64::MAX], None);
         assert_eq!(
             rejection(s.run(&request)),
-            Rejection::Underpaid {
+            Rejection::NotExact {
                 paid: u128::from(ONE_PSP),
                 requested: 2 * u128::from(u64::MAX)
             }
         );
         // the largest note and the largest sum of notes still compute
-        assert!(assess(units::psp_to_esp(u64::MAX), u128::from(u64::MAX)).is_ok());
+        assert!(check_exact(units::psp_to_esp(u64::MAX), units::psp_to_esp(u64::MAX)).is_ok());
         let many = units::total(std::iter::repeat(u64::MAX).take(MAX_ITEMS));
         assert_eq!(many, u128::from(u64::MAX) * MAX_ITEMS as u128);
-        assert!(assess(many, many).is_ok());
+        assert!(check_exact(many, many).is_ok());
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
@@ -842,8 +887,7 @@ mod tests {
         let mut s = setup("large");
         let (note, keypair) = s.psp.note(1024);
         let (request, _) = build(&[(note, &keypair, 1024)], &[1024 * ONE_PSP], None);
-        let response = s.run(&request).unwrap();
-        assert_eq!(response.credit_esp, 0);
+        s.run(&request).unwrap();
         assert_eq!(s.esp_issued(), 1024 * ONE_PSP);
         fs::remove_dir_all(&s.dir).unwrap();
     }

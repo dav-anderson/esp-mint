@@ -166,7 +166,6 @@ fn an_exchange_over_http_burns_the_psp_and_issues_verifiable_esp() {
     let (code, body) = post_json(&esp, "/exchange", &req);
     assert_eq!(code, 200, "{body}");
     let response: ExchangeResponse = serde_json::from_value(body.clone()).unwrap();
-    assert_eq!(response.credit_esp, 0);
 
     // the signatures verify under the keys derived for these terms
     let master =

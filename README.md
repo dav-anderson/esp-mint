@@ -11,6 +11,8 @@ Built:
 - Per-terms key derivation and the master secret file (`src/keys.rs`).
 - The PSP-to-ESP exchange (`src/exchange.rs`), its stored responses (`src/responses.rs`), the PSP client (`src/psp_client.rs`) and the HTTP API (`src/server.rs`, run with `esp-mint serve`).
 
+- The redemption queue file and the payout report (`src/queue.rs`, `src/payouts.rs`, `src/admin.rs`; commands `esp-mint payouts` and `esp-mint pay`, and the operator's HTTP routes). The queue is only a store so far: redemption, which will add the entries, is not built.
+
 Designed but not built: transfer, redemption and the redeem fee. See "Transfer to the service", "Redemption", "Fees" and "Left to do".
 
 ## Keys
@@ -45,12 +47,12 @@ The master secret is a file of 64 hex characters, `master_secret.hex`, with `060
 
 Built.
 
-1. The wallet sends PSP notes and blinded outputs to the ESP mint, along with the service ID it wants. It does not send a date. The outputs can have any non-zero amount, and a request holds at most 1000 notes and 1000 outputs.
-2. The PSP notes, times 10^12, must be worth at least the total of the ESP outputs, or the request is rejected before anything is burned. The mint charges no exchange fee. The request is a JAMJAR message, and its cost is paid in JAMJAR currency and charged by JAMJAR messaging, not by this mint. Excess below 10% of the outputs' total is kept by the mint, so wallets should send exact amounts. Excess of 10% or more is recorded as credit in the response (`credit_esp`). See "Overpayment".
+1. The wallet sends PSP notes and blinded outputs to the ESP mint, along with the service ID it wants. It does not send a date. The outputs can have any non-zero amount, and a request holds at most 1000 notes and 1000 outputs. The smallest exchange is 1 PSP (10^12 ESP).
+2. The PSP notes, times 10^12, must equal the total of the ESP outputs exactly, or the request is refused before anything is burned. See "Exact amounts and the minimum". The mint charges no exchange fee. The request is an AIR message, and its cost is paid in AIR currency and charged by AIR messaging, not by this mint.
 3. The mint checks everything it can before it burns: the output blind nonces are unused, the PSP notes are unspent at the PSP (`/check-state`), and every note's spend signature verifies over the memo below. The spend signatures are public to check, and they cover the memo, so only the holder of the notes can authorize this request.
 4. The ESP mint calls the PSP's `/melt` with the notes. The memo is the hex of `SHA-256("esp-mint/exchange/v1" || service || each output's amount and blind nonce)`, and the wallet's spend signatures cover that memo. The burn is bound to this one request. The mint checks that the PSP burned exactly the amount it expected.
 5. If the burn succeeds, the ESP mint derives the keys for the terms and issues each output with `MintLogic::issue_with_key`. It uses that method and not `issue` because the key depends on the note's terms as well as its amount. See the docs on `MintLogic::issue_with_key` in mint-core.
-6. It returns the service, the redeemable-after day, one blind signature per output in the request's order, the public key each was signed with (the wallet needs it to unblind), and `credit_esp`.
+6. It returns the service, the redeemable-after day, one blind signature per output in the request's order, and the public key each was signed with (the wallet needs it to unblind).
 
 **Retries.** Responses are stored by request hash, `SHA-256("esp-mint/exchange-request/v1" || memo || the PSP inputs as JSON)`. The hash covers the inputs, spend signatures included, so a request with different inputs never gets another request's response. The stored state has two steps:
 
@@ -61,6 +63,8 @@ A retry of a done request returns the stored response and burns nothing. A retry
 
 Not yet handled: a crash between the mint marking an output's blind nonce used and adding its amount to the issued total would leave the issued total short by that output, until the retry finishes it.
 
+**Wallet.** `ecash-wallet exchange --service <x-only hex> --psp N` builds this request, sends it to `/exchange` and unblinds the reply into ESP notes (see the ecash-wallet README). The wallet picks PSP notes worth at least N and asks for all of their value, so the request is always exact: N PSP of ESP, plus any difference as extra ESP notes under the same terms (change). It saves the request, the blinding factors and the new spend keys before sending, so after a timeout `exchange --resume <id>` sends the same request again and gets the stored response. A `400` means nothing was burned and the wallet frees its PSP notes. Each ESP note is stored with its spend key, its amount and its terms (service and redeemable-after day).
+
 ## HTTP API
 
 `esp-mint serve` runs the API. Settings are environment variables:
@@ -70,6 +74,8 @@ Not yet handled: a crash between the mint marking an output's blind nonce used a
 | `ESP_DATA_DIR` | `~/.esp-mint` (the master secret, `db/` and `responses.json`) |
 | `ESP_BIND` | `127.0.0.1:3100` |
 | `ESP_PSP_URL` | `http://127.0.0.1:3000` (`psp-mint serve`) |
+| `ESP_ADMIN_BIND` | `127.0.0.1:3101`, the operator's routes. Must be a loopback address or `serve` will not start. |
+| `ESP_ADMIN_TOKEN` | Not set. If set, the operator's routes need `Authorization: Bearer <token>`. |
 
 | Route | What it does |
 |---|---|
@@ -87,7 +93,7 @@ An app that pays a service with ESP hands over the notes, and with them each not
 
 - **Request.** The service's ESP inputs, fresh blinded outputs that the service chose, and the terms. One request covers one set of terms.
 - **Digest.** `SHA-256("esp-mint/transfer/v1" || terms || the inputs || the outputs)`. Every input is signed over it by the note's own nonce key, which the service now holds. The service also signs it with its x-only key from the terms. Only the named service can ask for a transfer.
-- **Checks.** Before anything is burned: every input is genuine under the key derived for its amount and terms, all signatures verify, the output blind nonces are unused (`MintLogic::is_blind_nonce_used`), and the inputs and outputs have the same total (summed in `u128`). The mint charges no transfer fee. The request is a JAMJAR message, and its cost is paid in JAMJAR currency and charged by JAMJAR messaging.
+- **Checks.** Before anything is burned: every input is genuine under the key derived for its amount and terms, all signatures verify, the output blind nonces are unused (`MintLogic::is_blind_nonce_used`), and the inputs and outputs have the same total (summed in `u128`). The mint charges no transfer fee. The request is an AIR message, and its cost is paid in AIR currency and charged by AIR messaging.
 - **Result.** The inputs are burned with `MintLogic::redeem_with_key` and the outputs are signed under the same terms with `MintLogic::issue_with_key`.
 - **Double presentation.** The service issues FSP only after its transfer succeeds, one FSP unit for each ESP unit. If the note was already presented, the transfer fails and no FSP is issued.
 
@@ -123,32 +129,58 @@ Only the owner of a service's DID key may redeem ESP for that service. The servi
   - All sums are `u128` or checked.
 - **Idempotence.** Responses are stored by request hash, so a retry of the same request returns the same result and the same queue entry, and never burns or charges twice.
 
+## Payout report
+
+Redemption entries are paid by hand (see "Redemption"). The report adds up what is owed to each service so the operator pays each one once, and `pay` then records the payment. Both work on the queue file, `queue.json` in the data directory. It is a development placeholder like `responses.json`: one JSON file, rewritten whole on every change. Redemption is not built, so nothing adds entries yet. The entries it will add are the ones this report reads: an id (the request hash), the service, the amount owed in ESP, the payout memo, the time and a status.
+
+**The report.** `esp-mint payouts` prints it as text and `esp-mint payouts --json` as JSON. For each service with open entries it shows:
+
+- the service ID (its DID public key, x-only hex);
+- the total owed in ESP and in USD at 10^12 ESP per $1 (exact, 12 decimal places), summed in `u128`;
+- the number of entries, and the dates of the oldest and newest;
+- the entry IDs, oldest first;
+- the payout memos, each with the entries and the amount under it.
+
+Declined and completed entries are left out. If one service's entries have different payout memos, every memo is shown and the group is flagged `memo_mismatch` (`MEMO MISMATCH` in the text). The mint does not choose between them. The operator decides where to pay and settles each memo's entries on its own. For example, XYZ redeems $10 on day 1 and $5 on day 2 to the same destination, and the report shows one line owing $15.000000000000 for 2 entries.
+
+**Settling.** After paying, run `esp-mint pay <service> <ref> <entry id>...`, with the exact entry IDs from the report and one payment reference (a txid, a wire number). It marks exactly those entries completed with that reference, and nothing else. An entry queued after the report was run is not in the list, so it stays open for the next report. It is all or nothing: nothing changes unless every listed entry exists, belongs to that service and is open, no ID is repeated, the reference is not empty, and the entries share one payout memo. If they have different memos the command refuses and names them; `--mixed-memos` overrides that when one payment really covers them. If the payout itself failed, do not run `pay`, and the entries stay open and are retried. If the file cannot be written, the command fails and the entries stay open.
+
+**HTTP.** The routes are on their own listener (`ESP_ADMIN_BIND`), not on the public API's port:
+
+| Route | What it does |
+|---|---|
+| `GET /payouts` | The report, as JSON. `?format=text` for plain text. Amounts are decimal strings, because they can pass 2^53. |
+| `POST /payouts/pay` | Body `{"service": "<hex>", "payment_ref": "...", "entry_ids": ["..."], "mixed_memos": false}`. `200` with what was paid, `400` if refused (nothing changed), `500` if the file could not be written (the entries stay open). `?format=text` for plain text. |
+
+Each request reads the queue file afresh, so a change made by `esp-mint pay` shows at once. `payouts` and `pay` on the command line never open the mint's database, so they run while `serve` is up. Two processes settling at the same moment is a race and is not guarded: use one of them at a time.
+
 ## Fees
 
 The only explicit mint fee in ESP is the redeem fee, paid in ESP and burned. It is a placeholder of 10^12 ESP (1 PSP, about $1) set in config. It is charged once per request that passes the signature check, however the request ends. See "Redemption".
 
-There is no exchange fee and no transfer fee. Those requests are JAMJAR messages, and their cost is paid in JAMJAR currency and charged by JAMJAR messaging, not by the mints. Services set their FSP fees in their own FSP mints.
+There is no exchange fee and no transfer fee. Those requests are AIR messages, and their cost is paid in AIR currency and charged by AIR messaging, not by the mints. Services set their FSP fees in their own FSP mints.
 
-## Overpayment
+## Exact amounts and the minimum
 
-The same rule as the PSP applies to an exchange.
+An exchange is exact. The PSP notes, times 10^12, must equal the total of the ESP outputs, summed in `u128`. If they differ, in either direction, the request is refused before anything is burned, with an error that says whether it is over or short and by how much. The mint keeps no excess and records no credit, and there is no `credit_esp`.
 
-- **Below 10% over** (the PSP notes times 10^12, against the total of the ESP outputs): the mint keeps the excess.
-- **10% or more over:** the mint issues the requested outputs and records the excess as credit against the request hash.
+The smallest exchange is 1 PSP (10^12 ESP). An outputs total below that is refused with its own error. Because PSP notes are whole units, an exact exchange is always a whole number of PSP.
 
-The procedure for credit, a **placeholder that is not built**: the mint sends a message to the payer's DID over JAMJAR, signed with the mint's DID key, saying how much credit there is and asking for a new request for the remainder. The buyer's reply is a JAMJAR message, paid for by the buyer in JAMJAR currency (PSP, ESP or FSP). JAMJAR messaging does not exist yet, and exchange requests do not yet carry a reply DID, so today the credit would only be recorded. An underpayment is not tolerated on the ESP: the request is rejected before anything is burned.
+The over and under thresholds (1% under, 10% over) apply to the PSP's BTC purchase only. See the psp-mint README.
+
+A wallet that holds more PSP than it wants to hand a service asks for all of the PSP it spends: the amount for the service, and the rest as extra ESP notes under the same terms (the same service and redeemable-after day). That change is ESP, so it cannot be turned back into PSP. See the ecash-wallet README.
 
 ## Left to do
 
 - **Transfer and redemption.** Designed above, not built. The exchange is built and its API runs. Transfer and redemption will use the same stored-response pattern.
-- **Redemption queue.** How entries are approved, declined and completed. Payouts are manual, in BTC, USD or another agreed method, for now.
+- **Redemption queue.** The store and the payout report are built (see "Payout report"). Adding entries, and how entries are approved and declined, wait on redemption. Payouts are manual, in BTC, USD or another agreed method, for now.
 - **Redemption store (deferred to the AIR).** The queue and the stored responses move into the AIR. Until then they are local files.
 - **Terms check.** The mint decides by hand whether a service met its terms. How to check uptime by machine is not designed.
-- **Overpayment credit.** The credit is recorded only. The JAMJAR message to the payer's DID is a placeholder and the exchange request has no reply DID field yet.
 - **Retries and crash safety for transfer and redemption.** The exchange stores its response by request hash and recovers from a crash after the burn. The transfer and the redeem also burn inputs and then issue outputs or queue an entry, and mint-core's `swap` does not do both in one step. They need the same treatment: the same signatures for a transfer, and the same queue entry or reissued notes for a redeem.
 - **ESP denominations.** The exchange accepts any non-zero output amount, and a key is derived for each. Whether amounts should be restricted to a ladder, to limit how much an amount reveals, is not decided.
+- **Wallet transfer and redeem.** `ecash-wallet` has entry points for ESP transfer and redemption that return "not built". They wait on the mint's `/transfer` and `/redeem`.
 - **Hold time.** The API holds the mint lock while it waits on the PSP. A slow PSP blocks every ESP request.
-- **Local store is for development.** The mint's database (sled) is on local disk only while the other pieces are built. It will eventually be stored in the JAMJAR. Until then: only one process can open the mint, so there is one instance and an outage while it restarts; a live `db/` must not be copied as a backup (stop the process first, or the copy may be inconsistent); and the data directory is on local disk, so losing it loses the keys and the state.
+- **Local store is for development.** The mint's database (sled) is on local disk only while the other pieces are built. It will eventually be stored in the AIR. Until then: only one process can open the mint, so there is one instance and an outage while it restarts; a live `db/` must not be copied as a backup (stop the process first, or the copy may be inconsistent); and the data directory is on local disk, so losing it loses the keys and the state.
 - **Master secret protection (deferred to the AIR).** It is a plain file with `0600` permissions. The mint keystore moves into the AIR, and how the secret is protected there is not decided.
 - **API over the AIR (deferred).** All mint API calls will travel over the AIR. HTTP is the development transport.
 - **Redeem window.** 365 days is a placeholder.
