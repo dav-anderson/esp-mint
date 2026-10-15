@@ -106,11 +106,12 @@ The procedure for credit, a **placeholder that is not built**: the mint sends a 
 
 ## Left to do
 
-- **The exchange, transfer and redemption.** Everything above. They need the PSP to run mintd's HTTP API in-process.
+- **The exchange, transfer and redemption.** Everything above. The PSP side exists: `psp-mint serve` runs the PSP's HTTP API (`/keys`, `/melt`, `/check-state`, `/audit`) in the same process as its payment scanner. The ESP mint still needs a client for it.
 - **Redemption queue.** Where the queue is stored, and how entries are approved, declined and completed. Payouts are manual, in BTC or USD, for now.
 - **Terms check.** The mint decides by hand whether a service met its terms. How to check uptime by machine is not designed.
 - **Overpayment credit.** The credit is recorded only. The JAMJAR message to the payer's DID is a placeholder and the exchange request has no reply DID field yet.
 - **Retries and crash safety.** The exchange, transfer and redeem all burn inputs and then issue outputs or queue an entry, and mint-core's `swap` does not do both in one step. If the process dies between them, the caller loses the notes. Storing the response by request hash would let a retry return the same result: the same signatures for an exchange or transfer, and the same queue entry or reissued notes for a redeem.
+- **Local store is for development.** The mint's database (sled) is on local disk only while the other pieces are built. It will eventually be stored in the JAMJAR. Until then: only one process can open the mint, so there is one instance and an outage while it restarts; a live `db/` must not be copied as a backup (stop the process first, or the copy may be inconsistent); and the data directory is on local disk, so losing it loses the keys and the state.
 - **Master secret protection.** It is a plain file with `0600` permissions. How the real secret is protected is not decided.
 - **Redeem window.** 365 days is a placeholder.
 - **Redeem fee amount.** 1 ESP unit (10^-12 USD) is a placeholder.
