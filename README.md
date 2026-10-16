@@ -8,7 +8,7 @@ esp-mint is built and tested: the PSP-to-ESP exchange, the transfer to the servi
 
 Source map: terms and the date rule (`src/terms.rs`), unit constants and checked sums (`src/units.rs`; both are re-exports of `sp-wire`, see "Wire format and versions"), per-terms key derivation (`src/keys.rs`), the exchange (`src/exchange.rs`), stored responses (`src/responses.rs`), the PSP client (`src/psp_client.rs`), the API (`src/server.rs`), the transfer (`src/transfer.rs`), redemption (`src/redeem.rs`), the queue and payout report (`src/queue.rs`, `src/payouts.rs`, `src/admin.rs`), fees (`src/fee.rs`), rotation (`src/rotation.rs`) and settings (`src/config.rs`).
 
-esp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.1.0` (git tags). It does not use the `air` crate, so nothing else is needed. To test against unpushed local copies of `sp-wire` or mint-core, `source ~/sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags (the recipe, with the plain `[patch]` form, is in the top-level README in `sandbox-mint`).
+esp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.2.0` (git tags). It does not use the `air` crate (sp-wire's `seal` feature, which pulls it in, is off here), so nothing else is needed. To test against unpushed local copies of `sp-wire` or mint-core, `source ~/sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags (the recipe, with the plain `[patch]` form, is in the top-level README in `sandbox-mint`).
 
 ## Keys
 
@@ -80,7 +80,7 @@ The tests cover a retry after the mint's own burn (it issues without burning aga
 
 The request and response bodies, the terms, the canonical redeem encoding, the request hashes, the unit constants and the error codes are defined in the `sp-wire` crate, not here. `esp-mint` re-exports them (`esp_mint::exchange::ExchangeRequest`, `esp_mint::redeem::RedeemRequest`, `esp_mint::queue::Status`, `esp_mint::rotation::RolloverRequest`, `esp_mint::terms::Terms`, `esp_mint::units::*`, and so on), so the paths did not change. The PSP and FSP mints and the wallet build against the same crate, so they cannot drift from this mint by a byte. What stays here is everything that is the mint's own: storage, the queue, fees, validation, settlement and config. The key-set ID derivation `rotation::keyset_id` stays too, because it needs the master secret.
 
-`GET /health` returns `wire_version`, the crate's `WIRE_VERSION` (1 to start). **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves. Nothing was changed on the wire by moving the types: the golden values were captured from this mint before the move, and `sp-wire` reproduces them.
+`GET /health` returns `wire_version`, the crate's `WIRE_VERSION` (2: version 1 was the first release, and version 2 changed only the sealed PSP payload, which this mint does not handle, so no ESP byte moved). **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves. Nothing was changed on the wire by moving the types: the golden values were captured from this mint before the move, and `sp-wire` reproduces them.
 
 ## HTTP API
 
