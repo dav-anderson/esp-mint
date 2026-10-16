@@ -6,49 +6,108 @@ use std::thread;
 use std::time::Duration;
 
 use esp_mint::admin::{self, AdminState};
+use esp_mint::config;
+use esp_mint::netdir;
 use esp_mint::payouts;
 use esp_mint::psp_client::HttpPsp;
 use esp_mint::responses::Responses;
 use esp_mint::server::{self, EspState};
-use esp_mint::mint;
 
 fn setting(key: &str, default: String) -> String {
     env::var(key).unwrap_or(default)
 }
 
+/// Load the settings, or say everything that is wrong with them.
+fn load_config(data_dir: &std::path::Path) -> Result<config::Loaded, Box<dyn Error>> {
+    config::load(data_dir, &config::process_env).map_err(|problems| {
+        let mut text = String::from("the settings are not valid:");
+        for problem in problems {
+            text.push_str("\n  ");
+            text.push_str(&problem);
+        }
+        text.into()
+    })
+}
+
 /// Run the ESP mint's HTTP API.
 ///
-/// Settings are environment variables:
+/// The settings are in `esp-mint.toml` in the data directory (or the file
+/// `ESP_CONFIG` names), each with an environment variable that overrides it.
+/// `esp-mint config` lists them all with the values in use. They are logged at
+/// startup, and a bad value stops the mint with a message that says which. Send
+/// the running mint `SIGHUP` to read them again: everything except the
+/// addresses, the PSP client and the admin body ceiling changes for the next
+/// request, and those say so and wait for a restart.
 ///
-/// - `ESP_DATA_DIR`, default `~/.esp-mint`: the master secret, the mint's
-///   database and the stored responses.
-/// - `ESP_BIND`, default `127.0.0.1:3100`.
-/// - `ESP_PSP_URL`, default `http://127.0.0.1:3000`: `psp-mint serve`.
-/// - `ESP_ADMIN_BIND`, default `127.0.0.1:3101`: the operator's routes (the
-///   payout report and settle). It must be a loopback address.
-/// - `ESP_ADMIN_TOKEN`, optional: if set, the operator's routes need
-///   `Authorization: Bearer <token>`.
+/// Two things are not settings. `ESP_DATA_DIR` (default `~/.esp-mint`) says where
+/// the master secret, the mint's database, the stored responses and the config
+/// file are, and `ESP_ADMIN_TOKEN` (optional, a secret, so never in a file) makes
+/// the operator's routes need `Authorization: Bearer <token>`.
 fn serve() -> Result<(), Box<dyn Error>> {
-    let home = env::var("HOME")?;
-    let data_dir = PathBuf::from(setting("ESP_DATA_DIR", format!("{home}/.esp-mint")));
-    let bind = setting("ESP_BIND", "127.0.0.1:3100".to_string());
-    let psp_url = setting("ESP_PSP_URL", "http://127.0.0.1:3000".to_string());
-    let admin_bind = admin::check_loopback(&setting("ESP_ADMIN_BIND", "127.0.0.1:3101".to_string()))?;
+    let base = data_dir()?;
+    let loaded = load_config(&base)?;
+    match &loaded.file {
+        Some(file) => println!(
+            "esp-mint settings from {}, and the environment:",
+            file.display()
+        ),
+        None => println!("esp-mint settings: no config file, so defaults and the environment:"),
+    }
+    for line in loaded.describe() {
+        println!("{line}");
+    }
+    let cfg = loaded.config;
+    netdir::refuse_legacy(&base)?;
+    let data_dir = netdir::network_dir(&base, &cfg.network);
+    std::fs::create_dir_all(&data_dir)?;
+    println!(
+        "esp-mint on {}: data in {}",
+        cfg.network,
+        data_dir.display()
+    );
+    let bind = cfg.bind.clone();
+    let psp_url = cfg.psp_url.clone();
+    let admin_bind = admin::check_loopback(&cfg.admin_bind)?;
     let admin_token = match env::var("ESP_ADMIN_TOKEN") {
         Ok(token) if token.is_empty() => return Err("ESP_ADMIN_TOKEN is set but empty".into()),
         Ok(token) => Some(token),
         Err(_) => None,
     };
 
-    let (logic, master) = mint::open(&data_dir)?;
+    let (rotor, logic) = esp_mint::rotation::Rotor::open(
+        &data_dir,
+        cfg.rotation_activation_hours,
+        cfg.rotation_period_hours,
+    )?;
+    for line in rotor.describe() {
+        println!("{line}");
+    }
+    let master = rotor.current.master.clone();
+    let rollovers = esp_mint::rotation::Rollovers::open(&data_dir)?;
     let responses = Responses::open(&data_dir.join("responses.json"))?;
     // The blocking client is made here, before the async runtime exists.
-    let psp = HttpPsp::new(&psp_url)?;
+    let psp = HttpPsp::with_timeout(&cfg.psp_url, cfg.psp_timeout_secs)?;
+    // The PSP must be on our network, or PSP notes from one chain would buy ESP
+    // on another. An unreachable PSP is refused too: the network cannot be
+    // checked.
+    let reported = psp.network().map_err(|e| {
+        format!("cannot ask the PSP at {psp_url} which network it is on: {e}. Start psp-mint serve first")
+    })?;
+    config::check_psp_network(&cfg.network, reported.as_deref())?;
+    println!(
+        "esp-mint on {}: the PSP at {psp_url} is on the same network",
+        cfg.network
+    );
     let state = Arc::new(EspState {
         logic: Mutex::new(logic),
         master,
         psp: Box::new(psp),
         responses: Mutex::new(responses),
+        queue_path: queue_path(&data_dir),
+        queue_lock: Mutex::new(()),
+        config: config::Handle::new(cfg),
+        rotor: Some(Mutex::new(rotor)),
+        rollovers: Some(Mutex::new(rollovers)),
     });
 
     // A poisoned lock means a thread panicked holding the mint, and every later
@@ -72,12 +131,40 @@ fn serve() -> Result<(), Box<dyn Error>> {
         queue_path: queue_path(&data_dir),
         lock: Mutex::new(()),
         token: admin_token,
+        esp: Some(Arc::clone(&state)),
     }));
+    let reload_state = Arc::clone(&state);
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         let admin_listener = tokio::net::TcpListener::bind(admin_bind).await?;
         println!("esp-mint api listening on http://{bind}, burning PSP at {psp_url}");
         println!("esp-mint admin listening on http://{admin_bind}");
+
+        // SIGHUP: read the settings again. A bad file changes nothing.
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let Ok(mut hangup) = signal(SignalKind::hangup()) else {
+                eprintln!("could not listen for SIGHUP, so settings change only on restart");
+                return;
+            };
+            while hangup.recv().await.is_some() {
+                match reload_state.config.reload(&base, &config::process_env) {
+                    Ok(lines) => {
+                        println!("esp-mint: SIGHUP, settings read again:");
+                        for line in lines {
+                            println!("{line}");
+                        }
+                    }
+                    Err(problems) => {
+                        eprintln!("esp-mint: SIGHUP, the settings are not valid, so none changed:");
+                        for problem in problems {
+                            eprintln!("  {problem}");
+                        }
+                    }
+                }
+            }
+        });
+
         let api = async {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
@@ -100,7 +187,18 @@ fn serve() -> Result<(), Box<dyn Error>> {
 
 fn data_dir() -> Result<PathBuf, Box<dyn Error>> {
     let home = env::var("HOME")?;
-    Ok(PathBuf::from(setting("ESP_DATA_DIR", format!("{home}/.esp-mint"))))
+    Ok(PathBuf::from(setting(
+        "ESP_DATA_DIR",
+        format!("{home}/.esp-mint"),
+    )))
+}
+
+/// The data folder of the configured network, after refusing old files.
+fn net_dir() -> Result<PathBuf, Box<dyn Error>> {
+    let base = data_dir()?;
+    let network = load_config(&base)?.config.network;
+    netdir::refuse_legacy(&base)?;
+    Ok(netdir::network_dir(&base, &network))
 }
 
 fn queue_path(data_dir: &std::path::Path) -> PathBuf {
@@ -109,22 +207,115 @@ fn queue_path(data_dir: &std::path::Path) -> PathBuf {
 
 const USAGE: &str = "usage:
   esp-mint serve
+  esp-mint config
+  esp-mint migrate      (once: move pre-network files into <ESP_DATA_DIR>/regtest)
   esp-mint payouts [--json]
-  esp-mint pay <service> <ref> <entry id>... [--mixed-memos]";
+  esp-mint pay <service> <ref> <entry id>... [--mixed-memos]
+  esp-mint decline <entry id> --reason TEXT";
+
+/// `esp-mint config`: every setting with the value in use and where it came from.
+fn run_config() -> Result<String, Box<dyn Error>> {
+    let loaded = load_config(&data_dir()?)?;
+    let mut out = match &loaded.file {
+        Some(file) => format!("settings from {}, and the environment:\n", file.display()),
+        None => "no config file, so defaults and the environment:\n".to_string(),
+    };
+    for line in loaded.describe() {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    let c = &loaded.config;
+    for line in esp_mint::rotation::describe_offline(
+        &netdir::network_dir(&data_dir()?, &c.network),
+        c.rotation_activation_hours,
+        c.rotation_period_hours,
+    ) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// `esp-mint decline <entry id> --reason TEXT`: ask the running mint, on its
+/// admin listener, to decline the entry's payout.
+fn run_decline(args: &[String]) -> Result<String, Box<dyn Error>> {
+    let mut entry_id: Option<&str> = None;
+    let mut reason: Option<&str> = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--reason" {
+            reason = Some(
+                rest.next()
+                    .ok_or("--reason needs the text of the reason")?
+                    .as_str(),
+            );
+        } else if arg.starts_with("--") {
+            return Err(format!("unknown option {arg}\n{USAGE}").into());
+        } else if entry_id.is_none() {
+            entry_id = Some(arg.as_str());
+        } else {
+            return Err(format!("only one entry id can be declined at a time\n{USAGE}").into());
+        }
+    }
+    let (Some(entry_id), Some(reason)) = (entry_id, reason) else {
+        return Err(USAGE.into());
+    };
+    let bind = load_config(&data_dir()?)?.config.admin_bind;
+    admin::check_loopback(&bind)?;
+    let client = reqwest::blocking::Client::new();
+    let mut request = client
+        .post(format!("http://{bind}/payouts/decline?format=text"))
+        .json(&serde_json::json!({"entry_id": entry_id, "reason": reason}));
+    if let Ok(token) = env::var("ESP_ADMIN_TOKEN") {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().map_err(|e| {
+        format!(
+            "could not reach the mint's admin listener at {bind}: {e}. Is `esp-mint serve` running?"
+        )
+    })?;
+    let ok = response.status().is_success();
+    let body = response.text()?;
+    if ok {
+        Ok(body)
+    } else {
+        Err(body.trim_end().to_string().into())
+    }
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("serve") => serve(),
+        Some("config") => {
+            print!("{}", run_config()?);
+            Ok(())
+        }
         // These read and write the queue file only. They never open the mint's
         // database, so they can run while `serve` is up.
+        Some("migrate") => {
+            let moved = netdir::migrate_to_regtest(&data_dir()?)?;
+            println!("moved into regtest/: {}", moved.join(", "));
+            Ok(())
+        }
         Some("payouts") => {
-            print!("{}", payouts::run_payouts(&queue_path(&data_dir()?), &args[1..])?);
+            print!(
+                "{}",
+                payouts::run_payouts(&queue_path(&net_dir()?), &args[1..])?
+            );
             Ok(())
         }
         Some("pay") => {
             let now = server::now_secs();
-            print!("{}", payouts::run_pay(&queue_path(&data_dir()?), &args[1..], now)?);
+            print!(
+                "{}",
+                payouts::run_pay(&queue_path(&net_dir()?), &args[1..], now)?
+            );
+            Ok(())
+        }
+        // Signs, so it asks the running `serve` on its admin listener.
+        Some("decline") => {
+            print!("{}", run_decline(&args[1..])?);
             Ok(())
         }
         _ => Err(USAGE.into()),

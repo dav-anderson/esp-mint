@@ -1,16 +1,43 @@
-//! The real PSP, over HTTP: `POST /melt` and `POST /check-state` on `psp-mint serve`.
+//! The real PSP, over HTTP: `POST /melt` and `POST /burns` on `psp-mint serve`.
+//! `/burns` says, for each note, whether it is spent and the memo it was burned
+//! under, which is how a retry tells its own burn from someone else's.
 //!
 //! The client is blocking, so it must be created and dropped outside an async
 //! runtime, and called from a blocking thread.
 
 use std::time::Duration;
 
-use mint_server::api::{
-    CheckStateRequest, CheckStateResponse, MeltRequest, MeltResponse,
-};
+use mint_server::api::{MeltRequest, MeltResponse};
 use mint_types::{Amount, MintInput, Nonce};
+use serde::{Deserialize, Serialize};
 
-use crate::exchange::Psp;
+use crate::exchange::{Burn, Psp};
+
+/// Body of the PSP's `POST /melt`: mint-core's melt and the keyset of each
+/// note (psp-mint's `PspMeltRequest`).
+#[derive(Serialize)]
+struct PspMelt<'a> {
+    #[serde(flatten)]
+    melt: MeltRequest,
+    keysets: &'a [String],
+}
+
+/// Body of the PSP's `POST /burns`.
+#[derive(Serialize)]
+struct BurnsRequest<'a> {
+    nonces: &'a [Nonce],
+}
+
+#[derive(Deserialize)]
+struct BurnsResponse {
+    burns: Vec<WireBurn>,
+}
+
+#[derive(Deserialize)]
+struct WireBurn {
+    spent: bool,
+    memo: Option<String>,
+}
 
 pub struct HttpPsp {
     base: String,
@@ -18,13 +45,35 @@ pub struct HttpPsp {
 }
 
 impl HttpPsp {
+    /// A client with the default timeout (`psp.timeout_secs`, 30 seconds).
     pub fn new(base: &str) -> Result<Self, reqwest::Error> {
+        Self::with_timeout(base, 30)
+    }
+
+    /// A client whose calls give up after `timeout_secs` seconds.
+    pub fn with_timeout(base: &str, timeout_secs: u64) -> Result<Self, reqwest::Error> {
         Ok(HttpPsp {
             base: base.trim_end_matches('/').to_string(),
             client: reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(timeout_secs))
                 .build()?,
         })
+    }
+
+    /// The network the PSP reports in `GET /health` (`None` if it does not
+    /// say). `/health` answers `503` while the PSP is unwell, and the network is
+    /// in that body too.
+    pub fn network(&self) -> Result<Option<String>, String> {
+        let response = self
+            .client
+            .get(format!("{}/health", self.base))
+            .send()
+            .map_err(|e| format!("psp /health: {e}"))?;
+        let body: serde_json::Value = response.json().map_err(|e| format!("psp /health: {e}"))?;
+        Ok(body
+            .get("network")
+            .and_then(|n| n.as_str())
+            .map(str::to_string))
     }
 
     fn post<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -49,23 +98,37 @@ impl HttpPsp {
 
 impl Psp for HttpPsp {
     fn melt(&self, inputs: &[MintInput], memo: &str) -> Result<Amount, String> {
+        self.melt_named(inputs, &[], memo)
+    }
+
+    fn melt_named(
+        &self,
+        inputs: &[MintInput],
+        keysets: &[String],
+        memo: &str,
+    ) -> Result<Amount, String> {
         let melted: MeltResponse = self.post(
             "/melt",
-            &MeltRequest {
-                inputs: inputs.to_vec(),
-                memo: memo.to_string(),
+            &PspMelt {
+                melt: MeltRequest {
+                    inputs: inputs.to_vec(),
+                    memo: memo.to_string(),
+                },
+                keysets,
             },
         )?;
         Ok(melted.burned)
     }
 
-    fn spent(&self, nonces: &[Nonce]) -> Result<Vec<bool>, String> {
-        let checked: CheckStateResponse = self.post(
-            "/check-state",
-            &CheckStateRequest {
-                nonces: nonces.to_vec(),
-            },
-        )?;
-        Ok(checked.spent)
+    fn burns(&self, nonces: &[Nonce]) -> Result<Vec<Burn>, String> {
+        let reply: BurnsResponse = self.post("/burns", &BurnsRequest { nonces })?;
+        Ok(reply
+            .burns
+            .into_iter()
+            .map(|b| Burn {
+                spent: b.spent,
+                memo: b.memo,
+            })
+            .collect())
     }
 }

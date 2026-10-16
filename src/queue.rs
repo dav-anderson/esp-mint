@@ -1,13 +1,14 @@
 //! The redemption queue: what the mint still owes services.
 //!
-//! One entry per accepted redemption request, with the amount owed (ESP), the
-//! payout memo, the service and a status. An entry is `open` until it is
-//! `completed` (paid, with a payment reference) or `declined`.
+//! One entry per redemption that leaves something owed, with the amount owed
+//! (ESP), the payout memo, the service and a status. An entry is `open` until it
+//! is `completed` (paid, with a payment reference) or `declined` (with the
+//! operator's reason and the signatures on the reissued notes).
 //!
-//! Redemption itself is not built yet, so nothing in the mint adds entries today.
-//! `Queue::add` is the call it will use, with the request hash as the entry id,
-//! so a retried request finds its entry already there. The payout report
-//! (`payouts.rs`) and the settle call below work on whatever is in the file.
+//! `redeem::redeem` adds entries with `Queue::add`, using the request hash as
+//! the entry id, so a retried request finds its entry already there. The payout
+//! report (`payouts.rs`), the settle call and the decline call below work on
+//! whatever is in the file.
 //!
 //! This is a placeholder store like `responses.rs`: one JSON object from entry
 //! id to entry, rewritten in full on every change (temporary file, fsync, rename,
@@ -24,14 +25,20 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use secp256k1::XOnlyPublicKey;
+use secp256k1::{PublicKey, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 
 /// ESP units in one US dollar.
 pub const ESP_PER_USD: u128 = 1_000_000_000_000;
 
-/// The longest payment reference accepted.
+/// The default for the longest payment reference accepted
+/// (`queue.max_payment_ref_bytes`).
 pub const MAX_REF_LEN: usize = 256;
+
+/// The default for the longest reason for a decline accepted
+/// (`redeem.max_reason_bytes`). The limit is checked where the decline is made
+/// (`redeem::decline_with`); the queue only needs a reason that is not empty.
+pub const DEFAULT_MAX_REASON_BYTES: usize = 1024;
 
 /// `u128` as a decimal string in JSON.
 pub mod dec {
@@ -60,7 +67,10 @@ pub enum QueueError {
     /// The entry is for another service.
     WrongService(String),
     /// The entry is not open (it is completed or declined).
-    NotOpen { id: String, status: Status },
+    NotOpen {
+        id: String,
+        status: Status,
+    },
     /// The entries have different payout memos and the caller did not allow it.
     MixedMemos(Vec<String>),
     /// A sum does not fit in `u128`.
@@ -117,6 +127,17 @@ pub enum Status {
     Completed,
 }
 
+/// A blind signature on one output and the key it was made with: what a wallet
+/// needs, with its blinding factor, to unblind the new note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedOutput {
+    pub signature: PublicKey,
+    pub key: PublicKey,
+    /// The keyset that signed it. Empty in an entry stored before keysets.
+    #[serde(default)]
+    pub keyset: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     /// The redemption request hash.
@@ -135,6 +156,44 @@ pub struct Entry {
     pub payment_ref: Option<String>,
     #[serde(default)]
     pub completed_unix: Option<u64>,
+    /// When the mint declined to pay, in unix seconds.
+    #[serde(default)]
+    pub declined_unix: Option<u64>,
+    /// Why the mint declined to pay.
+    #[serde(default)]
+    pub decline_reason: Option<String>,
+    /// The signatures on the notes reissued because of the decline, in the order
+    /// of the request's `decline_outputs`.
+    #[serde(default)]
+    pub decline_signatures: Vec<SignedOutput>,
+    /// The fee rate this redemption was charged at, in ESP units per encoded
+    /// byte: the rate in force when it was accepted. Zero on an entry that was
+    /// queued without one.
+    #[serde(default, with = "dec")]
+    pub fee_per_byte: u128,
+    /// The fee that was charged, in ESP units.
+    #[serde(default, with = "dec")]
+    pub fee_esp: u128,
+    /// The size of the request the fee was sized by, in bytes.
+    #[serde(default)]
+    pub size_bytes: u64,
+}
+
+/// What a service is told about its entry when it asks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryView {
+    pub status: Status,
+    #[serde(with = "dec")]
+    pub owed_esp: u128,
+    /// The rate the fee was charged at, and the fee, as stored when the request
+    /// was accepted.
+    #[serde(with = "dec")]
+    pub fee_per_byte: u128,
+    #[serde(with = "dec")]
+    pub fee_esp: u128,
+    pub payment_ref: Option<String>,
+    pub decline_reason: Option<String>,
+    pub decline_signatures: Vec<SignedOutput>,
 }
 
 impl Entry {
@@ -155,6 +214,32 @@ impl Entry {
             status: Status::Open,
             payment_ref: None,
             completed_unix: None,
+            declined_unix: None,
+            decline_reason: None,
+            decline_signatures: Vec::new(),
+            fee_per_byte: 0,
+            fee_esp: 0,
+            size_bytes: 0,
+        }
+    }
+
+    /// Record the fee this redemption was charged, and the rate it was charged at.
+    pub fn with_fee(mut self, fee_per_byte: u128, fee_esp: u128, size_bytes: u64) -> Self {
+        self.fee_per_byte = fee_per_byte;
+        self.fee_esp = fee_esp;
+        self.size_bytes = size_bytes;
+        self
+    }
+
+    pub fn view(&self) -> EntryView {
+        EntryView {
+            status: self.status,
+            owed_esp: self.owed_esp,
+            fee_per_byte: self.fee_per_byte,
+            fee_esp: self.fee_esp,
+            payment_ref: self.payment_ref.clone(),
+            decline_reason: self.decline_reason.clone(),
+            decline_signatures: self.decline_signatures.clone(),
         }
     }
 }
@@ -186,6 +271,7 @@ pub struct Paid {
 pub struct Queue {
     path: PathBuf,
     rows: BTreeMap<String, Entry>,
+    max_ref_bytes: usize,
 }
 
 impl Queue {
@@ -199,7 +285,15 @@ impl Queue {
         Ok(Queue {
             path: path.to_path_buf(),
             rows,
+            max_ref_bytes: MAX_REF_LEN,
         })
+    }
+
+    /// Set the longest payment reference `complete` accepts. The default is
+    /// `MAX_REF_LEN`; the mint sets it from `queue.max_payment_ref_bytes`.
+    pub fn with_max_ref_bytes(mut self, max_ref_bytes: usize) -> Self {
+        self.max_ref_bytes = max_ref_bytes;
+        self
     }
 
     pub fn get(&self, id: &str) -> Option<&Entry> {
@@ -251,11 +345,14 @@ impl Queue {
     pub fn complete(&mut self, payment: &Payment<'_>) -> Result<Paid, QueueError> {
         let payment_ref = payment.payment_ref.trim();
         if payment_ref.is_empty() {
-            return Err(QueueError::Invalid("a payment reference is required".into()));
+            return Err(QueueError::Invalid(
+                "a payment reference is required".into(),
+            ));
         }
-        if payment_ref.len() > MAX_REF_LEN {
+        if payment_ref.len() > self.max_ref_bytes {
             return Err(QueueError::Invalid(format!(
-                "the payment reference is longer than {MAX_REF_LEN} bytes"
+                "the payment reference is longer than {} bytes",
+                self.max_ref_bytes
             )));
         }
         if payment.entry_ids.is_empty() {
@@ -312,6 +409,44 @@ impl Queue {
         })
     }
 
+    /// Mark an open entry declined, with the reason and the signatures on the
+    /// notes reissued for it. Nothing changes unless the entry exists, is open,
+    /// and the reason is not empty.
+    pub fn decline(
+        &mut self,
+        id: &str,
+        reason: &str,
+        signatures: Vec<SignedOutput>,
+        now_unix: u64,
+    ) -> Result<(), QueueError> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(QueueError::Invalid(
+                "a reason for the decline is required".into(),
+            ));
+        }
+        let entry = self
+            .rows
+            .get(id)
+            .ok_or_else(|| QueueError::Unknown(id.to_string()))?;
+        if entry.status != Status::Open {
+            return Err(QueueError::NotOpen {
+                id: id.to_string(),
+                status: entry.status,
+            });
+        }
+        let mut next = self.rows.clone();
+        if let Some(entry) = next.get_mut(id) {
+            entry.status = Status::Declined;
+            entry.declined_unix = Some(now_unix);
+            entry.decline_reason = Some(reason.to_string());
+            entry.decline_signatures = signatures;
+        }
+        self.write(&next)?;
+        self.rows = next;
+        Ok(())
+    }
+
     fn write(&self, rows: &BTreeMap<String, Entry>) -> Result<(), QueueError> {
         let tmp = self.path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(rows).map_err(io::Error::other)?;
@@ -362,7 +497,14 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("esp-mint-queue-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("esp-mint-queue-{}-{name}", {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -386,7 +528,9 @@ mod tests {
         let mut queue = Queue::open(&path).unwrap();
         assert!(queue.is_empty());
         let big = u128::from(u64::MAX) * 1_000;
-        queue.add(Entry::open("a", service(), big, "memo", 5)).unwrap();
+        queue
+            .add(Entry::open("a", service(), big, "memo", 5))
+            .unwrap();
         let again = Queue::open(&path).unwrap();
         assert_eq!(again.len(), 1);
         assert_eq!(again.get("a").unwrap().owed_esp, big);
@@ -400,6 +544,81 @@ mod tests {
         fs::write(&path, "not json").unwrap();
         assert!(matches!(Queue::open(&path), Err(QueueError::Corrupt(_))));
         assert_eq!(fs::read_to_string(&path).unwrap(), "not json");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn signed(n: u8) -> SignedOutput {
+        let mut bytes = [0u8; 32];
+        bytes[31] = n;
+        let sk = secp256k1::SecretKey::from_slice(&bytes).unwrap();
+        let pk = PublicKey::from_secret_key(secp256k1::SECP256K1, &sk);
+        SignedOutput {
+            signature: pk,
+            key: pk,
+            keyset: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_decline_keeps_the_reason_and_the_signatures_across_a_reopen() {
+        let dir = scratch("decline");
+        let path = dir.join("queue.json");
+        let mut queue = Queue::open(&path).unwrap();
+        queue.add(Entry::open("a", service(), 5, "m", 1)).unwrap();
+        queue.add(Entry::open("b", service(), 6, "m", 1)).unwrap();
+        queue
+            .decline("a", "  terms not met  ", vec![signed(3), signed(4)], 99)
+            .unwrap();
+        let again = Queue::open(&path).unwrap();
+        let a = again.get("a").unwrap();
+        assert_eq!(a.status, Status::Declined);
+        assert_eq!(a.decline_reason.as_deref(), Some("terms not met"));
+        assert_eq!(a.declined_unix, Some(99));
+        assert_eq!(a.decline_signatures, vec![signed(3), signed(4)]);
+        assert_eq!(a.view().status, Status::Declined);
+        assert_eq!(again.get("b").unwrap().status, Status::Open);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_decline_is_refused_for_a_missing_closed_or_unexplained_entry() {
+        let dir = scratch("decline-refused");
+        let path = dir.join("queue.json");
+        let mut queue = Queue::open(&path).unwrap();
+        queue.add(Entry::open("a", service(), 5, "m", 1)).unwrap();
+        assert!(matches!(
+            queue.decline("nope", "why", vec![], 2),
+            Err(QueueError::Unknown(_))
+        ));
+        assert!(queue.decline("a", "   ", vec![], 2).is_err());
+        assert_eq!(queue.get("a").unwrap().status, Status::Open);
+        queue.decline("a", "why", vec![], 2).unwrap();
+        assert!(matches!(
+            queue.decline("a", "again", vec![], 3),
+            Err(QueueError::NotOpen { .. })
+        ));
+        assert_eq!(
+            queue.get("a").unwrap().decline_reason.as_deref(),
+            Some("why")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_entry_written_before_declines_existed_still_reads() {
+        let dir = scratch("old-entry");
+        let path = dir.join("queue.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"a":{{"id":"a","service":"{G_X}","owed_esp":"5","memo":"m","created_unix":1,"status":"open"}}}}"#
+            ),
+        )
+        .unwrap();
+        let queue = Queue::open(&path).unwrap();
+        let a = queue.get("a").unwrap();
+        assert_eq!(a.declined_unix, None);
+        assert!(a.decline_signatures.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 

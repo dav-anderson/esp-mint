@@ -60,14 +60,23 @@ pub fn report(queue: &Queue) -> Result<Vec<Group>, QueueError> {
     }
     let mut groups = Vec::new();
     for (service, mut list) in by_service {
-        list.sort_by(|a, b| a.created_unix.cmp(&b.created_unix).then_with(|| a.id.cmp(&b.id)));
+        list.sort_by(|a, b| {
+            a.created_unix
+                .cmp(&b.created_unix)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         let mut owed: u128 = 0;
         let mut by_memo: BTreeMap<&str, (Vec<String>, u128)> = BTreeMap::new();
         for entry in &list {
-            owed = owed.checked_add(entry.owed_esp).ok_or(QueueError::Overflow)?;
+            owed = owed
+                .checked_add(entry.owed_esp)
+                .ok_or(QueueError::Overflow)?;
             let line = by_memo.entry(entry.memo.as_str()).or_default();
             line.0.push(entry.id.clone());
-            line.1 = line.1.checked_add(entry.owed_esp).ok_or(QueueError::Overflow)?;
+            line.1 = line
+                .1
+                .checked_add(entry.owed_esp)
+                .ok_or(QueueError::Overflow)?;
         }
         let oldest = list.first().map_or(0, |e| e.created_unix);
         let newest = list.last().map_or(0, |e| e.created_unix);
@@ -105,7 +114,10 @@ pub fn render_report(groups: &[Group]) -> String {
     let mut out = String::new();
     for g in groups {
         out.push_str(&format!("service {}\n", g.service));
-        out.push_str(&format!("  owed     {} USD ({} ESP)\n", g.owed_usd, g.owed_esp));
+        out.push_str(&format!(
+            "  owed     {} USD ({} ESP)\n",
+            g.owed_usd, g.owed_esp
+        ));
         out.push_str(&format!(
             "  entries  {}, {} to {}\n",
             g.entries, g.oldest_date, g.newest_date
@@ -220,7 +232,14 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("esp-mint-payouts-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("esp-mint-payouts-{}-{name}", {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -249,9 +268,30 @@ mod tests {
     fn xyz_redeems_10_on_day_1_and_5_on_day_2_and_the_report_has_one_line_owing_15() {
         let dir = scratch("group");
         let mut q = Queue::open(&dir.join("queue.json")).unwrap();
-        q.add(Entry::open("e2", xyz(), 5 * ESP_PER_USD, "btc:bc1qxyz", DAY1 + DAY)).unwrap();
-        q.add(Entry::open("e1", xyz(), 10 * ESP_PER_USD, "btc:bc1qxyz", DAY1)).unwrap();
-        q.add(Entry::open("a1", abc(), 7 * ESP_PER_USD, "wire:abc", DAY1 + 5)).unwrap();
+        q.add(Entry::open(
+            "e2",
+            xyz(),
+            5 * ESP_PER_USD,
+            "btc:bc1qxyz",
+            DAY1 + DAY,
+        ))
+        .unwrap();
+        q.add(Entry::open(
+            "e1",
+            xyz(),
+            10 * ESP_PER_USD,
+            "btc:bc1qxyz",
+            DAY1,
+        ))
+        .unwrap();
+        q.add(Entry::open(
+            "a1",
+            abc(),
+            7 * ESP_PER_USD,
+            "wire:abc",
+            DAY1 + 5,
+        ))
+        .unwrap();
 
         let groups = report(&q).unwrap();
         assert_eq!(groups.len(), 2);
@@ -261,7 +301,10 @@ mod tests {
         assert_eq!(g.entries, 2);
         assert_eq!(g.oldest_unix, DAY1);
         assert_eq!(g.newest_unix, DAY1 + DAY);
-        assert_eq!((g.oldest_date.as_str(), g.newest_date.as_str()), ("2026-10-09", "2026-10-10"));
+        assert_eq!(
+            (g.oldest_date.as_str(), g.newest_date.as_str()),
+            ("2026-10-09", "2026-10-10")
+        );
         assert_eq!(g.entry_ids, ids(&["e1", "e2"]));
         assert_eq!(g.memos.len(), 1);
         assert_eq!(g.memos[0].memo, "btc:bc1qxyz");
@@ -281,7 +324,8 @@ mod tests {
         let groups = report(&q).unwrap();
         assert_eq!(groups[0].owed_esp, 2 * a);
         // and a sum past u128 is an error, not a wrapped number
-        q.add(Entry::open("c", xyz(), u128::MAX - a, "m", DAY1 + 2)).unwrap();
+        q.add(Entry::open("c", xyz(), u128::MAX - a, "m", DAY1 + 2))
+            .unwrap();
         assert!(matches!(report(&q), Err(QueueError::Overflow)));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -291,12 +335,17 @@ mod tests {
         let dir = scratch("filter");
         let path = dir.join("queue.json");
         let mut q = Queue::open(&path).unwrap();
-        q.add(Entry::open("open", xyz(), 4 * ESP_PER_USD, "m", DAY1)).unwrap();
-        q.add(Entry::open("paid", xyz(), 100 * ESP_PER_USD, "m", DAY1)).unwrap();
-        q.add(Entry::open("gone", abc(), 50 * ESP_PER_USD, "m", DAY1)).unwrap();
-        q.complete(&pay_args(xyz(), "wire-1", &ids(&["paid"]), DAY1 + 10)).unwrap();
+        q.add(Entry::open("open", xyz(), 4 * ESP_PER_USD, "m", DAY1))
+            .unwrap();
+        q.add(Entry::open("paid", xyz(), 100 * ESP_PER_USD, "m", DAY1))
+            .unwrap();
+        q.add(Entry::open("gone", abc(), 50 * ESP_PER_USD, "m", DAY1))
+            .unwrap();
+        q.complete(&pay_args(xyz(), "wire-1", &ids(&["paid"]), DAY1 + 10))
+            .unwrap();
         // declining is not built; the file is how a declined entry would look
-        let mut text: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut text: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         text["gone"]["status"] = "declined".into();
         fs::write(&path, serde_json::to_vec(&text).unwrap()).unwrap();
 
@@ -306,7 +355,10 @@ mod tests {
         assert_eq!(groups[0].service, G_X);
         assert_eq!(groups[0].owed_esp, 4 * ESP_PER_USD);
         assert_eq!(groups[0].entry_ids, ids(&["open"]));
-        assert_eq!(render_report(&[]), "nothing is owed: no open redemption entries\n");
+        assert_eq!(
+            render_report(&[]),
+            "nothing is owed: no open redemption entries\n"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -315,14 +367,25 @@ mod tests {
         let dir = scratch("late");
         let path = dir.join("queue.json");
         let mut q = Queue::open(&path).unwrap();
-        q.add(Entry::open("e1", xyz(), 10 * ESP_PER_USD, "m", DAY1)).unwrap();
-        q.add(Entry::open("e2", xyz(), 5 * ESP_PER_USD, "m", DAY1 + DAY)).unwrap();
+        q.add(Entry::open("e1", xyz(), 10 * ESP_PER_USD, "m", DAY1))
+            .unwrap();
+        q.add(Entry::open("e2", xyz(), 5 * ESP_PER_USD, "m", DAY1 + DAY))
+            .unwrap();
         let reported = report(&q).unwrap()[0].entry_ids.clone();
         assert_eq!(reported, ids(&["e1", "e2"]));
 
         // a third redemption lands while the operator is paying
-        q.add(Entry::open("e3", xyz(), 3 * ESP_PER_USD, "m", DAY1 + 2 * DAY)).unwrap();
-        let paid = q.complete(&pay_args(xyz(), "wire-9", &reported, DAY1 + 3 * DAY)).unwrap();
+        q.add(Entry::open(
+            "e3",
+            xyz(),
+            3 * ESP_PER_USD,
+            "m",
+            DAY1 + 2 * DAY,
+        ))
+        .unwrap();
+        let paid = q
+            .complete(&pay_args(xyz(), "wire-9", &reported, DAY1 + 3 * DAY))
+            .unwrap();
         assert_eq!(paid.entries, 2);
         assert_eq!(paid.paid_esp, 15 * ESP_PER_USD);
         assert_eq!(paid.paid_usd, "15.000000000000");
@@ -344,9 +407,30 @@ mod tests {
     fn different_payout_memos_are_all_shown_and_flagged_and_not_paid_together() {
         let dir = scratch("memo");
         let mut q = Queue::open(&dir.join("queue.json")).unwrap();
-        q.add(Entry::open("e1", xyz(), 10 * ESP_PER_USD, "btc:bc1qold", DAY1)).unwrap();
-        q.add(Entry::open("e2", xyz(), 5 * ESP_PER_USD, "btc:bc1qnew", DAY1 + DAY)).unwrap();
-        q.add(Entry::open("e3", xyz(), 1 * ESP_PER_USD, "btc:bc1qnew", DAY1 + DAY)).unwrap();
+        q.add(Entry::open(
+            "e1",
+            xyz(),
+            10 * ESP_PER_USD,
+            "btc:bc1qold",
+            DAY1,
+        ))
+        .unwrap();
+        q.add(Entry::open(
+            "e2",
+            xyz(),
+            5 * ESP_PER_USD,
+            "btc:bc1qnew",
+            DAY1 + DAY,
+        ))
+        .unwrap();
+        q.add(Entry::open(
+            "e3",
+            xyz(),
+            1 * ESP_PER_USD,
+            "btc:bc1qnew",
+            DAY1 + DAY,
+        ))
+        .unwrap();
 
         let groups = report(&q).unwrap();
         let g = &groups[0];
@@ -362,14 +446,27 @@ mod tests {
 
         // paying both in one go is refused unless the operator allows it
         let all = ids(&["e1", "e2", "e3"]);
-        let err = q.complete(&pay_args(xyz(), "wire-1", &all, DAY1)).unwrap_err();
-        assert!(matches!(err, QueueError::MixedMemos(ref m) if m.len() == 2), "{err}");
+        let err = q
+            .complete(&pay_args(xyz(), "wire-1", &all, DAY1))
+            .unwrap_err();
+        assert!(
+            matches!(err, QueueError::MixedMemos(ref m) if m.len() == 2),
+            "{err}"
+        );
         assert!(q.entries().all(|e| e.status == Status::Open));
         // one destination at a time works
-        q.complete(&pay_args(xyz(), "wire-2", &ids(&["e2", "e3"]), DAY1)).unwrap();
+        q.complete(&pay_args(xyz(), "wire-2", &ids(&["e2", "e3"]), DAY1))
+            .unwrap();
         assert_eq!(q.get("e1").unwrap().status, Status::Open);
         // and the operator can override when one payment really covers both
-        q.add(Entry::open("e4", xyz(), 2 * ESP_PER_USD, "btc:bc1qthird", DAY1 + 2 * DAY)).unwrap();
+        q.add(Entry::open(
+            "e4",
+            xyz(),
+            2 * ESP_PER_USD,
+            "btc:bc1qthird",
+            DAY1 + 2 * DAY,
+        ))
+        .unwrap();
         let rest = ids(&["e1", "e4"]);
         let mut mixed = pay_args(xyz(), "wire-3", &rest, DAY1);
         mixed.allow_mixed_memos = true;
@@ -384,10 +481,14 @@ mod tests {
         let dir = scratch("fail");
         let path = dir.join("queue.json");
         let mut q = Queue::open(&path).unwrap();
-        q.add(Entry::open("e1", xyz(), 10 * ESP_PER_USD, "m", DAY1)).unwrap();
-        q.add(Entry::open("e2", xyz(), 5 * ESP_PER_USD, "m", DAY1)).unwrap();
-        q.add(Entry::open("a1", abc(), 5 * ESP_PER_USD, "m", DAY1)).unwrap();
-        q.complete(&pay_args(xyz(), "old", &ids(&["e2"]), DAY1)).unwrap();
+        q.add(Entry::open("e1", xyz(), 10 * ESP_PER_USD, "m", DAY1))
+            .unwrap();
+        q.add(Entry::open("e2", xyz(), 5 * ESP_PER_USD, "m", DAY1))
+            .unwrap();
+        q.add(Entry::open("a1", abc(), 5 * ESP_PER_USD, "m", DAY1))
+            .unwrap();
+        q.complete(&pay_args(xyz(), "old", &ids(&["e2"]), DAY1))
+            .unwrap();
         let before = fs::read_to_string(&path).unwrap();
 
         // every refusal changes nothing
@@ -400,7 +501,9 @@ mod tests {
             ("r", ids(&["e1", "a1"]), xyz()),
         ];
         for (payment_ref, entry_ids, service) in &refused {
-            let err = q.complete(&pay_args(*service, payment_ref, entry_ids, DAY1)).unwrap_err();
+            let err = q
+                .complete(&pay_args(*service, payment_ref, entry_ids, DAY1))
+                .unwrap_err();
             assert!(err.is_refusal(), "{err}");
             assert_eq!(q.get("e1").unwrap().status, Status::Open);
             assert_eq!(q.get("a1").unwrap().status, Status::Open);
@@ -412,7 +515,10 @@ mod tests {
         ));
         assert!(matches!(
             q.complete(&pay_args(xyz(), "r", &ids(&["e2"]), DAY1)),
-            Err(QueueError::NotOpen { status: Status::Completed, .. })
+            Err(QueueError::NotOpen {
+                status: Status::Completed,
+                ..
+            })
         ));
         assert!(matches!(
             q.complete(&pay_args(xyz(), "r", &ids(&["a1"]), DAY1)),
@@ -421,8 +527,13 @@ mod tests {
 
         // a write that fails leaves them open, in memory too
         fs::remove_dir_all(&dir).unwrap();
-        let err = q.complete(&pay_args(xyz(), "wire-5", &ids(&["e1"]), DAY1)).unwrap_err();
-        assert!(matches!(err, QueueError::Io(_)) && !err.is_refusal(), "{err}");
+        let err = q
+            .complete(&pay_args(xyz(), "wire-5", &ids(&["e1"]), DAY1))
+            .unwrap_err();
+        assert!(
+            matches!(err, QueueError::Io(_)) && !err.is_refusal(),
+            "{err}"
+        );
         assert_eq!(q.get("e1").unwrap().status, Status::Open);
         assert_eq!(q.get("e1").unwrap().payment_ref, None);
         assert_eq!(report(&q).unwrap()[0].entry_ids, ids(&["e1"]));
@@ -433,8 +544,16 @@ mod tests {
         let dir = scratch("cli");
         let path = dir.join("queue.json");
         let mut q = Queue::open(&path).unwrap();
-        q.add(Entry::open("e1", xyz(), 10 * ESP_PER_USD, "btc:x", DAY1)).unwrap();
-        q.add(Entry::open("e2", xyz(), 5 * ESP_PER_USD, "btc:x", DAY1 + DAY)).unwrap();
+        q.add(Entry::open("e1", xyz(), 10 * ESP_PER_USD, "btc:x", DAY1))
+            .unwrap();
+        q.add(Entry::open(
+            "e2",
+            xyz(),
+            5 * ESP_PER_USD,
+            "btc:x",
+            DAY1 + DAY,
+        ))
+        .unwrap();
 
         let text = run_payouts(&path, &[]).unwrap();
         assert!(text.contains(&format!("service {G_X}")));
@@ -451,7 +570,10 @@ mod tests {
         let done = run_pay(&path, &args(&[G_X, "wire-1", "e1", "e2"]), DAY1).unwrap();
         assert!(done.contains("marked 2 entries completed"));
         assert!(done.contains("15.000000000000 USD") && done.contains("wire-1"));
-        assert_eq!(run_payouts(&path, &[]).unwrap(), "nothing is owed: no open redemption entries\n");
+        assert_eq!(
+            run_payouts(&path, &[]).unwrap(),
+            "nothing is owed: no open redemption entries\n"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

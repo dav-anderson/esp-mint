@@ -1,11 +1,17 @@
 pub mod admin;
+pub mod config;
 pub mod exchange;
+pub mod fee;
 pub mod keys;
 pub mod mint;
+pub mod netdir;
 pub mod payouts;
 pub mod psp_client;
 pub mod queue;
+pub mod redeem;
 pub mod responses;
+pub mod rotation;
 pub mod server;
 pub mod terms;
+pub mod transfer;
 pub mod units;

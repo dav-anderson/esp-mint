@@ -14,6 +14,16 @@
 //!   the queue file could not be written (the entries stay open). Also takes
 //!   `?format=text`.
 //!
+//! - `POST /payouts/decline`: body `{"entry_id": "...", "reason": "..."}`.
+//!   Declines the payout of an open entry: signs the entry's stored decline
+//!   outputs (the accepted notes minus the fee, each under its own service and
+//!   day), marks the entry declined with the reason and the signatures, and
+//!   answers with how many outputs and how much ESP were reissued. The service
+//!   learns of it by sending its redemption request again. This is a stand-in
+//!   for development: it is to be replaced by delivery over AIR. Do not pay and
+//!   decline the same entry. If a decline stops half way, run it again before
+//!   paying. Also takes `?format=text`.
+//!
 //! Each request opens the queue file afresh and one request runs at a time, so a
 //! change made by `esp-mint pay` on the command line is seen at once. Two
 //! processes writing at the same moment is still a race: do not run both at the
@@ -35,7 +45,8 @@ use serde_json::json;
 
 use crate::payouts;
 use crate::queue::{Payment, Queue};
-use crate::server::now_secs;
+use crate::redeem::{self, DeclineError};
+use crate::server::{EspState, now_secs};
 
 pub struct AdminState {
     pub queue_path: PathBuf,
@@ -43,6 +54,10 @@ pub struct AdminState {
     pub lock: Mutex<()>,
     /// The bearer token, if one is required.
     pub token: Option<String>,
+    /// The mint, which the decline call needs to sign. Without it the decline
+    /// route answers `501`. When it is there, the queue is also changed under the
+    /// mint's own queue lock, so a redemption never writes it at the same moment.
+    pub esp: Option<Arc<EspState>>,
 }
 
 /// Refuse a bind address that is not loopback.
@@ -75,6 +90,13 @@ impl FormatQuery {
             )),
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeclineBody {
+    entry_id: String,
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -124,10 +146,18 @@ async fn payouts_handler(
         Err(response) => return response,
     };
     if !authorized(&state, &headers) {
-        return error(StatusCode::UNAUTHORIZED, "missing or wrong admin token", text);
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "missing or wrong admin token",
+            text,
+        );
     }
     let Ok(_guard) = state.lock.lock() else {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "the admin lock is poisoned", text);
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the admin lock is poisoned",
+            text,
+        );
     };
     let groups = match Queue::open(&state.queue_path).and_then(|q| payouts::report(&q)) {
         Ok(groups) => groups,
@@ -151,12 +181,37 @@ async fn pay_handler(
         Err(response) => return response,
     };
     if !authorized(&state, &headers) {
-        return error(StatusCode::UNAUTHORIZED, "missing or wrong admin token", text);
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "missing or wrong admin token",
+            text,
+        );
     }
     let Ok(_guard) = state.lock.lock() else {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "the admin lock is poisoned", text);
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the admin lock is poisoned",
+            text,
+        );
     };
-    let result = Queue::open(&state.queue_path).and_then(|mut queue| {
+    let _queue_guard = match state.esp.as_ref().map(|esp| esp.queue_lock.lock()) {
+        None => None,
+        Some(Ok(guard)) => Some(guard),
+        Some(Err(_)) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the queue lock is poisoned",
+                text,
+            );
+        }
+    };
+    let max_ref_bytes = state
+        .esp
+        .as_ref()
+        .map(|esp| esp.config.current().queue_max_payment_ref_bytes)
+        .unwrap_or(crate::queue::MAX_REF_LEN);
+    let result = Queue::open(&state.queue_path).and_then(|queue| {
+        let mut queue = queue.with_max_ref_bytes(max_ref_bytes);
         queue.complete(&Payment {
             service: body.service,
             payment_ref: &body.payment_ref,
@@ -179,10 +234,133 @@ async fn pay_handler(
     }
 }
 
+async fn decline_handler(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    Query(query): Query<FormatQuery>,
+    Json(body): Json<DeclineBody>,
+) -> Response {
+    let text = match query.text() {
+        Ok(text) => text,
+        Err(response) => return response,
+    };
+    if !authorized(&state, &headers) {
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "missing or wrong admin token",
+            text,
+        );
+    }
+    if state.esp.is_none() {
+        return error(
+            StatusCode::NOT_IMPLEMENTED,
+            "this admin listener has no mint to sign with",
+            text,
+        );
+    }
+    // Signing reads and writes the mint's files, so it runs on a blocking thread.
+    let joined = tokio::task::spawn_blocking(move || {
+        let Ok(_guard) = state.lock.lock() else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the admin lock is poisoned".to_string(),
+            ));
+        };
+        let Some(esp) = state.esp.as_ref() else {
+            return Err((StatusCode::NOT_IMPLEMENTED, "no mint".to_string()));
+        };
+        let (Ok(mut logic), Ok(responses), Ok(_queue)) = (
+            esp.logic.lock(),
+            esp.responses.lock(),
+            esp.queue_lock.lock(),
+        ) else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the mint lock is poisoned".to_string(),
+            ));
+        };
+        // Decline outputs are signed with the current keyset, whichever one the
+        // redemption asked for; the signatures name it (see decline_gens).
+        let rot = crate::server::rotor_of(esp, &mut logic)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let gens = match &rot {
+            Some(r) => r.gens(&logic),
+            None => crate::rotation::Gens::only(&logic, &esp.master),
+        };
+        redeem::decline_gens(
+            &gens,
+            &responses,
+            &state.queue_path,
+            &body.entry_id,
+            &body.reason,
+            esp.config.current().redeem_max_reason_bytes,
+            now_secs(),
+        )
+        .map_err(|e| match e {
+            DeclineError::Refused(why) => (StatusCode::BAD_REQUEST, why),
+            DeclineError::Internal(why) => (StatusCode::INTERNAL_SERVER_ERROR, why),
+        })
+    })
+    .await;
+    match joined {
+        Ok(Ok(declined)) if text => text_response(
+            StatusCode::OK,
+            format!(
+                "declined entry {}: {} output(s) reissued, {} ESP units\n",
+                declined.entry_id, declined.outputs, declined.reissued_esp
+            ),
+        ),
+        Ok(Ok(declined)) => (StatusCode::OK, Json(declined)).into_response(),
+        Ok(Err((code, why))) => error(code, &why, text),
+        Err(e) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("decline task failed: {e}"),
+            text,
+        ),
+    }
+}
+
+/// The body ceiling, before any handler parses the body. Over it the answer is
+/// the same `413` as on the public routes (`error`, `code`, `size_bytes`,
+/// `limit_bytes`), always JSON.
+async fn limit_body(
+    State(limit): State<usize>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    match crate::server::read_limited(
+        &parts.headers,
+        body,
+        limit,
+        "Operator requests are small JSON.",
+    )
+    .await
+    {
+        Ok(bytes) => {
+            next.run(axum::extract::Request::from_parts(
+                parts,
+                axum::body::Body::from(bytes),
+            ))
+            .await
+        }
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
 pub fn router(state: Arc<AdminState>) -> Router {
+    // The ceiling on a request body here is `admin.max_request_bytes`. It is read
+    // once, when the router is built, so changing it needs a restart.
+    let limit = state
+        .esp
+        .as_ref()
+        .map(|esp| esp.config.current().admin_max_request_bytes)
+        .unwrap_or(1024 * 1024);
     Router::new()
         .route("/payouts", get(payouts_handler))
         .route("/payouts/pay", post(pay_handler))
+        .route("/payouts/decline", post(decline_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(limit))
+        .layer(axum::middleware::from_fn_with_state(limit, limit_body))
         .with_state(state)
 }
-

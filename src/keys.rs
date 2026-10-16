@@ -100,11 +100,22 @@ mod tests {
     }
 
     fn key_hex(master: &MasterSecret, units: u64, terms: &Terms) -> String {
-        hex::encode(master.key_for(Amount::from_units(units), terms).secret_bytes())
+        hex::encode(
+            master
+                .key_for(Amount::from_units(units), terms)
+                .secret_bytes(),
+        )
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("esp-mint-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("esp-mint-{}-{name}", {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -132,14 +143,20 @@ mod tests {
 
     #[test]
     fn same_inputs_give_the_same_key() {
-        assert_eq!(key_hex(&master(), 4, &terms()), key_hex(&master(), 4, &terms()));
+        assert_eq!(
+            key_hex(&master(), 4, &terms()),
+            key_hex(&master(), 4, &terms())
+        );
     }
 
     #[test]
     fn every_input_changes_the_key() {
         let base = key_hex(&master(), 4, &terms());
         assert_ne!(base, key_hex(&master(), 2, &terms()));
-        assert_ne!(base, key_hex(&MasterSecret::from_bytes([0x43; 32]), 4, &terms()));
+        assert_ne!(
+            base,
+            key_hex(&MasterSecret::from_bytes([0x43; 32]), 4, &terms())
+        );
         let other_service = Terms {
             service: XOnlyPublicKey::from_slice(
                 &hex::decode("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
@@ -186,7 +203,10 @@ mod tests {
         let dir = scratch("mode");
         let path = dir.join("master_secret.hex");
         load_or_generate(&path).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,6 +1,8 @@
 use secp256k1::XOnlyPublicKey;
 
 pub const SECONDS_PER_DAY: u64 = 86_400;
+/// The default for how many days after issue a note becomes redeemable
+/// (`terms.maturity_days`).
 pub const REDEEM_WINDOW_DAYS: u64 = 365;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -10,10 +12,17 @@ pub struct Terms {
 }
 
 impl Terms {
+    /// Terms for a note issued at `now_unix`, redeemable after the default window.
     pub fn new_at(service: XOnlyPublicKey, now_unix: u64) -> Self {
+        Self::new_at_days(service, now_unix, REDEEM_WINDOW_DAYS)
+    }
+
+    /// Terms for a note issued at `now_unix`, redeemable after `maturity_days`
+    /// (the mint's `terms.maturity_days`).
+    pub fn new_at_days(service: XOnlyPublicKey, now_unix: u64, maturity_days: u64) -> Self {
         Self {
             service,
-            redeemable_after_day: now_unix / SECONDS_PER_DAY + REDEEM_WINDOW_DAYS,
+            redeemable_after_day: (now_unix / SECONDS_PER_DAY).saturating_add(maturity_days),
         }
     }
 
@@ -44,6 +53,19 @@ mod tests {
         let terms = Terms::new_at(service(), 1_791_571_184);
         assert_eq!(terms.redeemable_after_day, 20_735 + 365);
         assert_eq!(terms.redeemable_after_day, 21_100);
+    }
+
+    #[test]
+    fn the_window_can_be_set() {
+        let terms = Terms::new_at_days(service(), 1_791_571_184, 30);
+        assert_eq!(terms.redeemable_after_day, 20_735 + 30);
+        let now = Terms::new_at_days(service(), 1_791_571_184, 0);
+        assert_eq!(now.redeemable_after_day, 20_735);
+        assert!(now.is_redeemable_at(1_791_571_184));
+        assert_eq!(
+            Terms::new_at_days(service(), 1_791_571_184, REDEEM_WINDOW_DAYS),
+            Terms::new_at(service(), 1_791_571_184)
+        );
     }
 
     #[test]

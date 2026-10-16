@@ -1,17 +1,23 @@
 //! Units.
 //!
-//! - PSP is worth 1 USD a unit.
-//! - ESP and FSP are worth 10^-12 USD a unit.
-//! - 1 PSP = 10^12 ESP, and ESP to FSP is 1:1.
+//! - PSP is worth 0.10 USD a unit: 10 PSP = 1 USD.
+//! - ESP and FSP are worth 10^-12 USD a unit: 10^12 ESP = 1 USD.
+//! - So 1 PSP = 10^11 ESP, 10 PSP = 10^12 ESP, and ESP to FSP is 1:1.
+//!
+//! PSP is priced at ten to the dollar, not a thousand, to keep the PSP
+//! purchase's OP_RETURN small: each extra output a payment has to name costs 41
+//! bytes (an 8-byte amount and a 33-byte point), and a finer PSP unit means
+//! more outputs for the same dollars.
 //!
 //! Amounts are `u64`, so one note is worth at most `u64::MAX` units, about
-//! $18.4 million of ESP or FSP. A request can hold many notes, so every sum and
+//! $18.4 million of ESP or FSP (one note of PSP holds at most 184,467,440 PSP,
+//! about $18.4 million). A request can hold many notes, so every sum and
 //! every PSP-to-ESP conversion is done in `u128` and never wraps.
 
 /// ESP units in one PSP unit.
-pub const ESP_PER_PSP: u64 = 1_000_000_000_000;
+pub const ESP_PER_PSP: u64 = 100_000_000_000;
 
-/// The most PSP whose ESP value still fits in one `u64` note (18,446,744).
+/// The most PSP whose ESP value still fits in one `u64` note (184,467,440).
 pub const MAX_PSP_PER_NOTE: u64 = u64::MAX / ESP_PER_PSP;
 
 /// The ESP value of a PSP amount. The largest result, for `u64::MAX` PSP, is
@@ -36,16 +42,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_psp_is_ten_to_the_twelfth_esp() {
-        assert_eq!(ESP_PER_PSP, 10u64.pow(12));
+    fn one_psp_is_ten_to_the_eleventh_esp_and_ten_psp_are_a_dollar() {
+        assert_eq!(ESP_PER_PSP, 10u64.pow(11));
         assert_eq!(psp_to_esp(0), 0);
-        assert_eq!(psp_to_esp(1), 1_000_000_000_000);
-        assert_eq!(psp_to_esp(1_048_576), 1_048_576_000_000_000_000);
+        assert_eq!(psp_to_esp(1), 100_000_000_000);
+        // 10 PSP = 1 USD = 10^12 ESP
+        assert_eq!(psp_to_esp(10), 1_000_000_000_000);
+        assert_eq!(psp_to_esp(10), 10u128.pow(12));
+        // the largest PSP denomination, 2^24
+        assert_eq!(psp_to_esp(16_777_216), 1_677_721_600_000_000_000);
     }
 
     #[test]
-    fn the_largest_psp_that_fits_one_note_is_18_446_744() {
-        assert_eq!(MAX_PSP_PER_NOTE, 18_446_744);
+    fn the_largest_psp_that_fits_one_note_is_184_467_440() {
+        assert_eq!(MAX_PSP_PER_NOTE, 184_467_440);
         let at_limit = psp_to_esp(MAX_PSP_PER_NOTE);
         assert_eq!(at_limit, 18_446_744_000_000_000_000);
         assert_eq!(as_note_amount(at_limit), Some(18_446_744_000_000_000_000));
@@ -54,7 +64,7 @@ mod tests {
     #[test]
     fn one_psp_more_does_not_fit_one_note() {
         let over = psp_to_esp(MAX_PSP_PER_NOTE + 1);
-        assert_eq!(over, 18_446_745_000_000_000_000);
+        assert_eq!(over, 18_446_744_100_000_000_000);
         assert!(over > u128::from(u64::MAX));
         assert_eq!(as_note_amount(over), None);
     }
@@ -63,7 +73,7 @@ mod tests {
     fn converting_the_largest_psp_does_not_overflow() {
         assert_eq!(
             psp_to_esp(u64::MAX),
-            u128::from(u64::MAX) * 1_000_000_000_000u128
+            u128::from(u64::MAX) * 100_000_000_000u128
         );
     }
 
