@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "esp-mint"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "bdhke",
@@ -1390,8 +1390,8 @@ dependencies = [
 
 [[package]]
 name = "sp-wire"
-version = "0.1.0"
-source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.1.0#ddef4889bb112e3b0ccd22318504eb47046a2aef"
+version = "0.2.0"
+source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.2.0#56c7f67c1d803911d07540d139e7710177c88266"
 dependencies = [
  "hex",
  "mint-types",
