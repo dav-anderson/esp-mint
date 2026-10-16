@@ -6,7 +6,9 @@ ESP is the encumbered point. It is obtained by exchanging PSP at 10^11 ESP for 1
 
 esp-mint is built and tested: the PSP-to-ESP exchange, the transfer to the service, redemption with its payout queue and report, per-byte and optional fees, key rotation, and a settings file reloaded on SIGHUP. What is left, and what waits on the AIR, is under "Left to do". The whole family and its status are in the top-level `~/sandbox-mint/README.md`.
 
-Source map: terms and the date rule (`src/terms.rs`), unit constants and checked sums (`src/units.rs`), per-terms key derivation (`src/keys.rs`), the exchange (`src/exchange.rs`), stored responses (`src/responses.rs`), the PSP client (`src/psp_client.rs`), the API (`src/server.rs`), the transfer (`src/transfer.rs`), redemption (`src/redeem.rs`), the queue and payout report (`src/queue.rs`, `src/payouts.rs`, `src/admin.rs`), fees (`src/fee.rs`), rotation (`src/rotation.rs`) and settings (`src/config.rs`).
+Source map: terms and the date rule (`src/terms.rs`), unit constants and checked sums (`src/units.rs`; both are re-exports of `sp-wire`, see "Wire format and versions"), per-terms key derivation (`src/keys.rs`), the exchange (`src/exchange.rs`), stored responses (`src/responses.rs`), the PSP client (`src/psp_client.rs`), the API (`src/server.rs`), the transfer (`src/transfer.rs`), redemption (`src/redeem.rs`), the queue and payout report (`src/queue.rs`, `src/payouts.rs`, `src/admin.rs`), fees (`src/fee.rs`), rotation (`src/rotation.rs`) and settings (`src/config.rs`).
+
+esp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.1.0` (git tags). It does not use the `air` crate, so nothing else is needed. To test against unpushed local copies of `sp-wire` or mint-core, `source ~/sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags (the recipe, with the plain `[patch]` form, is in the top-level README in `sandbox-mint`).
 
 ## Keys
 
@@ -74,6 +76,12 @@ The tests cover a retry after the mint's own burn (it issues without burning aga
 
 **Wallet.** `ecash-wallet exchange --service <x-only hex> --psp N` builds this request, sends it to `/exchange` and unblinds the reply into ESP notes (see the ecash-wallet README). The wallet picks PSP notes worth at least N and asks for all of their value, so the request is always exact: N PSP of ESP, plus any difference as extra ESP notes under the same terms (change). It saves the request, the blinding factors and the new spend keys before sending, so after a timeout `exchange --resume <id>` sends the same request again and gets the stored response. A `400` means nothing was burned and the wallet frees its PSP notes. Each ESP note is stored with its spend key, its amount and its terms (service and redeemable-after day).
 
+## Wire format and versions
+
+The request and response bodies, the terms, the canonical redeem encoding, the request hashes, the unit constants and the error codes are defined in the `sp-wire` crate, not here. `esp-mint` re-exports them (`esp_mint::exchange::ExchangeRequest`, `esp_mint::redeem::RedeemRequest`, `esp_mint::queue::Status`, `esp_mint::rotation::RolloverRequest`, `esp_mint::terms::Terms`, `esp_mint::units::*`, and so on), so the paths did not change. The PSP and FSP mints and the wallet build against the same crate, so they cannot drift from this mint by a byte. What stays here is everything that is the mint's own: storage, the queue, fees, validation, settlement and config. The key-set ID derivation `rotation::keyset_id` stays too, because it needs the master secret.
+
+`GET /health` returns `wire_version`, the crate's `WIRE_VERSION` (1 to start). **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves. Nothing was changed on the wire by moving the types: the golden values were captured from this mint before the move, and `sp-wire` reproduces them.
+
 ## HTTP API
 
 `esp-mint serve` runs the API. Its settings are in "Settings" below (`esp-mint.toml` and environment variables).
@@ -88,7 +96,7 @@ The tests cover a retry after the mint's own burn (it issues without burning aga
 | `GET /rotation` | Whether rotation is on, the first-issue time, and the current and previous keysets with their start and retirement times. |
 | `GET /fees` | The fee rates, size formulas and ceilings now in force. |
 | `GET /audit` | `issued`, `redeemed`, `outstanding`, in ESP units. |
-| `GET /health` | `200` while the locks are sound, `503` otherwise. |
+| `GET /health` | `200` while the locks are sound, `503` otherwise. The body has `status`, `network` and `wire_version` (an integer: the version of the wire format this mint speaks; a wallet refuses a mint whose number is not its own). |
 
 The process exits with status 1 if a lock is poisoned, so a supervisor can restart it. One request runs at a time, holding the mint and the stored responses (and waiting on the PSP) until it is done, which is fine for development and not a design for load. There is no authentication and no TLS: a note authorizes its own spend, so a caller can only burn notes they hold. Bind to localhost. Only one process can open the mint's database.
 
@@ -245,7 +253,7 @@ Each request reads the queue file afresh, so a change made by `esp-mint pay` sho
 
 ## Settings and fees
 
-**Network.** esp-mint is on mainnet unless `server.network` (`ESP_NETWORK`) says otherwise; for a regtest PSP run `ESP_NETWORK=regtest cargo run -- serve`. Start the PSP first: the mint will not start without asking it. `/health` returns `{"status": "ok", "network": "..."}`. Its data lives in `ESP_DATA_DIR/<network>/` (default `~/.esp-mint/<network>/`). Files from before the split, at the top of `ESP_DATA_DIR`, make `serve` refuse to start with a message; `esp-mint migrate` moves them into `regtest/` (all development so far was regtest), moving nothing if the target holds any of them and deleting nothing. The config file stays at the top. *Why:* keys and spent notes of one network must never be used on another, the same reason psp-mint and the wallet split theirs.
+**Network.** esp-mint is on mainnet unless `server.network` (`ESP_NETWORK`) says otherwise; for a regtest PSP run `ESP_NETWORK=regtest cargo run -- serve`. Start the PSP first: the mint will not start without asking it. `/health` returns `{"status": "ok", "network": "...", "wire_version": 1}`. Its data lives in `ESP_DATA_DIR/<network>/` (default `~/.esp-mint/<network>/`). Files from before the split, at the top of `ESP_DATA_DIR`, make `serve` refuse to start with a message; `esp-mint migrate` moves them into `regtest/` (all development so far was regtest), moving nothing if the target holds any of them and deleting nothing. The config file stays at the top. *Why:* keys and spent notes of one network must never be used on another, the same reason psp-mint and the wallet split theirs.
 
 
 Nothing an operator might tune is a constant in the code. Each setting has a default, can be set in one file, `esp-mint.toml` in the data directory (or the file `ESP_CONFIG` names, which must exist), and can be overridden by an environment variable, which wins over the file. The file is TOML in sections:

@@ -298,6 +298,11 @@ fn an_exchange_over_http_burns_the_psp_and_issues_verifiable_esp() {
 
     assert_eq!(get_json(&esp, "/health").0, 200);
     assert_eq!(get_json(&esp, "/health").1["network"], "main");
+    // The wire format this mint speaks; a wallet refuses a mint on another number.
+    assert_eq!(
+        get_json(&esp, "/health").1["wire_version"],
+        sp_wire::WIRE_VERSION
+    );
     rt.shutdown_background();
 }
 

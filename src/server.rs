@@ -136,7 +136,7 @@ fn fee_details(
     paid: u128,
     outputs: u128,
 ) {
-    body["code"] = json!("not_exact");
+    body["code"] = json!(sp_wire::codes::NOT_EXACT);
     body["fee_esp"] = json!(fee.to_string());
     body["size_bytes"] = json!(size_bytes);
     body["fee_per_byte"] = json!(fee_per_byte.to_string());
@@ -186,9 +186,9 @@ pub fn run_exchange(
             match &r {
                 // The wallet reads these two to mark exactly those notes as spent.
                 Rejection::Keyset { code, .. } => body["code"] = json!(code),
-                Rejection::MissingKeyset => body["code"] = json!("missing_keyset"),
+                Rejection::MissingKeyset => body["code"] = json!(sp_wire::codes::MISSING_KEYSET),
                 Rejection::NoteSpentElsewhere { spent } => {
-                    body["code"] = json!("note_spent_elsewhere");
+                    body["code"] = json!(sp_wire::codes::NOTE_SPENT_ELSEWHERE);
                     body["spent"] = json!(spent);
                 }
                 // The wallet reads these to rebuild the outputs.
@@ -259,7 +259,7 @@ pub fn run_transfer(state: &EspState, request: &TransferRequest) -> (StatusCode,
             }
             // The wallet reads these two to stop offering that note.
             if let TransferRejection::AlreadySpent { index } = &r {
-                body["code"] = json!("note_spent_elsewhere");
+                body["code"] = json!(sp_wire::codes::NOTE_SPENT_ELSEWHERE);
                 body["spent"] = json!([index]);
             }
             if let TransferRejection::NotExactWithFee {
@@ -370,7 +370,7 @@ fn too_large(size: Option<u64>, limit: usize, hint: &str) -> Refusal {
             "error": format!(
                 "{said}, and this route accepts at most {limit} bytes. {hint} Nothing was parsed, burned or charged"
             ),
-            "code": "request_too_large",
+            "code": sp_wire::codes::REQUEST_TOO_LARGE,
             "size_bytes": size,
             "limit_bytes": limit as u64,
         })),
@@ -383,7 +383,7 @@ fn malformed(why: impl std::fmt::Display) -> Refusal {
         StatusCode::BAD_REQUEST,
         Json(json!({
             "error": format!("not a valid request: {why}"),
-            "code": "malformed_request",
+            "code": sp_wire::codes::MALFORMED_REQUEST,
         })),
     )
 }
@@ -600,13 +600,20 @@ async fn health_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json
     match fatal(&state) {
         None => (
             StatusCode::OK,
-            Json(json!({"status": "ok", "network": state.config.current().network})),
+            Json(json!({
+                "status": "ok",
+                "network": state.config.current().network,
+                "wire_version": sp_wire::WIRE_VERSION,
+            })),
         ),
         Some(why) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(
-                json!({"status": "broken", "reason": why, "network": state.config.current().network}),
-            ),
+            Json(json!({
+                "status": "broken",
+                "reason": why,
+                "network": state.config.current().network,
+                "wire_version": sp_wire::WIRE_VERSION,
+            })),
         ),
     }
 }
@@ -712,7 +719,7 @@ async fn rollover_handler(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": format!("input {i}: the note is already spent"),
-                "code": "note_spent_elsewhere",
+                "code": sp_wire::codes::NOTE_SPENT_ELSEWHERE,
                 "spent": [i],
             })),
         ),

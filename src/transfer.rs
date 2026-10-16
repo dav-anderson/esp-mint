@@ -51,13 +51,16 @@ use std::error::Error;
 use std::fmt;
 
 use mint_core::MintLogic;
-use mint_types::{MintInput, MintOutput, MintOutputError};
+use mint_types::MintOutputError;
+#[cfg(test)]
+use mint_types::{MintInput, MintOutput};
+use secp256k1::SECP256K1;
+#[cfg(test)]
+use secp256k1::XOnlyPublicKey;
+#[cfg(test)]
 use secp256k1::schnorr::Signature;
-use secp256k1::{SECP256K1, XOnlyPublicKey};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::exchange::{ExchangeResponse, MAX_ITEMS};
+use crate::exchange::MAX_ITEMS;
 use crate::fee;
 use crate::keys::MasterSecret;
 use crate::responses::{Entry, Responses, TransferPending};
@@ -65,63 +68,11 @@ use crate::rotation::Gens;
 use crate::terms::Terms;
 use crate::units;
 
-/// A transfer answers in the same shape as an exchange: the service, the
-/// redeemable-after day, and one blind signature and key for each output.
-pub type TransferResponse = ExchangeResponse;
-
-const DIGEST_TAG: &[u8] = b"esp-mint/transfer/v1";
-const REQUEST_TAG: &[u8] = b"esp-mint/transfer-request/v2";
-
-pub(crate) mod hex_signature {
-    use secp256k1::schnorr::Signature;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &Signature, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&hex::encode(v.as_ref()))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Signature, D::Error> {
-        let s = String::deserialize(d)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        Signature::from_slice(&bytes).map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransferRequest {
-    /// The service that holds the notes and asks for the swap (its DID key,
-    /// x-only). It is also the service every new note names.
-    pub service: XOnlyPublicKey,
-    /// The redeemable-after day of the notes. One request covers one set of
-    /// terms, and the new notes keep this day.
-    pub redeemable_after_day: u64,
-    /// The keyset of each input, in order. Each note is checked, and looked
-    /// up in the spent list, of the keyset it names.
-    #[serde(default)]
-    pub input_keysets: Vec<String>,
-    /// The ESP notes, each with a spend signature over the digest.
-    pub inputs: Vec<MintInput>,
-    /// The keyset to sign the outputs with: current or previous.
-    #[serde(default)]
-    pub keyset: String,
-    /// The new notes, blinded. Any non-zero amounts that add up to the inputs.
-    pub outputs: Vec<MintOutput>,
-    /// The service's signature over the digest.
-    #[serde(with = "hex_signature")]
-    pub service_signature: Signature,
-}
-
-impl TransferRequest {
-    /// What every signature in the request covers.
-    pub fn digest(&self) -> [u8; 32] {
-        digest(
-            &self.service,
-            self.redeemable_after_day,
-            &self.inputs,
-            &self.outputs,
-        )
-    }
-}
+// The request type, the digest and the request hash live in sp-wire; they are
+// re-exported so the paths are unchanged.
+pub use sp_wire::esp::transfer::{
+    TransferRequest, TransferResponse, digest, hex_signature, request_hash,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferRejection {
@@ -281,55 +232,6 @@ fn internal<E: ToString>(e: E) -> TransferError {
     TransferError::Internal(e.to_string())
 }
 
-/// What the service and every input sign:
-/// `SHA-256("esp-mint/transfer/v1" || terms || the inputs || the outputs)`.
-/// The terms are the service and the redeemable-after day (40 bytes). Each input
-/// is its amount and its nonce, and each output is its amount and its blind
-/// nonce, with a count in front of each list. The spend signatures themselves are
-/// not part of it.
-pub fn digest(
-    service: &XOnlyPublicKey,
-    redeemable_after_day: u64,
-    inputs: &[MintInput],
-    outputs: &[MintOutput],
-) -> [u8; 32] {
-    let terms = Terms {
-        service: *service,
-        redeemable_after_day,
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(DIGEST_TAG);
-    hasher.update(terms.to_bytes());
-    hasher.update((inputs.len() as u64).to_be_bytes());
-    for input in inputs {
-        hasher.update(input.amount.units.to_be_bytes());
-        hasher.update(input.note.nonce.0.serialize());
-    }
-    hasher.update((outputs.len() as u64).to_be_bytes());
-    for output in outputs {
-        hasher.update(output.amount.units.to_be_bytes());
-        hasher.update(output.blind_nonce.0.serialize());
-    }
-    hasher.finalize().into()
-}
-
-/// The key a request is stored under. It covers the digest and every signature,
-/// so a request with different signatures never gets another request's stored
-/// response.
-pub fn request_hash(request: &TransferRequest) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(REQUEST_TAG);
-    hasher.update(request.digest());
-    hasher.update(request.service_signature.as_ref());
-    for input in &request.inputs {
-        hasher.update(input.spend_signature.as_ref());
-    }
-    // Every keyset field, each with its length, so two requests that differ
-    // only in a keyset never share a hash.
-    crate::rotation::hash_keysets(&mut hasher, &request.input_keysets, &request.keyset);
-    hex::encode(hasher.finalize())
-}
-
 /// The input nonces and output blind nonces a pending transfer holds, as hex.
 fn held_by(request: &TransferRequest) -> TransferPending {
     TransferPending {
@@ -361,7 +263,7 @@ fn validate_shape(request: &TransferRequest, max_items: usize) -> Result<(), Tra
     }
     if request.input_keysets.len() != request.inputs.len() || request.keyset.is_empty() {
         return Err(TransferRejection::Keyset {
-            code: "missing_keyset",
+            code: sp_wire::codes::MISSING_KEYSET,
             why: "every input needs its keyset (input_keysets, in order) and the outputs need one (keyset). Nothing was burned".into(),
         });
     }
@@ -547,7 +449,7 @@ pub fn transfer_gens(
             Err(_) if proven || gens.burn_proven(input) => in_keys.push(None),
             Err(e) if recovering => {
                 return Err(TransferRejection::Keyset {
-                    code: "burn_not_proven",
+                    code: sp_wire::codes::BURN_NOT_PROVEN,
                     why: format!(
                         "note {index}: {}; this request was started before, but nothing stored proves its notes were burned under this request, so it cannot be finished without them",
                         e.why("its keyset")

@@ -25,6 +25,13 @@ use crate::keys::MasterSecret;
 use crate::mint::{DB_DIRNAME, MASTER_SECRET_FILENAME};
 use crate::terms::Terms;
 
+// The rollover and rotation wire types, and the keyset hashing, live in
+// sp-wire; they are re-exported so the paths are unchanged. `keyset_id` below
+// stays here: it derives the ID from the master secret, which is the mint's.
+pub use sp_wire::esp::hash_keysets;
+pub use sp_wire::esp::rollover::{MAX_ROLLOVER_NOTES, RolloverRequest, RolloverResponse};
+pub use sp_wire::keyset::{KeysetWindow, RotationResponse};
+
 pub const FIRST_ISSUE_FILE: &str = "first_issue.json";
 /// The most retired keyset IDs kept: 1 MB of 8-byte IDs (131,072). A
 /// request naming a listed ID gets `keyset_retired` (its notes expired); any
@@ -63,29 +70,6 @@ impl Rotation {
             _ => 0,
         }
     }
-}
-
-/// `GET /rotation`, the same shape as fsp-mint's.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeysetWindow {
-    pub id: String,
-    pub epoch: u64,
-    pub starts: Option<u64>,
-    pub current_until: Option<u64>,
-    pub retires: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RotationResponse {
-    pub active: bool,
-    pub first_issue: Option<u64>,
-    pub rotation_activation_hours: u64,
-    pub activation: Option<u64>,
-    pub rotation_period_hours: u64,
-    pub current: KeysetWindow,
-    pub previous: Option<KeysetWindow>,
-    pub next_rotation: Option<u64>,
-    pub now: u64,
 }
 
 /// One generation's identity: its epoch, its master secret and its ID.
@@ -328,20 +312,6 @@ impl<'a> Gens<'a> {
     }
 }
 
-/// Feed every keyset field of a request into its request hash: the count and
-/// each input keyset, then the output keyset, each with its length in front,
-/// so no two different lists of keysets hash alike.
-pub fn hash_keysets(h: &mut sha2::Sha256, inputs: &[String], output: &str) {
-    use sha2::Digest;
-    h.update((inputs.len() as u64).to_be_bytes());
-    for k in inputs {
-        h.update((k.len() as u64).to_be_bytes());
-        h.update(k.as_bytes());
-    }
-    h.update((output.len() as u64).to_be_bytes());
-    h.update(output.as_bytes());
-}
-
 /// A live generation, as a keyset ID names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -379,9 +349,9 @@ impl KeysetError {
 
     pub fn code(&self) -> &'static str {
         match self {
-            KeysetError::Retired(_) => "keyset_retired",
-            KeysetError::Unknown(_) => "unknown_keyset",
-            KeysetError::NotCurrent { .. } => "keyset_not_current",
+            KeysetError::Retired(_) => sp_wire::codes::KEYSET_RETIRED,
+            KeysetError::Unknown(_) => sp_wire::codes::UNKNOWN_KEYSET,
+            KeysetError::NotCurrent { .. } => sp_wire::codes::KEYSET_NOT_CURRENT,
         }
     }
 }
@@ -708,60 +678,13 @@ pub fn describe_offline(base: &Path, activation_hours: u64, period_hours: u64) -
 
 // ---- the rollover swap ------------------------------------------------------
 
-use mint_types::{MintOutput, MintOutputError, transaction_sighash};
-use secp256k1::{PublicKey, SECP256K1, XOnlyPublicKey};
+#[cfg(test)]
+use mint_types::MintOutput;
+use mint_types::MintOutputError;
+use secp256k1::{PublicKey, SECP256K1};
 use std::collections::BTreeMap;
 
 pub const ROLLOVERS_FILE: &str = "rollovers.json";
-pub const MAX_ROLLOVER_NOTES: usize = 1000;
-
-/// `POST /rollover`: ESP notes of one service and one redeemable-after day in,
-/// fresh notes of exactly the same amounts and the same terms out, signed with
-/// the current key set. The holder signs (each note's spend key over
-/// [`RolloverRequest::digest`]); the service's signature is not needed,
-/// because nothing moves to anyone and nothing is split.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloverRequest {
-    pub service: XOnlyPublicKey,
-    pub redeemable_after_day: u64,
-    /// The keyset of each input, in order.
-    #[serde(default)]
-    pub input_keysets: Vec<String>,
-    pub inputs: Vec<MintInput>,
-    /// The keyset to sign the outputs with (normally the current one).
-    #[serde(default)]
-    pub keyset: String,
-    pub outputs: Vec<MintOutput>,
-}
-
-impl RolloverRequest {
-    /// What every input signs: the terms and mint-core's transaction sighash.
-    pub fn digest(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(b"esp-mint/rollover/v1");
-        h.update(self.service.serialize());
-        h.update(self.redeemable_after_day.to_be_bytes());
-        h.update(transaction_sighash(&self.inputs, &self.outputs));
-        h.finalize().into()
-    }
-    pub fn hash(&self) -> String {
-        use sha2::{Digest, Sha256};
-        hex::encode(Sha256::digest(
-            serde_json::to_vec(self).expect("serializable"),
-        ))
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloverResponse {
-    pub keyset: String,
-    pub epoch: u64,
-    pub service: XOnlyPublicKey,
-    pub redeemable_after_day: u64,
-    pub signatures: Vec<PublicKey>,
-    pub keys: Vec<PublicKey>,
-}
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Rollovers {
@@ -838,7 +761,7 @@ pub fn rollover(
     }
     if req.input_keysets.len() != req.inputs.len() || req.keyset.is_empty() {
         return Err(Keyset(
-            "missing_keyset",
+            sp_wire::codes::MISSING_KEYSET,
             "every input needs its keyset (input_keysets) and the outputs need one (keyset)".into(),
         ));
     }
@@ -972,7 +895,7 @@ pub fn rollover(
 /// proof that this request burned its inputs: refused, nothing signed.
 fn burn_not_proven(i: usize, e: &KeysetError) -> RolloverError {
     RolloverError::Keyset(
-        "burn_not_proven",
+        sp_wire::codes::BURN_NOT_PROVEN,
         format!(
             "input {i}: {}; this request was started before, but nothing stored proves its inputs were burned under this request, so it cannot be finished without them",
             e.why("its keyset")

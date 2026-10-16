@@ -5,3 +5,5 @@ mint_keys.json
 .env
 .env.*
 .DS_Store
+.cargo/
+_to_delete/

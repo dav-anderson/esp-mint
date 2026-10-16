@@ -25,11 +25,16 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use secp256k1::{PublicKey, XOnlyPublicKey};
+#[cfg(test)]
+use secp256k1::PublicKey;
+use secp256k1::XOnlyPublicKey;
 use serde::{Deserialize, Serialize};
 
-/// ESP units in one US dollar.
-pub const ESP_PER_USD: u128 = 1_000_000_000_000;
+// The wire types and constants live in sp-wire; they are re-exported so the
+// paths are unchanged.
+pub use sp_wire::dec;
+pub use sp_wire::esp::queue::{EntryView, SignedOutput, Status};
+pub use sp_wire::units::ESP_PER_USD;
 
 /// The default for the longest payment reference accepted
 /// (`queue.max_payment_ref_bytes`).
@@ -39,20 +44,6 @@ pub const MAX_REF_LEN: usize = 256;
 /// (`redeem.max_reason_bytes`). The limit is checked where the decline is made
 /// (`redeem::decline_with`); the queue only needs a reason that is not empty.
 pub const DEFAULT_MAX_REASON_BYTES: usize = 1024;
-
-/// `u128` as a decimal string in JSON.
-pub mod dec {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(value: &u128, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(value)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        text.parse().map_err(serde::de::Error::custom)
-    }
-}
 
 #[derive(Debug)]
 pub enum QueueError {
@@ -119,25 +110,6 @@ impl From<io::Error> for QueueError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Status {
-    Open,
-    Declined,
-    Completed,
-}
-
-/// A blind signature on one output and the key it was made with: what a wallet
-/// needs, with its blinding factor, to unblind the new note.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedOutput {
-    pub signature: PublicKey,
-    pub key: PublicKey,
-    /// The keyset that signed it. Empty in an entry stored before keysets.
-    #[serde(default)]
-    pub keyset: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     /// The redemption request hash.
@@ -177,23 +149,6 @@ pub struct Entry {
     /// The size of the request the fee was sized by, in bytes.
     #[serde(default)]
     pub size_bytes: u64,
-}
-
-/// What a service is told about its entry when it asks.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EntryView {
-    pub status: Status,
-    #[serde(with = "dec")]
-    pub owed_esp: u128,
-    /// The rate the fee was charged at, and the fee, as stored when the request
-    /// was accepted.
-    #[serde(with = "dec")]
-    pub fee_per_byte: u128,
-    #[serde(with = "dec")]
-    pub fee_esp: u128,
-    pub payment_ref: Option<String>,
-    pub decline_reason: Option<String>,
-    pub decline_signatures: Vec<SignedOutput>,
 }
 
 impl Entry {
