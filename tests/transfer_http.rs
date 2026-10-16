@@ -21,7 +21,8 @@ use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
 use tokio::runtime::Runtime;
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-const ONE_PSP: u64 = 100_000_000_000;
+/// A test note size, a power of two (about 0.7 PSP).
+const ONE_PSP: u64 = 1 << 36;
 const NOW: u64 = 1_791_571_184;
 
 fn scratch(name: &str) -> PathBuf {
@@ -105,6 +106,7 @@ fn start_esp(rt: &Runtime, dir: &PathBuf) -> (String, Arc<EspState>) {
         config: esp_mint::config::Handle::default(),
         rotor: None,
         rollovers: None,
+        in_flight: Default::default(),
     });
     (serve(rt, server::router(Arc::clone(&state))), state)
 }
@@ -140,8 +142,29 @@ struct Wanted {
     amount: u64,
 }
 
-/// A transfer request for the service `G_X`, signed by `service_signer`.
+/// Split a total into powers of two, the way the wallet does: one note for each
+/// bit set, largest first.
+fn split(total: u64) -> Vec<u64> {
+    (0..64)
+        .rev()
+        .map(|bit| 1u64 << bit)
+        .filter(|p| total & p != 0)
+        .collect()
+}
+
+/// A transfer request for the service `G_X`, signed by `service_signer`. Each
+/// amount in `out_amounts` is a total, split into powers of two.
 fn request(
+    notes: &[(Note, &Keypair, u64)],
+    out_amounts: &[u64],
+    service_signer: &Keypair,
+) -> (TransferRequest, Vec<Wanted>) {
+    let amounts: Vec<u64> = out_amounts.iter().flat_map(|&a| split(a)).collect();
+    request_exact(notes, &amounts, service_signer)
+}
+
+/// Like `request`, but each output is as it stands, whatever it is.
+fn request_exact(
     notes: &[(Note, &Keypair, u64)],
     out_amounts: &[u64],
     service_signer: &Keypair,
@@ -216,15 +239,15 @@ fn a_transfer_over_http_swaps_the_notes_and_the_supply_does_not_change() {
     let dir = scratch("happy");
     let (esp, state) = start_esp(&rt, &dir);
 
-    let (a, ka) = esp_note(&state, 3 * ONE_PSP, service());
+    let (a, ka) = esp_note(&state, 2 * ONE_PSP, service());
     let (b, kb) = esp_note(&state, ONE_PSP, service());
     let audit = get_json(&esp, "/audit").1;
-    assert_eq!(audit["issued"], 4 * ONE_PSP);
-    assert_eq!(audit["outstanding"], 4 * ONE_PSP);
+    assert_eq!(audit["issued"], 3 * ONE_PSP);
+    assert_eq!(audit["outstanding"], 3 * ONE_PSP);
 
     let (req, wanted) = request(
-        &[(a, &ka, 3 * ONE_PSP), (b, &kb, ONE_PSP)],
-        &[ONE_PSP, 3 * ONE_PSP],
+        &[(a, &ka, 2 * ONE_PSP), (b, &kb, ONE_PSP)],
+        &[ONE_PSP, 2 * ONE_PSP],
         &service_keypair(),
     );
     let (code, body) = post_json(&esp, "/transfer", &req);
@@ -257,15 +280,15 @@ fn a_transfer_over_http_swaps_the_notes_and_the_supply_does_not_change() {
     // the old notes are spent, and nothing was created or destroyed
     assert!(is_spent(&state, &a) && is_spent(&state, &b));
     let audit = get_json(&esp, "/audit").1;
-    assert_eq!(audit["issued"], 8 * ONE_PSP);
-    assert_eq!(audit["redeemed"], 4 * ONE_PSP);
-    assert_eq!(audit["outstanding"], 4 * ONE_PSP);
+    assert_eq!(audit["issued"], 6 * ONE_PSP);
+    assert_eq!(audit["redeemed"], 3 * ONE_PSP);
+    assert_eq!(audit["outstanding"], 3 * ONE_PSP);
 
     // the same request again returns the same response and changes nothing
     let (code, again) = post_json(&esp, "/transfer", &req);
     assert_eq!(code, 200);
     assert_eq!(again, body);
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 8 * ONE_PSP);
+    assert_eq!(get_json(&esp, "/audit").1["issued"], 6 * ONE_PSP);
 
     assert_eq!(get_json(&esp, "/health").0, 200);
     rt.shutdown_background();
@@ -286,6 +309,55 @@ fn an_inexact_transfer_is_a_400_and_the_notes_survive() {
     let audit = get_json(&esp, "/audit").1;
     assert_eq!(audit["issued"], ONE_PSP);
     assert_eq!(audit["redeemed"], 0);
+    rt.shutdown_background();
+}
+
+#[test]
+fn an_amount_that_is_not_a_power_of_two_is_a_400_and_the_notes_survive() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("denomination");
+    let (esp, state) = start_esp(&rt, &dir);
+
+    let (a, ka) = esp_note(&state, 2 * ONE_PSP, service());
+    // an output that is not a power of two, though the total is exact
+    let (req, _) = request_exact(
+        &[(a, &ka, 2 * ONE_PSP)],
+        &[ONE_PSP + 1, ONE_PSP - 1],
+        &service_keypair(),
+    );
+    let (code, body) = post_json(&esp, "/transfer", &req);
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(body["code"], "bad_denomination");
+    assert_eq!(
+        body["error"],
+        "output 0: ESP amounts are powers of two. Nothing was burned"
+    );
+    assert!(!is_spent(&state, &a));
+
+    // an incoming note of an odd size is refused the same way
+    let odd = ONE_PSP + 5;
+    let (b, kb) = esp_note(&state, odd, service());
+    let (req, _) = request(&[(b, &kb, odd)], &[odd], &service_keypair());
+    let (code, body) = post_json(&esp, "/transfer", &req);
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(body["code"], "bad_denomination");
+    assert_eq!(
+        body["error"],
+        "note 0: ESP amounts are powers of two. Nothing was burned"
+    );
+    assert!(!is_spent(&state, &b));
+    let audit = get_json(&esp, "/audit").1;
+    assert_eq!(audit["redeemed"], 0);
+
+    // the same total split into powers of two goes through
+    let (req, _) = request(
+        &[(a, &ka, 2 * ONE_PSP)],
+        &[ONE_PSP + 1, ONE_PSP - 1],
+        &service_keypair(),
+    );
+    let (code, body) = post_json(&esp, "/transfer", &req);
+    assert_eq!(code, 200, "{body}");
+    assert!(is_spent(&state, &a));
     rt.shutdown_background();
 }
 

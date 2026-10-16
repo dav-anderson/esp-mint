@@ -13,10 +13,6 @@ use esp_mint::psp_client::HttpPsp;
 use esp_mint::responses::Responses;
 use esp_mint::server::{self, EspState};
 
-fn setting(key: &str, default: String) -> String {
-    env::var(key).unwrap_or(default)
-}
-
 /// Load the settings, or say everything that is wrong with them.
 fn load_config(data_dir: &std::path::Path) -> Result<config::Loaded, Box<dyn Error>> {
     config::load(data_dir, &config::process_env).map_err(|problems| {
@@ -90,9 +86,9 @@ fn serve() -> Result<(), Box<dyn Error>> {
     // The PSP must be on our network, or PSP notes from one chain would buy ESP
     // on another. An unreachable PSP is refused too: the network cannot be
     // checked.
-    let reported = psp.network().map_err(|e| {
-        format!("cannot ask the PSP at {psp_url} which network it is on: {e}. Start psp-mint serve first")
-    })?;
+    // It is not given up on: the mint may be started before the PSP, or after a
+    // power cut that took both down, and nobody should have to start it again.
+    let reported = wait_for_psp(&psp, &psp_url, cfg.psp_startup_retry_secs);
     config::check_psp_network(&cfg.network, reported.as_deref())?;
     println!(
         "esp-mint on {}: the PSP at {psp_url} is on the same network",
@@ -108,6 +104,7 @@ fn serve() -> Result<(), Box<dyn Error>> {
         config: config::Handle::new(cfg),
         rotor: Some(Mutex::new(rotor)),
         rollovers: Some(Mutex::new(rollovers)),
+        in_flight: Default::default(),
     });
 
     // A poisoned lock means a thread panicked holding the mint, and every later
@@ -168,7 +165,7 @@ fn serve() -> Result<(), Box<dyn Error>> {
         let api = async {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
+                    shutdown_signal().await;
                     println!("shutting down");
                 })
                 .await
@@ -176,7 +173,7 @@ fn serve() -> Result<(), Box<dyn Error>> {
         let admin = async {
             axum::serve(admin_listener, admin_app)
                 .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
+                    shutdown_signal().await;
                 })
                 .await
         };
@@ -185,12 +182,64 @@ fn serve() -> Result<(), Box<dyn Error>> {
     })
 }
 
+/// Ask the PSP which network it is on, and ask again every `retry_secs` until it
+/// answers. Only an unreachable PSP is waited for (it may not have started yet);
+/// what it answers is checked by the caller. The log gets the first failure and
+/// then one line a minute.
+fn wait_for_psp(psp: &HttpPsp, url: &str, retry_secs: u64) -> Option<String> {
+    let log_every = (60 / retry_secs.max(1)).max(1);
+    let mut failures = 0u64;
+    loop {
+        match psp.network() {
+            Ok(network) => {
+                if failures > 0 {
+                    println!("esp-mint: the PSP at {url} answers now");
+                }
+                return network;
+            }
+            Err(e) => {
+                if failures % log_every == 0 {
+                    eprintln!(
+                        "esp-mint: cannot ask the PSP at {url} which network it is on: {e}. Trying again every {retry_secs} s (start psp-mint serve)"
+                    );
+                }
+                failures += 1;
+                thread::sleep(Duration::from_secs(retry_secs));
+            }
+        }
+    }
+}
+
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM, which is what `launchd` and
+/// `systemd` send to stop a service. The server then stops taking new
+/// connections, lets the requests it is answering finish, and returns, and the
+/// process exits with status 0.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).ok();
+    let terminate = async {
+        match term.as_mut() {
+            Some(t) => {
+                t.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate => {}
+    }
+}
+
 fn data_dir() -> Result<PathBuf, Box<dyn Error>> {
-    let home = env::var("HOME")?;
-    Ok(PathBuf::from(setting(
-        "ESP_DATA_DIR",
-        format!("{home}/.esp-mint"),
-    )))
+    // A service names the directory and may have no home directory at all.
+    if let Ok(dir) = env::var("ESP_DATA_DIR") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    let home = env::var("HOME").map_err(|_| "HOME is not set: set ESP_DATA_DIR")?;
+    Ok(PathBuf::from(format!("{home}/.esp-mint")))
 }
 
 /// The data folder of the configured network, after refusing old files.

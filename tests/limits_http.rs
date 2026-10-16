@@ -72,6 +72,7 @@ fn start(rt: &Runtime, dir: &PathBuf) -> (String, Arc<EspState>) {
         config: Handle::new(cfg),
         rotor: None,
         rollovers: None,
+        in_flight: Default::default(),
     });
     (serve(rt, server::router(Arc::clone(&state))), state)
 }

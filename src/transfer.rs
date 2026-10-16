@@ -80,6 +80,11 @@ pub enum TransferRejection {
     NoOutputs,
     TooManyItems,
     ZeroAmount,
+    /// A note or an output amount is not a power of two. Nothing was burned.
+    BadDenomination {
+        output: bool,
+        index: usize,
+    },
     DuplicateInput,
     DuplicateBlindNonce,
     BlindNonceAlreadyUsed,
@@ -129,6 +134,7 @@ impl TransferRejection {
     pub fn code(&self) -> Option<&'static str> {
         match self {
             TransferRejection::Keyset { code, .. } => Some(code),
+            TransferRejection::BadDenomination { .. } => Some(crate::units::BAD_DENOMINATION),
             _ => None,
         }
     }
@@ -144,6 +150,11 @@ impl fmt::Display for TransferRejection {
                 "more notes or outputs than one transfer may have (transfer.max_items, {MAX_ITEMS} by default)"
             ),
             TransferRejection::ZeroAmount => write!(f, "a note or an output has amount zero"),
+            TransferRejection::BadDenomination { output, index } => write!(
+                f,
+                "{} {index}: ESP amounts are powers of two. Nothing was burned",
+                if *output { "output" } else { "note" }
+            ),
             TransferRejection::DuplicateInput => write!(f, "a note is listed twice"),
             TransferRejection::DuplicateBlindNonce => {
                 write!(f, "an output blind nonce is listed twice")
@@ -249,8 +260,8 @@ fn held_by(request: &TransferRequest) -> TransferPending {
     }
 }
 
-/// The shape of the request: counts, repeats and zero amounts. Nothing here
-/// touches the mint.
+/// The shape of the request: counts, repeats, zero amounts and sizes (each a
+/// power of two). Nothing here touches the mint.
 fn validate_shape(request: &TransferRequest, max_items: usize) -> Result<(), TransferRejection> {
     if request.inputs.is_empty() {
         return Err(TransferRejection::NoInputs);
@@ -268,18 +279,30 @@ fn validate_shape(request: &TransferRequest, max_items: usize) -> Result<(), Tra
         });
     }
     let mut nonces = HashSet::new();
-    for input in &request.inputs {
+    for (index, input) in request.inputs.iter().enumerate() {
         if input.amount.units == 0 {
             return Err(TransferRejection::ZeroAmount);
+        }
+        if !crate::units::is_denomination(input.amount.units) {
+            return Err(TransferRejection::BadDenomination {
+                output: false,
+                index,
+            });
         }
         if !nonces.insert(input.note.nonce) {
             return Err(TransferRejection::DuplicateInput);
         }
     }
     let mut blind_nonces = HashSet::new();
-    for output in &request.outputs {
+    for (index, output) in request.outputs.iter().enumerate() {
         if output.amount.units == 0 {
             return Err(TransferRejection::ZeroAmount);
+        }
+        if !crate::units::is_denomination(output.amount.units) {
+            return Err(TransferRejection::BadDenomination {
+                output: true,
+                index,
+            });
         }
         if !blind_nonces.insert(output.blind_nonce) {
             return Err(TransferRejection::DuplicateBlindNonce);
@@ -621,7 +644,8 @@ mod tests {
     const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
     const NOW: u64 = 1_791_571_184;
     const DAY: u64 = NOW / 86_400 + 365;
-    const ONE_PSP: u64 = 100_000_000_000;
+    /// A note size to test with: a power of two, about 0.7 PSP.
+    const ONE_PSP: u64 = 1 << 36;
 
     fn service() -> XOnlyPublicKey {
         XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
@@ -798,7 +822,44 @@ mod tests {
         )
     }
 
+    /// Split a total into powers of two, the way the wallet does: one note for
+    /// each bit set, largest first. Zero stays as one zero.
+    fn split(total: u64) -> Vec<u64> {
+        if total == 0 {
+            return vec![0];
+        }
+        (0..64)
+            .rev()
+            .map(|bit| 1u64 << bit)
+            .filter(|p| total & p != 0)
+            .collect()
+    }
+
+    /// Split a total into exactly `n` powers of two, by halving the largest
+    /// note that is more than one until there are `n`.
+    fn split_into(total: u64, n: usize) -> Vec<u64> {
+        let mut notes = split(total);
+        while notes.len() < n {
+            let i = notes.iter().position(|&a| a > 1).unwrap();
+            let half = notes[i] / 2;
+            notes[i] = half;
+            notes.insert(i + 1, half);
+        }
+        notes
+    }
+
+    /// Build a request the way a service does: each amount in `out_amounts` is
+    /// a total, split into powers of two.
     fn build(
+        notes: &[(Note, &Keypair, u64)],
+        out_amounts: &[u64],
+    ) -> (TransferRequest, Vec<Wanted>) {
+        let amounts: Vec<u64> = out_amounts.iter().flat_map(|&a| split(a)).collect();
+        build_exact(notes, &amounts)
+    }
+
+    /// Like `build`, but each output is as it stands, whatever it is.
+    fn build_exact(
         notes: &[(Note, &Keypair, u64)],
         out_amounts: &[u64],
     ) -> (TransferRequest, Vec<Wanted>) {
@@ -871,14 +932,14 @@ mod tests {
     #[test]
     fn a_transfer_swaps_the_notes_for_new_ones_with_the_same_terms() {
         let mut s = setup("happy");
-        let (a, ka) = s.esp_note(3 * ONE_PSP, service(), DAY);
+        let (a, ka) = s.esp_note(2 * ONE_PSP, service(), DAY);
         let (b, kb) = s.esp_note(ONE_PSP, service(), DAY);
         let (issued_before, redeemed_before) = s.totals();
-        assert_eq!((issued_before, redeemed_before), (4 * ONE_PSP, 0));
+        assert_eq!((issued_before, redeemed_before), (3 * ONE_PSP, 0));
 
         let (request, wanted) = build(
-            &[(a, &ka, 3 * ONE_PSP), (b, &kb, ONE_PSP)],
-            &[2 * ONE_PSP, 2 * ONE_PSP],
+            &[(a, &ka, 2 * ONE_PSP), (b, &kb, ONE_PSP)],
+            &[2 * ONE_PSP, ONE_PSP],
         );
         let response = s.run(&request).unwrap();
 
@@ -891,8 +952,8 @@ mod tests {
         // the inputs count as redeemed and the outputs as issued, by the same
         // amount, so the outstanding total is unchanged
         let (issued, redeemed) = s.totals();
-        assert_eq!(issued, issued_before + 4 * ONE_PSP);
-        assert_eq!(redeemed, redeemed_before + 4 * ONE_PSP);
+        assert_eq!(issued, issued_before + 3 * ONE_PSP);
+        assert_eq!(redeemed, redeemed_before + 3 * ONE_PSP);
         assert_eq!(issued - redeemed, issued_before - redeemed_before);
         // the stored response is a finished one
         assert!(matches!(
@@ -952,6 +1013,79 @@ mod tests {
     }
 
     #[test]
+    fn an_amount_that_is_not_a_power_of_two_is_refused_before_anything_is_burned() {
+        let mut s = setup("denomination");
+        let (a, ka) = s.esp_note(2 * ONE_PSP, service(), DAY);
+        let totals = s.totals();
+        // an output of the right total that is not a power of two
+        let (request, _) = build_exact(&[(a, &ka, 2 * ONE_PSP)], &[ONE_PSP + 1, ONE_PSP - 1]);
+        let r = rejection(s.run(&request));
+        assert_eq!(
+            r,
+            TransferRejection::BadDenomination {
+                output: true,
+                index: 0
+            }
+        );
+        assert_eq!(
+            r.to_string(),
+            "output 0: ESP amounts are powers of two. Nothing was burned"
+        );
+        assert_eq!(r.code(), Some("bad_denomination"));
+        // one odd output among good ones names its place
+        let (request, _) = build_exact(&[(a, &ka, 2 * ONE_PSP)], &[ONE_PSP, ONE_PSP - 1, 1]);
+        assert_eq!(
+            rejection(s.run(&request)),
+            TransferRejection::BadDenomination {
+                output: true,
+                index: 1
+            }
+        );
+        // an incoming note of an odd size is refused the same way, whatever the
+        // mint holds under that amount
+        let odd = ONE_PSP + 5;
+        let (b, kb) = s.esp_note(odd, service(), DAY);
+        let (request, _) = build_exact(&[(b, &kb, odd)], &split(odd));
+        let r = rejection(s.run(&request));
+        assert_eq!(
+            r,
+            TransferRejection::BadDenomination {
+                output: false,
+                index: 0
+            }
+        );
+        assert_eq!(
+            r.to_string(),
+            "note 0: ESP amounts are powers of two. Nothing was burned"
+        );
+        assert!(!s.logic.is_spent(a.nonce).unwrap());
+        assert!(!s.logic.is_spent(b.nonce).unwrap());
+        assert_eq!(s.totals(), (totals.0 + odd, totals.1));
+        assert!(s.responses.is_empty());
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_total_split_into_powers_of_two_is_transferred() {
+        let mut s = setup("split");
+        let (a, ka) = s.esp_note(4 * ONE_PSP, service(), DAY);
+        // one note of 4 ONE_PSP, paid out as two totals that are not powers of
+        // two, each split into powers of two
+        let (request, wanted) = build(&[(a, &ka, 4 * ONE_PSP)], &[4 * ONE_PSP - 5, 5]);
+        assert!(request.outputs.len() > 2);
+        assert!(
+            request
+                .outputs
+                .iter()
+                .all(|o| o.amount.units.is_power_of_two())
+        );
+        let response = s.run(&request).unwrap();
+        assert_outputs_verify(&s, &response, &wanted);
+        assert!(s.logic.is_spent(a.nonce).unwrap());
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
     fn a_fee_is_paid_in_esp_on_top_of_the_exact_amount_and_the_rate_is_kept() {
         let mut s = setup("fee");
         let rate = 1_000u128;
@@ -982,8 +1116,20 @@ mod tests {
         }
         assert!(!s.logic.is_spent(a.nonce).unwrap());
         assert!(s.responses.is_empty());
-        // With the fee left off the outputs, it goes through.
-        let (request, _) = build(&[(a, &ka, ONE_PSP)], &[ONE_PSP - fee_esp as u64]);
+        // With the fee left off the outputs, it goes through. The fee depends on
+        // how many outputs there are, and the rest is split into powers of two,
+        // so take the fewest outputs n for which the rest after the fee for n
+        // outputs splits into exactly n.
+        let (n, rest, fee_esp, size) = (1..=MAX_ITEMS)
+            .find_map(|n| {
+                let size = fee::transfer_size(1, n);
+                let fee_esp = fee::charge(size, rate);
+                let rest = ONE_PSP - fee_esp as u64;
+                (split(rest).len() <= n && n as u64 <= rest).then_some((n, rest, fee_esp, size))
+            })
+            .unwrap();
+        let (request, _) = build_exact(&[(a, &ka, ONE_PSP)], &split_into(rest, n));
+        assert_eq!(request.outputs.len(), n);
         let response =
             transfer_with(&s.logic, &s.master, &mut s.responses, &request, &with_fee).unwrap();
         assert_eq!(
@@ -1013,28 +1159,28 @@ mod tests {
 
     #[test]
     fn sums_are_exact_in_u128_past_the_size_of_one_note() {
-        let two = 2 * u128::from(u64::MAX);
+        let top = 1u64 << 63;
+        let two = 2 * u128::from(top);
         let ok = fake_request(
-            vec![fake_input(u64::MAX), fake_input(u64::MAX)],
-            vec![fake_output(u64::MAX), fake_output(u64::MAX)],
+            vec![fake_input(top), fake_input(top)],
+            vec![fake_output(top), fake_output(top)],
         );
         assert_eq!(validate(&ok), Ok(()));
         let short = fake_request(
-            vec![fake_input(u64::MAX), fake_input(u64::MAX)],
-            vec![fake_output(u64::MAX), fake_output(u64::MAX - 1)],
+            vec![fake_input(top), fake_input(top)],
+            vec![fake_output(top), fake_output(1)],
         );
         assert_eq!(
             validate(&short),
             Err(TransferRejection::NotExact {
                 inputs: two,
-                outputs: two - 1,
+                outputs: u128::from(top) + 1,
             })
         );
         // a split whose pieces add up to more than one note holds
-        let half = u64::MAX / 2 + 1;
         let split = fake_request(
-            vec![fake_input(half), fake_input(half)],
-            vec![fake_output(u64::MAX), fake_output(1)],
+            vec![fake_input(top), fake_input(top)],
+            vec![fake_output(top), fake_output(top / 2), fake_output(top / 2)],
         );
         assert_eq!(validate(&split), Ok(()));
     }

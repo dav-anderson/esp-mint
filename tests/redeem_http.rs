@@ -26,7 +26,8 @@ use serde_json::Value;
 use tokio::runtime::Runtime;
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-const ONE: u64 = 1_000_000_000_000;
+/// A test amount, a power of two (about $1.10).
+const ONE: u64 = 1 << 40;
 /// A day long past, so that every note below is mature on the mint's clock.
 const PAST: u64 = 100;
 const PAST2: u64 = 200;
@@ -113,6 +114,11 @@ fn out_ks() -> String {
 }
 
 fn start(rt: &Runtime, dir: &PathBuf, max_bytes: usize) -> Mint {
+    start_at_rate(rt, dir, max_bytes, RATE)
+}
+
+/// `start`, with the redemption fee rate (ESP units per byte) chosen.
+fn start_at_rate(rt: &Runtime, dir: &PathBuf, max_bytes: usize, rate: u128) -> Mint {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     let id = esp_mint::rotation::keyset_id(&master);
     set_keysets(&id, &id);
@@ -127,12 +133,13 @@ fn start(rt: &Runtime, dir: &PathBuf, max_bytes: usize) -> Mint {
         queue_lock: Mutex::new(()),
         config: esp_mint::config::Handle::new({
             let mut config = esp_mint::config::Config::default();
-            config.redeem_fee_per_byte = RATE as u64;
+            config.redeem_fee_per_byte = rate as u64;
             config.redeem_max_request_bytes = max_bytes;
             config
         }),
         rotor: None,
         rollovers: None,
+        in_flight: Default::default(),
     });
     let esp = serve(rt, server::router(Arc::clone(&state)));
     let admin_state = Arc::new(AdminState {
@@ -198,6 +205,15 @@ fn request(
     decline: &[(u64, u64)],
     service_signer: &Keypair,
 ) -> (RedeemRequest, Vec<Wanted>) {
+    request_with_memo(notes, decline, service_signer, MEMO)
+}
+
+fn request_with_memo(
+    notes: &[(Note, &Keypair, u64, u64)],
+    decline: &[(u64, u64)],
+    service_signer: &Keypair,
+    memo: &str,
+) -> (RedeemRequest, Vec<Wanted>) {
     let mut wanted = Vec::new();
     let mut decline_outputs = Vec::new();
     for &(amount, day) in decline {
@@ -232,7 +248,7 @@ fn request(
             },
         })
         .collect();
-    let sighash = redeem::digest(&service(), &out_ks(), &inputs, MEMO, &decline_outputs, &[]);
+    let sighash = redeem::digest(&service(), &out_ks(), &inputs, memo, &decline_outputs, &[]);
     for (input, (_, keypair, _, _)) in inputs.iter_mut().zip(notes) {
         input.input.spend_signature = SECP256K1.sign_schnorr(&sighash, keypair);
     }
@@ -242,7 +258,7 @@ fn request(
             service: service(),
             output_keyset: out_ks(),
             inputs,
-            memo: MEMO.to_string(),
+            memo: memo.to_string(),
             decline_outputs,
             refund_outputs: vec![],
             service_signature,
@@ -296,11 +312,11 @@ fn a_request_over_the_ceiling_is_refused_before_it_is_parsed() {
     // a request that is perfectly good but too big is refused without a burn or a fee
     let mut held = Vec::new();
     for _ in 0..8 {
-        held.push(esp_note(&mint, 3 * ONE, service(), PAST));
+        held.push(esp_note(&mint, 4 * ONE, service(), PAST));
     }
     let notes: Vec<(Note, &Keypair, u64, u64)> = held
         .iter()
-        .map(|(note, key)| (*note, key, 3 * ONE, PAST))
+        .map(|(note, key)| (*note, key, 4 * ONE, PAST))
         .collect();
     let (req, _) = request(&notes, &[], &service_keypair());
     let bytes = req.encode();
@@ -319,8 +335,8 @@ fn a_request_that_is_not_the_canonical_encoding_is_a_400() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("malformed");
     let mint = start(&rt, &dir, 64 * 1024 * 1024);
-    let (note, key) = esp_note(&mint, 3 * ONE, service(), PAST);
-    let (req, _) = request(&[(note, &key, 3 * ONE, PAST)], &[], &service_keypair());
+    let (note, key) = esp_note(&mint, 4 * ONE, service(), PAST);
+    let (req, _) = request(&[(note, &key, 4 * ONE, PAST)], &[], &service_keypair());
     let mut bytes = req.encode();
     bytes.push(0);
     let (code, body) = post_bytes(&mint.esp, bytes);
@@ -335,12 +351,49 @@ fn a_request_that_is_not_the_canonical_encoding_is_a_400() {
 }
 
 #[test]
+fn an_amount_that_is_not_a_power_of_two_is_a_400_with_no_burn_and_no_fee() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("denomination");
+    let mint = start(&rt, &dir, 64 * 1024 * 1024);
+    let (good, kg) = esp_note(&mint, 4 * ONE, service(), PAST);
+    // an incoming note of an odd size, which the mint holds under that amount
+    let (odd, ko) = esp_note(&mint, ONE + 5, service(), PAST);
+
+    let (req, _) = request(&[(odd, &ko, ONE + 5, PAST)], &[], &service_keypair());
+    let (code, body) = post_bytes(&mint.esp, req.encode());
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(body["code"], "bad_denomination");
+    assert_eq!(
+        body["error"],
+        "note 0: ESP amounts are powers of two. Nothing was burned and no fee was taken"
+    );
+
+    // a decline output that is not a power of two
+    let (req, _) = request(
+        &[(good, &kg, 4 * ONE, PAST)],
+        &[(ONE, PAST), (ONE + 1, PAST)],
+        &service_keypair(),
+    );
+    let (code, body) = post_bytes(&mint.esp, req.encode());
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(body["code"], "bad_denomination");
+    assert_eq!(
+        body["error"],
+        "decline output 1: ESP amounts are powers of two. Nothing was burned and no fee was taken"
+    );
+
+    assert!(!is_spent(&mint, &good) && !is_spent(&mint, &odd));
+    assert!(nothing_stored(&mint));
+    rt.shutdown_background();
+}
+
+#[test]
 fn a_bad_service_signature_is_a_400_with_no_burn_and_no_fee() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("badsig");
     let mint = start(&rt, &dir, 64 * 1024 * 1024);
-    let (note, key) = esp_note(&mint, 3 * ONE, service(), PAST);
-    let (req, _) = request(&[(note, &key, 3 * ONE, PAST)], &[], &other_keypair());
+    let (note, key) = esp_note(&mint, 4 * ONE, service(), PAST);
+    let (req, _) = request(&[(note, &key, 4 * ONE, PAST)], &[], &other_keypair());
     let (code, body) = post_bytes(&mint.esp, req.encode());
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "bad_service_signature");
@@ -354,10 +407,10 @@ fn a_redemption_is_queued_then_declined_and_the_service_collects_the_reissued_no
     let rt = Runtime::new().unwrap();
     let dir = scratch("flow");
     let mint = start(&rt, &dir, 64 * 1024 * 1024);
-    let (a, ka) = esp_note(&mint, 3 * ONE, service(), PAST);
+    let (a, ka) = esp_note(&mint, 4 * ONE, service(), PAST);
     let (b, kb) = esp_note(&mint, 2 * ONE, service(), PAST2);
     let (req, wanted) = request(
-        &[(a, &ka, 3 * ONE, PAST), (b, &kb, 2 * ONE, PAST2)],
+        &[(a, &ka, 4 * ONE, PAST), (b, &kb, 2 * ONE, PAST2)],
         &[(2 * ONE, PAST), (2 * ONE, PAST2)],
         &service_keypair(),
     );
@@ -367,10 +420,10 @@ fn a_redemption_is_queued_then_declined_and_the_service_collects_the_reissued_no
 
     let (code, body) = post_bytes(&mint.esp, bytes.clone());
     assert_eq!(code, 200, "{body}");
-    assert_eq!(body["accepted_esp"], (5 * ONE).to_string());
+    assert_eq!(body["accepted_esp"], (6 * ONE).to_string());
     assert_eq!(body["fee_esp"], fee.to_string());
     assert_eq!(body["size_bytes"], bytes.len());
-    assert_eq!(body["owed_esp"], (u128::from(5 * ONE) - fee).to_string());
+    assert_eq!(body["owed_esp"], (u128::from(6 * ONE) - fee).to_string());
     assert_eq!(body["message"], "payout queued");
     assert_eq!(body["entry"]["status"], "open");
     assert_eq!(body["notes"][0]["accepted"], true);
@@ -456,11 +509,11 @@ fn a_redemption_split_across_two_requests_makes_two_queue_entries() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("split");
     let mint = start(&rt, &dir, 64 * 1024 * 1024);
-    let (a, ka) = esp_note(&mint, 3 * ONE, service(), PAST);
+    let (a, ka) = esp_note(&mint, 4 * ONE, service(), PAST);
     let (b, kb) = esp_note(&mint, 2 * ONE, service(), PAST);
     let (c, kc) = esp_note(&mint, 4 * ONE, service(), PAST2);
     let (first, _) = request(
-        &[(a, &ka, 3 * ONE, PAST), (b, &kb, 2 * ONE, PAST)],
+        &[(a, &ka, 4 * ONE, PAST), (b, &kb, 2 * ONE, PAST)],
         &[],
         &service_keypair(),
     );
@@ -492,12 +545,22 @@ fn a_redemption_split_across_two_requests_makes_two_queue_entries() {
 fn when_the_accepted_notes_only_cover_the_fee_nothing_is_owed_and_a_retry_says_so() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("nothing-owed");
-    let mint = start(&rt, &dir, 64 * 1024 * 1024);
-    // the fee for one note and no outputs: 320 bytes
-    let fee = redeem::fee_for(redeem::encoded_len(1, MEMO.len(), 0, 0), RATE);
-    assert_eq!(fee, 320_000_000);
+    // A fee only a power of two can equal: a rate of 2^20 per byte, and a memo
+    // that makes the request exactly 512 bytes (119 + 186 for one note, and 207
+    // of memo), so the fee is 2^29 and one note of that size covers it exactly.
+    let rate: u128 = 1 << 20;
+    let mint = start_at_rate(&rt, &dir, 64 * 1024 * 1024, rate);
+    let memo = format!("{:x<207}", "btc:bc1qpayhere-");
+    assert_eq!(memo.len(), 207);
+    let fee = redeem::fee_for(redeem::encoded_len(1, memo.len(), 0, 0), rate);
+    assert_eq!(fee, 1 << 29);
     let (note, key) = esp_note(&mint, fee as u64, service(), PAST);
-    let (req, _) = request(&[(note, &key, fee as u64, PAST)], &[], &service_keypair());
+    let (req, _) = request_with_memo(
+        &[(note, &key, fee as u64, PAST)],
+        &[],
+        &service_keypair(),
+        &memo,
+    );
     let (code, body) = post_bytes(&mint.esp, req.encode());
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["owed_esp"], "0");
@@ -519,12 +582,12 @@ fn a_request_below_the_fee_is_refused_with_the_fee_in_the_body() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("below-fee");
     let mint = start(&rt, &dir, 64 * 1024 * 1024);
-    let (note, key) = esp_note(&mint, 1000, service(), PAST);
-    let (req, _) = request(&[(note, &key, 1000, PAST)], &[], &service_keypair());
+    let (note, key) = esp_note(&mint, 512, service(), PAST);
+    let (req, _) = request(&[(note, &key, 512, PAST)], &[], &service_keypair());
     let (code, body) = post_bytes(&mint.esp, req.encode());
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "below_fee");
-    assert_eq!(body["value_esp"], "1000");
+    assert_eq!(body["value_esp"], "512");
     assert_eq!(body["fee_esp"], "320000000");
     // the per-note reasons are in the body, and nothing was burned
     assert_eq!(body["notes"].as_array().unwrap().len(), 1);
@@ -540,25 +603,25 @@ fn decline_outputs_over_the_limit_come_back_with_the_totals_to_rebuild_from() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("over-limit");
     let mint = start(&rt, &dir, 64 * 1024 * 1024);
-    let (a, ka) = esp_note(&mint, 3 * ONE, service(), PAST);
+    let (a, ka) = esp_note(&mint, 4 * ONE, service(), PAST);
     // asks for all of it back, but the fee comes off
     let (req, _) = request(
-        &[(a, &ka, 3 * ONE, PAST)],
-        &[(3 * ONE, PAST)],
+        &[(a, &ka, 4 * ONE, PAST)],
+        &[(4 * ONE, PAST)],
         &service_keypair(),
     );
     let (code, body) = post_bytes(&mint.esp, req.encode());
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "outputs_over_limit");
     assert_eq!(body["list"], "decline_outputs");
-    assert_eq!(body["totals"]["accepted_esp"], (3 * ONE).to_string());
+    assert_eq!(body["totals"]["accepted_esp"], (4 * ONE).to_string());
     assert_eq!(
         body["totals"]["accepted_by_terms"][0]["redeemable_after_day"],
         PAST
     );
     assert_eq!(
         body["totals"]["accepted_by_terms"][0]["esp"],
-        (3 * ONE).to_string()
+        (4 * ONE).to_string()
     );
     assert!(!is_spent(&mint, &a));
     assert!(nothing_stored(&mint));
@@ -600,6 +663,7 @@ fn start_rotating_with(
             esp_mint::rotation::Rollovers::open(&data).unwrap(),
         )),
         rotor: Some(Mutex::new(rotor)),
+        in_flight: Default::default(),
     });
     let esp = serve(rt, server::router(Arc::clone(&state)));
     let admin = serve(

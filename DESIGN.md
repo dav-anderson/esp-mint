@@ -27,13 +27,14 @@ The master secret is a file of 64 hex characters, `master_secret.hex`, with `060
 
 - 1 PSP = 10^11 ESP, so 10 PSP = $1 = 10^12 ESP. ESP to FSP is 1:1, so an FSP mint uses the same unit.
 - **Why ten PSP to the dollar, and not a thousand.** A finer PSP unit gives more precision, but the PSP purchase is paid with a Bitcoin transaction whose OP_RETURN carries one 41-byte entry (an 8-byte amount and a 33-byte point) for every PSP note the wallet asks for, and that space is limited and is not raised. A purchase is split into powers of two, so each factor of 2 in the unit adds about one more possible output. Going from 1 PSP to the dollar to 10 adds about 3.3 denominations (a worst case of 4 more outputs, 164 bytes); going to 1000 would add about 10 (a worst case of 10 more, 410 bytes), about three times the added payload for precision the purchase does not need. Ten to the dollar keeps the precision at a small cost. The rate is `ESP_PER_PSP` in `src/units.rs`.
+- **ESP notes are powers of two**, so notes of one size look alike; see "ESP amounts are powers of two".
 - Amounts are `u64`, so one note is worth at most about 1.8e19 units, which is about $18.4 million (184,467,440 PSP when converted to ESP).
 - A request can hold many notes. Every sum, and every PSP-to-ESP conversion (PSP units times 10^11), is computed in `u128` or with checked arithmetic, so an overflow is an error and never wraps.
 - The constants and helpers are in `src/units.rs`, with tests at the limits: the largest PSP that fits one note, one PSP over it, `u64::MAX` sums, and totals that exceed one note.
 
 ## The exchange
 
-1. The wallet sends PSP notes and blinded outputs to the ESP mint, along with the service ID it wants. It does not send a date. The outputs can have any non-zero amount, and a request holds at most 1000 notes and 1000 outputs. The smallest exchange is 1 PSP ($0.10, 10^11 ESP) by default (`exchange.min_psp`).
+1. The wallet sends PSP notes and blinded outputs to the ESP mint, along with the service ID it wants. It does not send a date. Every output amount must be a power of two (see "ESP amounts are powers of two"), and a request holds at most 1000 notes and 1000 outputs. The smallest exchange is 1 PSP ($0.10, 10^11 ESP) by default (`exchange.min_psp`).
 2. The PSP notes, times 10^11, must equal the total of the ESP outputs exactly, or the request is refused before anything is burned. See "Exact amounts and the minimum". The mint charges no exchange fee. The request is an AIR message, and its cost is paid in AIR currency and charged by AIR messaging, not by this mint.
 3. The mint checks everything it can before it burns: no other unfinished request holds any of the PSP notes or output blind nonces (see "Reservation" below), the output blind nonces are unused, the PSP notes are unspent at the PSP (`/burns`), and every note's spend signature verifies over the memo below. The spend signatures are public to check, and they cover the memo, so only the holder of the notes can authorize this request.
 4. The ESP mint calls the PSP's `/melt` with the notes. The memo is the hex of `SHA-256("esp-mint/exchange/v1" || service || each output's amount and blind nonce)`, and the wallet's spend signatures cover that memo. The burn is bound to this one request. The PSP keeps the memo of every burn (see "Burn memos" below). The mint checks that the PSP burned exactly the amount it expected.
@@ -62,6 +63,28 @@ The tests cover a retry after the mint's own burn (it issues without burning aga
 
 **The issued total.** From mint-core v0.1.3 the nonce mark and the total are one sled transaction.  sled is a stand-in for the storage the mint will have in the AIR, and that storage must keep the same rule as mint-core v0.1.3: marking an output's blind nonce used and adding its amount to the issued total are one atomic step.
 
+### Not holding the lock while the PSP is called
+
+The exchange calls the PSP twice (a look at the notes, then the burn) and a PSP can be slow or not answer. The mint's lock (the mint and the stored responses) is not held across either call, so a slow PSP holds up only the request that is waiting on it. A transfer, a redemption, `/audit` and an unrelated exchange go on as usual. The exchange runs in five phases, and the lock is held in three of them:
+
+1. **Check (lock).** Every check there was before, in the same order: shape, stored answer, amounts, spend signatures, the mint's database, the reservations of other requests. Nothing is written.
+2. **Look at the notes (no lock).** A new request asks the PSP whether any note is already spent, and is refused `400` if one is. Nothing is written, so a PSP that cannot be asked leaves nothing behind (`502`, and a retry starts clean).
+3. **Reserve (lock).** The database and reservation checks are made again, because the lock was let go and another request may have got in, and then the `pending` entry is written: the request hash, the day, the PSP note nonces and the output blind nonces. This is the reservation; it is on file before the PSP is asked to burn anything.
+4. **Burn (no lock).** The PSP burns the notes. A retry asks the PSP what became of them first, as in "Burn memos".
+5. **Finish (lock).** The entry is checked to be the pending one this request wrote, the outputs are signed, and the `done` entry replaces it. A key set that retired in the meantime does not stop it: the notes may be burned, so it is signed with the current set, as for any pending request.
+
+**Guarantees kept.**
+
+- *No two requests burn the same PSP notes.* The reservation in phase 3 is written under the lock, after the check that nobody else holds the notes, so two different requests for one note are serialized there: the second gets `400` (held by another request) without reaching the PSP.
+- *No request is recorded twice.* The entry is keyed by the request hash.
+- *Crash-safe by request hash.* A crash after any phase leaves the mint as one of three things: nothing written (before phase 3), a `pending` entry with the notes not burned, or a `pending` entry with the notes burned, and the retry works out which from the PSP's memo of the burn. The unit tests stop after each phase, restart, and retry.
+
+**The same request twice at once.** A request that is `pending` on file is a retry to carry on with, whether it was left by a crash or is being worked on right now. Without the lock held, a second copy that arrives while the first waits at the PSP would be taken for a retry and would call the PSP too. The server keeps the hashes it is working on in memory (`EspState::in_flight`). A copy that arrives while its hash is there is answered `409` with `code: "in_progress"` and is not processed: nothing is burned or written, and the wallet keeps its request and sends it again (it treats any answer other than `400` as "not known", keeps the request pending and offers `--resume`). The set is not storage and nothing of it survives: a restart empties it, which is right, since nothing is running after one and the `pending` entry on file is a crashed request to carry on. The place is given up however the request ends, including a panic, so a failed request leaves no mark.
+
+**A PSP timeout.** The PSP client gives up after `psp.timeout_secs` (30 by default), and the request is answered `502`. Nothing is running, no lock is held, and no mark is left in memory. What is on file depends on where it stopped. A failure in phase 2 left nothing. A failure in phase 4 leaves the `pending` entry, because whether the PSP burned is not known and the entry is how the retry finds out; the retry asks the PSP and either burns or skips the burn. The entry holds the notes against other requests until then, as it did before, and the notes are not stuck: the retry of that request frees them, and a note the holder spent somewhere else in the meantime makes the retry answer `note_spent_elsewhere`, which tells the wallet to mark it spent. An exchange that is never retried keeps holding its notes; that is the cost of not knowing whether the burn happened, and it was so before this change.
+
+**What this does not change.** The lock is still taken for every phase that reads or writes the mint, so everything the mint writes is still written by one request at a time. The checks, their order and their answers are the same. The one new answer is `409 in_progress`; the code is `server::IN_PROGRESS` and is not in `sp-wire` yet.
+
 **Wallet.** `ecash-wallet exchange --service <x-only hex> --psp N` builds this request, sends it to `/exchange` and unblinds the reply into ESP notes (see the ecash-wallet README). The wallet picks PSP notes worth at least N and asks for all of their value, so the request is always exact: N PSP of ESP, plus any difference as extra ESP notes under the same terms (change). It saves the request, the blinding factors and the new spend keys before sending, so after a timeout `exchange --resume <id>` sends the same request again and gets the stored response. A `400` means nothing was burned and the wallet frees its PSP notes. Each ESP note is stored with its spend key, its amount and its terms (service and redeemable-after day).
 
 ## Wire format and versions
@@ -77,7 +100,7 @@ An app that pays a service with ESP hands the service the notes, and with them e
 - **Request.** `POST /transfer` takes the service (x-only), the redeemable-after day, the ESP inputs, the blinded outputs the service chose, and the service's signature. One request covers one set of terms, and a request holds at most 1000 inputs and 1000 outputs.
 - **Digest.** `SHA-256("esp-mint/transfer/v1" || service || redeemable_after_day || input count || each input's amount and nonce || output count || each output's amount and blind nonce)`. The terms are 40 bytes (the service, then the day, big-endian). Every input is signed over the digest by the note's own nonce key, which the service now holds, and the service signs it with its key (Schnorr, x-only, the key named in the terms). The spend signatures are not part of the digest.
 - **Only the named service.** The service signature is checked first. Each input is then checked against the key the mint derives for its amount and for the request's terms, so a note named for another service, or for another day, does not verify (`BadNote`). The outputs are signed under the same terms, so the new notes name the same service and the same day. An app cannot move ESP to another service or to a peer: nothing it can sign changes whose key must sign the request.
-- **Exact.** The inputs and the outputs must have the same total, summed in `u128`, or the request is refused before anything is burned, with an error that says whether it is over or short and by how much. Zero amounts, repeated inputs and repeated output blind nonces are refused. There is no minimum.
+- **Exact.** The inputs and the outputs must have the same total, summed in `u128`, or the request is refused before anything is burned, with an error that says whether it is over or short and by how much. Zero amounts, amounts that are not a power of two (inputs and outputs both), repeated inputs and repeated output blind nonces are refused. There is no minimum.
 - **No fee.** The request is an AIR message, and the AIR send fee covers it. The mint charges nothing.
 - **Result.** The inputs are burned with `MintLogic::redeem_with_key` and the outputs are signed with `MintLogic::issue_with_key`. The inputs count as redeemed and the outputs as issued, by the same amount, so `/audit` shows both rising together and `outstanding` unchanged. Nothing is burned out of circulation and no value is created.
 - **Double presentation.** The service issues FSP only after its transfer succeeds, one FSP unit for each ESP unit. If the note was already presented, the transfer fails with `AlreadySpent` and no FSP is issued.
@@ -94,7 +117,7 @@ An app that pays a service with ESP hands the service the notes, and with them e
 
 The pending entry also keeps other requests away, as the exchange's does (see "Reservation" under "The exchange"). Until a transfer is done, no other request can use a note or an output blind nonce it names. So an input that is spent while a transfer of it is pending was spent by that transfer, and a retry can skip it safely. Without this, a second request for the same note, made between a crash and the retry, could burn the note and leave the first request to issue outputs for a note it did not burn.
 
-**Wallet.** The app side is `hand-over` and the service side is `receive` and `transfer` (see the ecash-wallet README). The app hands over whole notes that add up to the amount, because it cannot split an ESP note. The service takes them in, builds the request with fresh blinded outputs and sends it to `/transfer`. Handing the notes to the service is an AIR message, which is deferred. For now it is a file.
+**Wallet.** The app side is `hand-over` and the service side is `receive` and `transfer` (see the ecash-wallet README). The app hands over whole notes that add up to the amount, because it cannot split an ESP note. The service takes them in, builds the request with fresh blinded outputs (the total split into the fewest powers of two) and sends it to `/transfer`. Handing the notes to the service is an AIR message, which is deferred. For now it is a file.
 
 ## Redemption
 
@@ -165,6 +188,7 @@ A request body over `redeem.max_request_bytes` (64 MiB) is refused with `413` an
 | HTTP, `413` | `request_too_large` | Body over `redeem.max_request_bytes`. Not read or parsed. | No, no |
 | `400` | `malformed_request` | Not a valid encoding (version, length, key, counts, memo not UTF-8). | No, no |
 | `400` | `no_inputs`, `zero_amount`, `memo_invalid`, `duplicate_blind_nonce`, `blind_nonce_already_used` | Shape and field limits. | No, no |
+| `400` | `bad_denomination` | A note, a decline output or a refund output is not a power of two. The message names which and its position. | No, no |
 | `400` | `bad_service_signature` | The service did not sign this. | No, no |
 | `400` | `note_held` | An output blind nonce is held by another unfinished request. | No, no |
 | `400` | `below_fee` | V is less than the fee. `notes` says why each rejected input was. | No, no |
@@ -178,6 +202,8 @@ A request body over `redeem.max_request_bytes` (64 MiB) is refused with `413` an
 The mint pays out by hand in BTC, USD or another agreed method, then marks the entry completed with a payment reference (`esp-mint pay`). The USD value of an amount is the amount divided by 10^12. Before paying, the mint checks that the service met its terms. This is manual for now, because uptime cannot be checked by a machine yet. If a payout fails, the entry stays open and is retried. Notes are never reissued because of a failed payout.
 
 If the terms were not met, the operator declines: `esp-mint decline <entry id> --reason TEXT` (or `POST /payouts/decline` on the admin listener, `{"entry_id", "reason"}`). The mint signs the stored decline outputs, marks the entry declined, and stores the signatures and the reason (at most `redeem.max_reason_bytes`, 1024) on the entry. The service **resends the same request** (same hash), and the reply carries the entry's status: **open**, **completed** with the payment reference, or **declined** with the reason and the signatures. Each output keeps its original service and date; there is no reset. The fee is not returned.
+
+**What a decline says.** Over the AIR a decline is a plain message to the service's DID: the reason text and the signatures. The reason is free text written by the operator (`--reason`, at most 1024 bytes), and no code or structure is needed because a person reads it. The most common one is that the notes are not mature yet ("these notes are not mature yet; wait until they mature and try again"), after which the service redeems again. That question is closed. The mint adds nothing to explain a decline beyond that text.
 
 **This is a development stand-in.** Delivery of the decline over a request-and-reply is temporary; it will be replaced by delivery over the AIR. The decline outputs' blind nonces stay reserved while the entry is open, and for good after it, so that nothing else can be issued on them.
 
@@ -228,7 +254,7 @@ Every route that takes a body has a ceiling on its size, set per route and enfor
 | `POST /rollover` | 1 MiB (`rollover.max_request_bytes`) | At most `rollover.max_items` (1000) notes; the same shape as a transfer. |
 | operator routes | 1 MiB (`admin.max_request_bytes`) | Loopback only; small JSON. Same `413` body as the public routes. |
 
-After the size, every route checks in the same order, cheapest first, and nothing is written or burned until all have passed: **size, then shape and field limits** (counts, repeats, zero amounts, lengths), **the amounts** (exactness, fee), **signatures**, **the mint's database** (spent notes, used blind nonces), **reservations** held by other unfinished requests, and last anything that is written or burned. (An answer found in the database is held back until the reservations have been looked at, because a note that is spent may be spent by an unfinished request, and then "held" is the truer answer. The exchange asks the PSP last of all.)
+After the size, every route checks in the same order, cheapest first, and nothing is written or burned until all have passed: **size, then shape and field limits** (counts, repeats, zero amounts, amounts that are not a power of two, lengths), **the amounts** (exactness, fee), **signatures**, **the mint's database** (spent notes, used blind nonces), **reservations** held by other unfinished requests, and last anything that is written or burned. (An answer found in the database is held back until the reservations have been looked at, because a note that is spent may be spent by an unfinished request, and then "held" is the truer answer. The exchange asks the PSP last of all.)
 
 ### Fees on the exchange and the transfer
 
@@ -238,6 +264,35 @@ Both default to 0: there is no mint fee, and behavior is as it was. They are 0 b
 - It is paid in ESP on top of the exact amount: the notes must be worth the outputs **plus** the fee, and the request is still checked as exact against that total. An exchange of 1 PSP at 1000 ESP units a byte, one note and one output (235 bytes), has a fee of 235,000 ESP units, so its output is 10^11 − 235,000. The fee comes out of what the wallet asks for, so the wallet never needs a second note to pay it.
 - A request that is not exact against that total is refused before anything is burned, with `code: "not_exact"` and the `fee_esp`, `size_bytes`, `fee_per_byte`, `paid_esp`, `outputs_esp` and `required_esp` the wallet needs to rebuild it.
 - `GET /fees` returns the rates, ceilings, limits and size formulas now in force for all three routes, so a wallet reads them rather than assuming.
+
+## ESP amounts are powers of two
+
+Every ESP amount the mint signs or accepts is a power of two (1, 2, 4, ... 2^63). Zero is not one. The check is `units::is_denomination`, and the error code is `bad_denomination`, the same as the FSP mint's.
+
+**Why.** A note's amount is public: it is part of the note, and the mint derives a different signing key for each amount and terms. If any amount were allowed, the amount would work as a fingerprint. A service that is handed notes of 83,917,422,011 and 4,101 units could recognise the same notes again wherever it sees them, and tie a transfer to the exchange that made them. When every note is a power of two, notes of the same size look alike, and the total a holder owns is spread over at most 64 sizes instead of being a number that identifies them. The PSP and FSP mints already work this way (a PSP purchase is split into powers of two, and the FSP mint refuses anything else), so this brings ESP in line.
+
+**Every route that signs ESP applies it:**
+
+- **Exchange.** Each output must be a power of two. The PSP notes are PSP-denominated and are not checked here (the PSP mint checks them).
+- **Transfer.** Each input and each output.
+- **Redemption.** Each input note, and each decline and refund output. The totals of those lists need not be powers of two, only the individual amounts.
+- **Rollover.** Not changed: the outputs must have exactly the amounts of the inputs, so it adds no new amount. See below.
+
+**Order.** The check is part of the shape check, before the stored-response lookup, before any signature, database or PSP call, and before anything is burned or charged. A redemption refused for it takes no fee. The messages end "Nothing was burned" (and "no fee was taken" for redemption), the way the PSP and FSP wording does.
+
+**Splitting is the wallet's job.** The mint never splits or merges. The wallet splits an exchange or transfer total into the fewest powers of two (the binary representation of the total, so a total of 7 is 4, 2 and 1), including the change from an exchange. It splits the amount a redemption refunds or declines the same way.
+
+**The fee and the number of outputs depend on each other.** When a fee per byte is set, the fee is the rate times the request's size, and the size depends on how many outputs there are. With any-amount outputs the wallet picked the count and then computed the fee. With powers of two the count of outputs follows from the amount left after the fee, and that amount follows from the count. The wallet resolves this by trying counts upward: for a count n it takes the total less the fee for n outputs, and accepts n if that amount needs at most n notes in binary and is at least n (so it can be split into exactly n notes by halving the largest). When a redemption has several services or days, each one's total is first split into the fewest notes, and the extra notes needed to reach n are cut from the largest note of the days the fee came out of (the wallet takes the fee from the day with the most value first). A day the fee did not touch keeps the fewest notes its amount allows. Only when the days the fee touched have nothing left to halve are the others cut. The smallest such n is used. The fee is paid with the exact amount the mint expects, so a wallet that gets this wrong is told by the mint (`not_exact`, with the numbers needed to rebuild).
+
+**No largest-denomination setting.** A cap such as "no note above 2^40" was optional in the brief and is not built. The largest note is bounded by the `u64` amount (2^63), and a total that large is split into several notes of 2^63 or less. A cap would add a setting and a failure mode, and its only effect would be more, smaller notes. It can be added to the wallet's split without a change to the mint.
+
+**Requests from before this rule.** The shape check runs before the stored-response lookup everywhere except the exchange's finished replay, so:
+
+- A finished exchange is still replayed from its stored response (a wallet that lost the reply can fetch it again).
+- An exchange stored as pending with a non-power-of-two output is refused if it is sent again, and a transfer stored with one is refused whether it is pending or done. A refused pending request keeps holding its inputs and output blind nonces. This is a change from the behaviour before, and it should not occur if the mint has no pending exchanges or transfers when it is upgraded, which is already the advice for upgrading (see "Burn memos"). A transfer that was done before the upgrade cannot be fetched again by resending it.
+- Rollover is not changed. It requires the outputs to have exactly the amounts of the inputs (see "Key rotation"), so it adds no amount that is not already in a note, and refusing notes from before this rule would strand them.
+
+**Why ESP is not split further for holders.** A holder converts ESP to FSP straight away, and FSP is split by the FSP mint, so a holder does not keep ESP notes long enough for the amounts to matter. Splitting an ESP holding after the exchange is therefore not built. See the ecash-wallet README.
 
 ## Exact amounts and the minimum
 
@@ -281,6 +336,34 @@ The spent list itself is left as it is (in the sled database). A **redeem deadli
 ## Fees and junk requests
 
 Fees are charged on requests that carry value. A request that carries no value (malformed, unverifiable, or a replay of a spent note) is refused before anything can be charged, so fees do not stop junk requests; the size ceilings and the order of checks (cheap checks first) bound their cost. Per-DID and per-connection rate limits at the AIR layer are a possible further mitigation, not yet explored.
+
+## What the storage must provide
+
+The mint's state is in files and a sled database today. Both are stand-ins for the storage the AIR will provide, and none of the logic depends on them: the exchange, the transfer and the redemption read and write through `Responses` (the stored requests), the queue, the rollover store and the mint-core store. What the AIR storage that replaces them has to guarantee is the list below. Each item is a requirement that the code relies on now.
+
+1. **Atomic writes of one entry.** Writing an entry (a `pending`, a `done`, a queue entry) is all or nothing. A reader after a crash sees the entry as it was or as it became, never a mix. The stand-in does this by writing a new file and renaming it.
+2. **Durable before it returns.** A write that has returned survives a crash and a restart. The exchange relies on this for the `pending` entry: it must be on file before the PSP is asked to burn, or a crash after the burn would lose the notes.
+3. **Read your own writes.** A read after a write, in the same process, sees it.
+4. **A single writer, and a check-and-write that is one step.** At any time one process owns the data. The mint takes its own lock around "check that nothing holds these notes, then write the reservation", and relies on nobody else writing in between. If the AIR storage has more than one writer, it must offer that step as one atomic operation (a compare-and-set or a transaction), because the mint's lock would not cover the others. A second process opening the same data must be refused.
+5. **Recovery shows everything that was durable and nothing else.** After a restart, every entry whose write had returned is there, and an entry whose write had not returned is either there whole or not there. The retry of a request depends on this: it finds a `pending` entry and works out from the PSP what happened.
+6. **The mint-core v0.1.3 rule.** Marking an output's blind nonce used and adding its amount to the issued total are one atomic step; so are marking an input spent and adding its amount to the redeemed total.
+7. **Listing.** The pending entries can be listed, since the reservation checks read them all.
+
+The mint needs no delete, no rollback of a write, and no ordering between two different entries, apart from items 2 and 4. If the AIR storage cannot give one of these, the code that depends on it has to change; the list is here so that is known in advance.
+
+## Running as a service
+
+`esp-mint serve` runs under `launchd` (macOS) or `systemd` (Linux) as a user that is not root, with its data directory (`ESP_DATA_DIR`) and settings file (`ESP_CONFIG`) named in an env file, so it needs no home directory and reads nothing it was not given. The definitions, the install and uninstall steps and the health monitor are in [OPERATIONS.md](../sandbox-mint/OPERATIONS.md) (in `sandbox-mint`).
+
+**Failure and restart.** A fatal fault (a poisoned lock) makes the process exit with status 1, and the service manager starts it again after a delay that grows (systemd) or is fixed (launchd) and never gives up. A restart is picked up from what is on disk by the same rules as a crash: the `pending` entry of an exchange, transfer or redemption is what a retry works from.
+
+**The PSP at startup.** `serve` asks the PSP which network it is on. If the PSP cannot be reached, it asks again every `psp.startup_retry_secs` (5 by default), without limit, and logs the first failure and then one line a minute, so the mint can be started before the PSP or after a power cut with nobody to start it again. Two answers are not waited for, because waiting would not change them: a PSP on another network, and a PSP that does not say which network it is on. The mint stops with a message, and the service manager starts it again after its delay, which is the same as waiting but visible in the log.
+
+**Stopping.** SIGTERM and SIGINT stop both listeners gracefully: no new connections, the requests being answered finish (an exchange waiting on the PSP finishes or times out at `psp.timeout_secs`), and the process exits with status 0. Nothing needs flushing at that point, because every write is complete when the request that made it returns (see "What the storage must provide"). A kill or a power cut during a request leaves the entry the request had written, which the retry finishes.
+
+**Opening the data twice.** The database allows one process at a time (a second open fails with an error; there is a test), so a new process that starts while the old one is still stopping cannot open the data. It exits with an error and the service manager starts it again after its delay. This is item 4 of "What the storage must provide", and the AIR storage has to give the same refusal or an equivalent single-writer guarantee.
+
+**Health.** `GET /health` is `200` while the locks are sound and `503` after, and the process also exits when a lock is poisoned. The monitor in `sandbox-mint/ops` polls it and reports or restarts a mint that stays unhealthy (interval, thresholds and action are settings of the monitor, in its file and environment). It catches a mint that is up but hung or wrong, which the exit-on-fault cannot.
 
 ## Source map
 

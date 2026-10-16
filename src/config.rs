@@ -132,6 +132,14 @@ pub const SPECS: &[Spec] = &[
         what: "How long a call to the PSP may take before the exchange fails and can be retried.",
     },
     Spec {
+        key: "psp.startup_retry_secs",
+        env: "ESP_PSP_STARTUP_RETRY_SECS",
+        default: "5",
+        units: "seconds",
+        reload: false,
+        what: "At startup the mint asks the PSP which network it is on. If the PSP cannot be reached, the mint waits this long and asks again, for as long as it takes, so that starting the mint before the PSP (or after a power cut) needs no one to start it again. A PSP that answers with another network, or with none, is not waited for: the mint stops with a message.",
+    },
+    Spec {
         key: "terms.maturity_days",
         env: "ESP_MATURITY_DAYS",
         default: "365",
@@ -284,6 +292,7 @@ pub struct Config {
     pub admin_bind: String,
     pub psp_url: String,
     pub psp_timeout_secs: u64,
+    pub psp_startup_retry_secs: u64,
     pub maturity_days: u64,
     pub rotation_activation_hours: u64,
     pub rotation_period_hours: u64,
@@ -312,6 +321,7 @@ impl Default for Config {
             admin_bind: "127.0.0.1:3101".into(),
             psp_url: "http://127.0.0.1:3000".into(),
             psp_timeout_secs: 30,
+            psp_startup_retry_secs: 5,
             maturity_days: REDEEM_WINDOW_DAYS,
             rotation_activation_hours: 8760,
             rotation_period_hours: 87600,
@@ -350,6 +360,7 @@ impl Config {
             "server.admin_bind" => self.admin_bind.clone(),
             "psp.url" => self.psp_url.clone(),
             "psp.timeout_secs" => self.psp_timeout_secs.to_string(),
+            "psp.startup_retry_secs" => self.psp_startup_retry_secs.to_string(),
             "terms.maturity_days" => self.maturity_days.to_string(),
             "rotation.activation_hours" => self.rotation_activation_hours.to_string(),
             "rotation.period_hours" => self.rotation_period_hours.to_string(),
@@ -381,6 +392,7 @@ impl Config {
             "server.admin_bind" => self.admin_bind = value.trim().to_string(),
             "psp.url" => self.psp_url = value.trim().to_string(),
             "psp.timeout_secs" => self.psp_timeout_secs = whole(key, value)?,
+            "psp.startup_retry_secs" => self.psp_startup_retry_secs = whole(key, value)?,
             "terms.maturity_days" => self.maturity_days = whole(key, value)?,
             "rotation.activation_hours" => self.rotation_activation_hours = whole(key, value)?,
             "rotation.period_hours" => self.rotation_period_hours = whole(key, value)?,
@@ -415,6 +427,13 @@ impl Config {
             }
         };
         range("psp.timeout_secs", self.psp_timeout_secs, 1, 600, "seconds");
+        range(
+            "psp.startup_retry_secs",
+            self.psp_startup_retry_secs,
+            1,
+            3600,
+            "seconds",
+        );
         range(
             "rotation.activation_hours",
             self.rotation_activation_hours,
@@ -601,6 +620,7 @@ impl Config {
         self.admin_bind = running.admin_bind.clone();
         self.psp_url = running.psp_url.clone();
         self.psp_timeout_secs = running.psp_timeout_secs;
+        self.psp_startup_retry_secs = running.psp_startup_retry_secs;
         self.admin_max_request_bytes = running.admin_max_request_bytes;
         ignored
     }
@@ -1155,6 +1175,7 @@ mod tests {
         assert_eq!(c.bind, "127.0.0.1:3100");
         assert_eq!(c.psp_url, "http://127.0.0.1:3000");
         assert_eq!(c.psp_timeout_secs, 30);
+        assert_eq!(c.psp_startup_retry_secs, 5);
         assert_eq!(c.maturity_days, 10);
         assert!(
             lines
@@ -1185,6 +1206,7 @@ mod tests {
                 "server.admin_bind",
                 "psp.url",
                 "psp.timeout_secs",
+                "psp.startup_retry_secs",
                 "rotation.activation_hours",
                 "rotation.period_hours",
                 "admin.max_request_bytes"

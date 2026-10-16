@@ -1,6 +1,6 @@
 # esp-mint
 
-ESP is the encumbered point. It is obtained by exchanging PSP at 10^11 ESP for 1 PSP (10 PSP = $1 = 10^12 ESP). Each ESP note is bound to terms: one service that alone may redeem it, and a date before which nobody can.
+ESP is the encumbered point. It is obtained by exchanging PSP at 10^11 ESP for 1 PSP (10 PSP = $1 = 10^12 ESP). Each ESP note is bound to terms: one service that alone may redeem it, and a date before which nobody can. Every ESP amount the mint signs or accepts is a power of two (1, 2, 4, ...), so notes of one size look alike; an amount that is not is refused `400` with code `bad_denomination` before anything is burned or charged. The wallet does the splitting. Why, and every route it applies to, is in [DESIGN.md](DESIGN.md), "ESP amounts are powers of two".
 
 ## Building
 
@@ -13,7 +13,7 @@ cargo run -- config
 ESP_NETWORK=regtest cargo run -- serve
 ```
 
-Start psp-mint first: esp-mint asks the PSP for its network at startup and will not start if it cannot be reached or reports another network. `config` prints every setting and where it came from without starting the mint.
+esp-mint asks the PSP for its network at startup. If the PSP cannot be reached it waits and asks again (`psp.startup_retry_secs`), so psp-mint can start first or second; it stops with a message if the PSP reports another network or none. `config` prints every setting and where it came from without starting the mint.
 
 ## Commands
 
@@ -53,9 +53,10 @@ Two things are not settings: `ESP_DATA_DIR` (default `~/.esp-mint`: the config f
 |---|---|---|---|---|---|
 | `[server] bind` | `ESP_BIND` | `127.0.0.1:3100` | host:port | restart | The public API's address. |
 | `[server] admin_bind` | `ESP_ADMIN_BIND` | `127.0.0.1:3101` | host:port | restart | The operator's listener (payout report, settle, decline). Must be a loopback address. |
-| `[server] network` | `ESP_NETWORK` | `main` | network | restart | The Bitcoin network of the PSP: `main`, `regtest`, `signet`, `testnet`. At startup `serve` asks the PSP's `GET /health` and refuses to start if the PSP reports another network, reports none, or cannot be reached. Reported in this mint's `/health`. |
+| `[server] network` | `ESP_NETWORK` | `main` | network | restart | The Bitcoin network of the PSP: `main`, `regtest`, `signet`, `testnet`. At startup `serve` asks the PSP's `GET /health`, waits for it if it cannot be reached, and refuses to start if it reports another network or none. Reported in this mint's `/health`. |
 | `[psp] url` | `ESP_PSP_URL` | `http://127.0.0.1:3000` | URL | restart | The PSP mint (`psp-mint serve`) where PSP notes are burned and looked up. |
 | `[psp] timeout_secs` | `ESP_PSP_TIMEOUT_SECS` | `30` | seconds | restart | How long a call to the PSP may take before the exchange fails and can be retried. |
+| `[psp] startup_retry_secs` | `ESP_PSP_STARTUP_RETRY_SECS` | `5` | seconds | restart | At startup the mint asks the PSP which network it is on. If the PSP cannot be reached it waits this long and asks again, for as long as it takes. A PSP that answers with another network, or with none, is not waited for: the mint stops with a message. |
 | `[terms] maturity_days` | `ESP_MATURITY_DAYS` | `365` | days | SIGHUP | How long after the day of issue a new exchange's ESP notes become redeemable. Fixed into each exchange when it is first accepted; notes already issued keep theirs. |
 | `[exchange] max_items` | `ESP_EXCHANGE_MAX_ITEMS` | `1000` | notes | SIGHUP | The most PSP notes, and the most ESP outputs, in one exchange. |
 | `[exchange] min_psp` | `ESP_EXCHANGE_MIN_PSP` | `1` | PSP (10 PSP = $1) | SIGHUP | The smallest exchange, in PSP. 1 PSP is $0.10 (10 PSP = $1). Below it the exchange is refused before anything is burned. |
@@ -81,7 +82,7 @@ Two things are not settings: `ESP_DATA_DIR` (default `~/.esp-mint`: the config f
 
 | Route | What it does |
 |---|---|
-| `POST /exchange` | Body: `{"service": "<x-only hex>", "psp_inputs": [...], "outputs": [...]}`. `200` with the response (see [DESIGN.md](DESIGN.md), "The exchange"). `400` if the request is refused, with `{"error": ...}`, `413` if the body is over `exchange.max_request_bytes`, and also `"code": "note_spent_elsewhere"` and `"spent": [...]` when PSP notes in the request were spent by a different request (see [DESIGN.md](DESIGN.md), "Burn memos"). `502` if the PSP could not be reached or refused the burn. `500` for a fault in the mint. A retry is safe after a `502` or `500`. |
+| `POST /exchange` | Body: `{"service": "<x-only hex>", "psp_inputs": [...], "outputs": [...]}`. `409` (`in_progress`) if the same request is being processed now. `200` with the response (see [DESIGN.md](DESIGN.md), "The exchange"). `400` if the request is refused, with `{"error": ...}` (an output that is not a power of two has `"code": "bad_denomination"`), `413` if the body is over `exchange.max_request_bytes`, and also `"code": "note_spent_elsewhere"` and `"spent": [...]` when PSP notes in the request were spent by a different request (see [DESIGN.md](DESIGN.md), "Burn memos"). `502` if the PSP could not be reached or refused the burn. `500` for a fault in the mint. A retry is safe after a `502` or `500`. |
 | `POST /transfer` | Body: `{"service": "<x-only hex>", "redeemable_after_day": N, "inputs": [...], "outputs": [...], "service_signature": "<hex>"}`. `200` with the response (same shape as the exchange's). `400` if the request is refused, with `{"error": ...}` (nothing was burned; an input that is already spent also carries `"code": "note_spent_elsewhere"` and `"spent": [position]`), `413` if the body is over `transfer.max_request_bytes`. `500` for a fault in the mint, and a retry is safe. See [DESIGN.md](DESIGN.md), "Transfer to the service". |
 | `POST /redeem` | Body: the redemption request in its binary encoding (see [DESIGN.md](DESIGN.md), "Redemption"). `200` with the answer, `400` if refused (nothing burned; `code` says why), `413` over the ceiling, `500` for a fault. |
 | `POST /rollover` | Body: the rollover request (one service and day, `input_keysets`, `keyset`, inputs, outputs). `200` with the new signatures, `413` if the body is over `rollover.max_request_bytes`, `400` if refused (nothing burned; `code`: `keyset_retired`, `unknown_keyset`, `missing_keyset`, `burn_not_proven`, or `note_spent_elsewhere` with `spent`: the positions of the inputs that are spent). See [DESIGN.md](DESIGN.md), "Key rotation". |
@@ -91,7 +92,7 @@ Two things are not settings: `ESP_DATA_DIR` (default `~/.esp-mint`: the config f
 | `GET /audit` | `issued`, `redeemed`, `outstanding`, in ESP units. |
 | `GET /health` | `200` while the locks are sound, `503` otherwise. The body has `status`, `network` and `wire_version` (an integer: the version of the wire format this mint speaks; a wallet refuses a mint whose number is not its own). |
 
-The process exits with status 1 if a lock is poisoned, so a supervisor can restart it. One request runs at a time, holding the mint and the stored responses (and waiting on the PSP) until it is done, which is fine for development and not a design for load. There is no authentication and no TLS: a note authorizes its own spend, so a caller can only burn notes they hold. Bind to localhost. Only one process can open the mint's database.
+The process exits with status 1 if a lock is poisoned, so a supervisor can restart it. The mint's lock is taken for the steps that touch the mint and let go while an exchange waits on the PSP, so a slow PSP holds up only the exchange that is waiting on it (see [DESIGN.md](DESIGN.md), "Not holding the lock while the PSP is called"). The same exchange sent again while it is being processed gets `409` with `code: "in_progress"` and is not processed twice; send it again in a moment. There is no authentication and no TLS: a note authorizes its own spend, so a caller can only burn notes they hold. Bind to localhost. Only one process can open the mint's database.
 
 ## Wire version
 
@@ -112,4 +113,5 @@ The integration tests in `tests/` run the HTTP routes (`http.rs`, `transfer_http
 - [CHANGELOG.md](CHANGELOG.md): what was built and what changed.
 - [ROADMAP.md](../sandbox-mint/ROADMAP.md) (in `sandbox-mint`): left to do and not decided yet, for every repo.
 - [psp-mint](../psp-mint/README.md), [fsp-mint](../fsp-mint/README.md) and [ecash-wallet](../ecash-wallet/README.md): the other parts.
+- [OPERATIONS.md](../sandbox-mint/OPERATIONS.md) (in `sandbox-mint`): running the mints as services: `launchd` and `systemd` definitions, install and uninstall, the health monitor.
 - [sandbox-mint README](../sandbox-mint/README.md): the family of repos.

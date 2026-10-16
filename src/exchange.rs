@@ -114,6 +114,10 @@ pub enum Rejection {
     NoOutputs,
     TooManyItems,
     ZeroAmount,
+    /// An output amount is not a power of two. Nothing was burned.
+    BadDenomination {
+        index: usize,
+    },
     DuplicateInput,
     DuplicateBlindNonce,
     BlindNonceAlreadyUsed,
@@ -173,6 +177,10 @@ impl fmt::Display for Rejection {
                 "more notes or outputs than one exchange may have (exchange.max_items, {MAX_ITEMS} by default)"
             ),
             Rejection::ZeroAmount => write!(f, "an output has amount zero"),
+            Rejection::BadDenomination { index } => write!(
+                f,
+                "output {index}: ESP amounts are powers of two. Nothing was burned"
+            ),
             Rejection::DuplicateInput => write!(f, "a PSP note is listed twice"),
             Rejection::DuplicateBlindNonce => write!(f, "an output blind nonce is listed twice"),
             Rejection::BlindNonceAlreadyUsed => write!(f, "an output blind nonce was already used"),
@@ -339,8 +347,8 @@ pub fn check_exact_min(paid: u128, requested: u128, minimum: u128) -> Result<(),
     Ok(())
 }
 
-/// The shape of the request: counts and repeats. Nothing here looks at amounts
-/// beyond zero, and nothing touches the mint.
+/// The shape of the request: counts, repeats and output sizes (each a power of
+/// two). Nothing here touches the mint.
 fn validate_shape(request: &ExchangeRequest, settings: &ExchangeSettings) -> Result<(), Rejection> {
     if request.psp_inputs.is_empty() {
         return Err(Rejection::NoInputs);
@@ -361,9 +369,12 @@ fn validate_shape(request: &ExchangeRequest, settings: &ExchangeSettings) -> Res
         }
     }
     let mut blind_nonces = HashSet::new();
-    for output in &request.outputs {
+    for (index, output) in request.outputs.iter().enumerate() {
         if output.amount.units == 0 {
             return Err(Rejection::ZeroAmount);
+        }
+        if !crate::units::is_denomination(output.amount.units) {
+            return Err(Rejection::BadDenomination { index });
         }
         if !blind_nonces.insert(output.blind_nonce) {
             return Err(Rejection::DuplicateBlindNonce);
@@ -449,11 +460,148 @@ pub fn exchange_with(
     )
 }
 
-/// An exchange over the live key sets: the outputs are signed with the
-/// keyset the request names (`keyset_retired` / `unknown_keyset` otherwise,
-/// before anything is burned). An exchange accepted before a rotation and
-/// finished after it, whose keyset retired in between, is signed with the
-/// current set; the reply names the keyset that signed.
+/// The phases of one exchange, and which of them may hold the mint's lock.
+///
+/// An exchange talks to the PSP twice (a look at the notes, then the burn), and
+/// the PSP can be slow or not answer. The mint's lock must not be held across
+/// those calls, or one slow PSP blocks every other request. So the exchange runs
+/// in phases, and the server takes the lock only for the ones that touch the
+/// mint, with the lock released around the ones that call the PSP:
+///
+/// 1. [`prepare_gens`] (lock): every check, as before. Nothing is written.
+/// 2. [`precheck`] (no lock): a fresh request asks the PSP whether any note is
+///    already spent, so a request that cannot succeed is refused before it
+///    reserves anything.
+/// 3. [`reserve_gens`] (lock): the checks that read the mint (the database and the
+///    reservations of other requests) are made again, since the lock was let
+///    go, and the `pending` entry is written. This reserves the PSP notes and
+///    the output blind nonces and records the terms. After this, a crash at any
+///    point is picked up by a retry.
+/// 4. [`burn_phase`] (no lock): the PSP burns the notes, or on a retry says
+///    whether it already did.
+/// 5. [`finish_gens`] (lock): the entry is checked to still be the pending one
+///    this request wrote, the outputs are signed and the `done` entry is written.
+///
+/// What keeps this safe is the `pending` entry, which is what the reservations
+/// and the crash replay already rest on: it is written (phase 3) before the PSP
+/// is asked to burn anything (phase 4), and only a `done` entry replaces it.
+/// Whether two copies of one request are running at once is not for this module
+/// to say (it is in-memory state); the server refuses the second while the
+/// first is in the middle of these phases (see `server::InFlight`).
+///
+/// [`exchange_gens`] runs the five back to back, for tests and for callers with
+/// no lock to let go.
+///
+/// What [`prepare_gens`] found.
+#[derive(Debug)]
+pub enum Prepared {
+    /// The request is finished; this is its stored response.
+    Done(ExchangeResponse),
+    /// The request passed its checks. Carry on with the phases.
+    Go(Plan),
+}
+
+/// What the later phases need to know about a request that passed
+/// [`prepare_gens`]. It is not stored: a retry works it out again from the
+/// request and the `pending` entry.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    hash: String,
+    memo: String,
+    nonces: Vec<Nonce>,
+    psp_total: u128,
+    redeemable_after_day: u64,
+    recovering: bool,
+    fee_per_byte: u128,
+    fee_esp: u128,
+    size_bytes: u64,
+}
+
+impl Plan {
+    /// Whether this is a retry of a request whose `pending` entry is on file
+    /// (so its burn may already have happened).
+    pub fn recovering(&self) -> bool {
+        self.recovering
+    }
+}
+
+/// The signer for the request's keyset, or the refusal that goes with it.
+/// `resumed` lets a request that is already on file finish with the current set
+/// when its own has been retired since.
+fn signer_for<'a>(
+    gens: &crate::rotation::Gens<'a>,
+    request: &ExchangeRequest,
+    resumed: bool,
+) -> Result<(&'a MintLogic, &'a MasterSecret, String), ExchangeError> {
+    if request.keyset.is_empty() {
+        return Err(Rejection::Keyset {
+            code: sp_wire::codes::MISSING_KEYSET,
+            why: "the outputs need a keyset (keyset). Nothing was burned".into(),
+        }
+        .into());
+    }
+    gens.signer(&request.keyset, resumed).map_err(|e| {
+        ExchangeError::Rejected(Rejection::Keyset {
+            code: e.code(),
+            why: e.why("the outputs"),
+        })
+    })
+}
+
+/// Phase 1 (hold the lock). An exchange over the live key sets: the outputs are
+/// signed with the keyset the request names (`keyset_retired` /
+/// `unknown_keyset` otherwise, before anything is burned). A stored answer is
+/// replayed as it is, whatever set is current now.
+pub fn prepare_gens(
+    gens: &crate::rotation::Gens,
+    responses: &Responses,
+    now_unix: u64,
+    request: &ExchangeRequest,
+    settings: &ExchangeSettings,
+) -> Result<Prepared, ExchangeError> {
+    // An empty keyset is refused first, before anything else is looked at.
+    if request.keyset.is_empty() {
+        signer_for(gens, request, false)?;
+    }
+    let stored = responses.get(&request_hash(request)?);
+    if let Some(Entry::Done(done)) = stored {
+        return Ok(Prepared::Done(done.clone()));
+    }
+    let resumed = matches!(stored, Some(Entry::Pending { .. }));
+    let (logic, _, _) = signer_for(gens, request, resumed)?;
+    prepare(logic, responses, now_unix, request, settings)
+}
+
+/// Phase 3 (hold the lock): check again and write the `pending` entry. Does
+/// nothing for a retry, whose entry is already on file.
+pub fn reserve_gens(
+    gens: &crate::rotation::Gens,
+    responses: &mut Responses,
+    request: &ExchangeRequest,
+    plan: &Plan,
+) -> Result<(), ExchangeError> {
+    let (logic, _, _) = signer_for(gens, request, plan.recovering)?;
+    reserve(logic, responses, request, plan)
+}
+
+/// Phase 5 (hold the lock): sign the outputs and write the `done` entry. An
+/// exchange accepted before a rotation and finished after it, whose keyset
+/// retired in between, is signed with the current set; the reply names the
+/// keyset that signed. By now the notes may be burned, so a retired set is no
+/// reason to stop.
+pub fn finish_gens(
+    gens: &crate::rotation::Gens,
+    responses: &mut Responses,
+    request: &ExchangeRequest,
+    plan: &Plan,
+) -> Result<ExchangeResponse, ExchangeError> {
+    let (logic, master, id) = signer_for(gens, request, true)?;
+    finish(logic, master, &id, responses, request, plan)
+}
+
+/// All five phases, back to back (see the phases above). The server does not
+/// call this: it runs the phases itself, so that its lock is not held while the
+/// PSP is called.
 pub fn exchange_gens(
     gens: &crate::rotation::Gens,
     psp: &dyn Psp,
@@ -462,30 +610,18 @@ pub fn exchange_gens(
     request: &ExchangeRequest,
     settings: &ExchangeSettings,
 ) -> Result<ExchangeResponse, ExchangeError> {
-    if request.keyset.is_empty() {
-        return Err(Rejection::Keyset {
-            code: sp_wire::codes::MISSING_KEYSET,
-            why: "the outputs need a keyset (keyset). Nothing was burned".into(),
-        }
-        .into());
-    }
-    let stored = responses.get(&request_hash(request)?);
-    // A stored answer is replayed as it is, whatever set is current now.
-    if let Some(Entry::Done(done)) = stored {
-        return Ok(done.clone());
-    }
-    let resumed = matches!(stored, Some(Entry::Pending { .. }));
-    let (logic, master, id) = gens.signer(&request.keyset, resumed).map_err(|e| {
-        ExchangeError::Rejected(Rejection::Keyset {
-            code: e.code(),
-            why: e.why("the outputs"),
-        })
-    })?;
-    exchange_signed(
-        logic, master, &id, psp, responses, now_unix, request, settings,
-    )
+    let plan = match prepare_gens(gens, responses, now_unix, request, settings)? {
+        Prepared::Done(response) => return Ok(response),
+        Prepared::Go(plan) => plan,
+    };
+    precheck(psp, &plan)?;
+    reserve_gens(gens, responses, request, &plan)?;
+    burn_phase(psp, request, &plan)?;
+    finish_gens(gens, responses, request, &plan)
 }
 
+/// Test only: the five phases over one key set.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn exchange_signed(
     logic: &MintLogic,
@@ -497,13 +633,33 @@ fn exchange_signed(
     request: &ExchangeRequest,
     settings: &ExchangeSettings,
 ) -> Result<ExchangeResponse, ExchangeError> {
+    let plan = match prepare(logic, responses, now_unix, request, settings)? {
+        Prepared::Done(response) => return Ok(response),
+        Prepared::Go(plan) => plan,
+    };
+    precheck(psp, &plan)?;
+    reserve(logic, responses, request, &plan)?;
+    burn_phase(psp, request, &plan)?;
+    finish(logic, master, keyset, responses, request, &plan)
+}
+
+/// Phase 1. Everything that can be checked without the PSP, cheapest first:
+/// the shape, the stored answer, the amounts, the spend signatures, the mint's
+/// database and the reservations of other requests. Writes nothing.
+fn prepare(
+    logic: &MintLogic,
+    responses: &Responses,
+    now_unix: u64,
+    request: &ExchangeRequest,
+    settings: &ExchangeSettings,
+) -> Result<Prepared, ExchangeError> {
     validate_shape(request, settings)?;
     let hash = request_hash(request)?;
     let memo = memo(&request.service, &request.outputs);
     let nonces: Vec<Nonce> = request.psp_inputs.iter().map(|i| i.note.nonce).collect();
 
     let (redeemable_after_day, recovering) = match responses.get(&hash) {
-        Some(Entry::Done(done)) => return Ok(done.clone()),
+        Some(Entry::Done(done)) => return Ok(Prepared::Done(done.clone())),
         Some(Entry::Pending {
             redeemable_after_day,
             ..
@@ -519,10 +675,6 @@ fn exchange_signed(
                 .redeemable_after_day,
             false,
         ),
-    };
-    let terms = Terms {
-        service: request.service,
-        redeemable_after_day,
     };
 
     let psp_total = units::total(request.psp_inputs.iter().map(|i| i.amount.units));
@@ -545,99 +697,189 @@ fn exchange_signed(
     };
 
     if !recovering {
-        let (held_inputs, held_outputs) = held_by(request);
-        // 1. The spend signatures. They are public to check, and cover the memo,
-        //    so a pending entry only ever exists for a request its holder signed.
+        // The spend signatures. They are public to check, and cover the memo,
+        // so a pending entry only ever exists for a request its holder signed.
         let sighash = melt_sighash(&request.psp_inputs, memo.as_bytes());
         for input in &request.psp_inputs {
             if logic.verify_spend_authorization(input, sighash).is_err() {
                 return Err(Rejection::BadSpendSignature.into());
             }
         }
-        // 2. The mint's own database. The answer is held back until the
-        //    reservations below have been looked at, because a blind nonce that
-        //    is used may be used by an unfinished request, and then "held" is the
-        //    truer answer.
-        let mut blind_nonce_used = false;
-        for output in &request.outputs {
-            if logic
-                .is_blind_nonce_used(&output.blind_nonce)
-                .map_err(internal)?
-            {
-                blind_nonce_used = true;
-                break;
-            }
-        }
-        // 3. Reservations. Keep clear of every unfinished request, so that a PSP
-        //    note or a blind nonce one of them will use cannot be taken by
-        //    another request first.
-        for (other, inputs, outputs) in responses.pending_exchanges() {
-            if other == &hash {
-                continue;
-            }
-            if inputs.iter().any(|n| held_inputs.contains(n))
-                || outputs.iter().any(|n| held_outputs.contains(n))
-            {
-                return Err(Rejection::NoteHeld.into());
-            }
-        }
-        for (other, pending) in responses.pending_transfers() {
-            if other == &hash {
-                continue;
-            }
-            // A transfer's inputs are ESP notes, so only its outputs can clash.
-            if pending.outputs.iter().any(|n| held_outputs.contains(n)) {
-                return Err(Rejection::NoteHeld.into());
-            }
-        }
-        // Same for a redemption: its blind nonces are held, unfinished or not.
-        let (_, redeem_outputs) = responses.redeem_holds(&hash);
-        if held_outputs.iter().any(|n| redeem_outputs.contains(n)) {
-            return Err(Rejection::NoteHeld.into());
-        }
-        if blind_nonce_used {
-            return Err(Rejection::BlindNonceAlreadyUsed.into());
-        }
-        // 4. The PSP, the last look before anything is written or burned.
-        let spent = psp_spent(psp, &nonces)?;
-        if spent.iter().any(|s| *s) {
-            return Err(Rejection::PspNoteSpent.into());
-        }
-        responses
-            .put(
-                &hash,
-                Entry::Pending {
-                    redeemable_after_day,
-                    inputs: held_inputs,
-                    outputs: held_outputs,
-                },
-            )
-            .map_err(internal)?;
-        burn(psp, request, &memo, psp_total)?;
-    } else {
-        let burns = psp_burns(psp, &nonces)?;
-        // A note that is spent counts as burned by this exchange only if the
-        // PSP says it was burned under this exchange's memo.
-        let elsewhere: Vec<usize> = burns
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.spent && b.memo.as_deref() != Some(memo.as_str()))
-            .map(|(i, _)| i)
-            .collect();
-        if !elsewhere.is_empty() {
-            return Err(Rejection::NoteSpentElsewhere { spent: elsewhere }.into());
-        }
-        if burns.iter().all(|b| b.spent) {
-            // already burned by an earlier attempt
-        } else if burns.iter().any(|b| b.spent) {
-            return Err(ExchangeError::Internal(
-                "some PSP notes are spent and some are not, which needs a person to look".into(),
-            ));
-        } else {
-            burn(psp, request, &memo, psp_total)?;
+        check_free(logic, responses, request, &hash)?;
+    }
+    Ok(Prepared::Go(Plan {
+        hash,
+        memo,
+        nonces,
+        psp_total,
+        redeemable_after_day,
+        recovering,
+        fee_per_byte,
+        fee_esp,
+        size_bytes,
+    }))
+}
+
+/// The checks that read the mint: the database and the reservations of other
+/// unfinished requests. They are made in phase 1, and again in phase 3 because
+/// the lock was let go in between and another request may have got in.
+fn check_free(
+    logic: &MintLogic,
+    responses: &Responses,
+    request: &ExchangeRequest,
+    hash: &str,
+) -> Result<(), ExchangeError> {
+    let (held_inputs, held_outputs) = held_by(request);
+    // The mint's own database. The answer is held back until the reservations
+    // below have been looked at, because a blind nonce that is used may be used
+    // by an unfinished request, and then "held" is the truer answer.
+    let mut blind_nonce_used = false;
+    for output in &request.outputs {
+        if logic
+            .is_blind_nonce_used(&output.blind_nonce)
+            .map_err(internal)?
+        {
+            blind_nonce_used = true;
+            break;
         }
     }
+    // Reservations. Keep clear of every unfinished request, so that a PSP note
+    // or a blind nonce one of them will use cannot be taken by another request
+    // first.
+    for (other, inputs, outputs) in responses.pending_exchanges() {
+        if other == hash {
+            continue;
+        }
+        if inputs.iter().any(|n| held_inputs.contains(n))
+            || outputs.iter().any(|n| held_outputs.contains(n))
+        {
+            return Err(Rejection::NoteHeld.into());
+        }
+    }
+    for (other, pending) in responses.pending_transfers() {
+        if other == hash {
+            continue;
+        }
+        // A transfer's inputs are ESP notes, so only its outputs can clash.
+        if pending.outputs.iter().any(|n| held_outputs.contains(n)) {
+            return Err(Rejection::NoteHeld.into());
+        }
+    }
+    // Same for a redemption: its blind nonces are held, unfinished or not.
+    let (_, redeem_outputs) = responses.redeem_holds(hash);
+    if held_outputs.iter().any(|n| redeem_outputs.contains(n)) {
+        return Err(Rejection::NoteHeld.into());
+    }
+    if blind_nonce_used {
+        return Err(Rejection::BlindNonceAlreadyUsed.into());
+    }
+    Ok(())
+}
 
+/// Phase 2 (no lock). A fresh request asks the PSP whether any of its notes is
+/// already spent, the last look before anything is written. A retry has its own
+/// way of asking (phase 4). Nothing is written, so a failure here leaves
+/// nothing behind.
+pub fn precheck(psp: &dyn Psp, plan: &Plan) -> Result<(), ExchangeError> {
+    if plan.recovering {
+        return Ok(());
+    }
+    let spent = psp_spent(psp, &plan.nonces)?;
+    if spent.iter().any(|s| *s) {
+        return Err(Rejection::PspNoteSpent.into());
+    }
+    Ok(())
+}
+
+/// Phase 3. Write the `pending` entry, after checking again that nothing has
+/// taken the notes or nonces since phase 1. A retry already has its entry.
+fn reserve(
+    logic: &MintLogic,
+    responses: &mut Responses,
+    request: &ExchangeRequest,
+    plan: &Plan,
+) -> Result<(), ExchangeError> {
+    if plan.recovering {
+        return Ok(());
+    }
+    if responses.get(&plan.hash).is_some() {
+        return Err(internal(
+            "this request was stored while it was being checked",
+        ));
+    }
+    check_free(logic, responses, request, &plan.hash)?;
+    let (inputs, outputs) = held_by(request);
+    responses
+        .put(
+            &plan.hash,
+            Entry::Pending {
+                redeemable_after_day: plan.redeemable_after_day,
+                inputs,
+                outputs,
+            },
+        )
+        .map_err(internal)
+}
+
+/// Phase 4 (no lock). The PSP burns the notes. For a retry, the PSP is asked
+/// first what became of them: burned under this request's memo means an earlier
+/// attempt did it, and the burn is skipped.
+pub fn burn_phase(
+    psp: &dyn Psp,
+    request: &ExchangeRequest,
+    plan: &Plan,
+) -> Result<(), ExchangeError> {
+    if !plan.recovering {
+        return burn(psp, request, &plan.memo, plan.psp_total);
+    }
+    let burns = psp_burns(psp, &plan.nonces)?;
+    // A note that is spent counts as burned by this exchange only if the PSP
+    // says it was burned under this exchange's memo.
+    let elsewhere: Vec<usize> = burns
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.spent && b.memo.as_deref() != Some(plan.memo.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    if !elsewhere.is_empty() {
+        return Err(Rejection::NoteSpentElsewhere { spent: elsewhere }.into());
+    }
+    if burns.iter().all(|b| b.spent) {
+        // already burned by an earlier attempt
+        Ok(())
+    } else if burns.iter().any(|b| b.spent) {
+        Err(ExchangeError::Internal(
+            "some PSP notes are spent and some are not, which needs a person to look".into(),
+        ))
+    } else {
+        burn(psp, request, &plan.memo, plan.psp_total)
+    }
+}
+
+/// Phase 5. The entry must still be the pending one this request wrote; then the
+/// outputs are signed and the `done` entry replaces it.
+fn finish(
+    logic: &MintLogic,
+    master: &MasterSecret,
+    keyset: &str,
+    responses: &mut Responses,
+    request: &ExchangeRequest,
+    plan: &Plan,
+) -> Result<ExchangeResponse, ExchangeError> {
+    match responses.get(&plan.hash) {
+        Some(Entry::Pending { .. }) => {}
+        Some(Entry::Done(done)) => return Ok(done.clone()),
+        _ => {
+            return Err(internal(
+                "the pending entry of this exchange is gone, which needs a person to look",
+            ));
+        }
+    }
+    let terms = Terms {
+        service: request.service,
+        redeemable_after_day: plan.redeemable_after_day,
+    };
+    let recovering = true;
     let mut signatures = Vec::with_capacity(request.outputs.len());
     let mut keys = Vec::with_capacity(request.outputs.len());
     for output in &request.outputs {
@@ -658,15 +900,15 @@ fn exchange_signed(
     let response = ExchangeResponse {
         keyset: keyset.to_string(),
         service: request.service,
-        redeemable_after_day,
+        redeemable_after_day: plan.redeemable_after_day,
         signatures,
         keys,
-        fee_per_byte,
-        fee_esp,
-        size_bytes,
+        fee_per_byte: plan.fee_per_byte,
+        fee_esp: plan.fee_esp,
+        size_bytes: plan.size_bytes,
     };
     responses
-        .put(&hash, Entry::Done(response.clone()))
+        .put(&plan.hash, Entry::Done(response.clone()))
         .map_err(internal)?;
     Ok(response)
 }
@@ -754,6 +996,8 @@ mod tests {
         fail_before_burn: Cell<bool>,
         /// The PSP burns the notes and the reply is lost.
         fail_after_burn: Cell<bool>,
+        /// The PSP cannot be asked about the notes (`/burns`).
+        fail_burns: Cell<bool>,
     }
 
     impl FakePsp {
@@ -766,6 +1010,7 @@ mod tests {
                 memos: RefCell::new(BTreeMap::new()),
                 fail_before_burn: Cell::new(false),
                 fail_after_burn: Cell::new(false),
+                fail_burns: Cell::new(false),
             }
         }
 
@@ -853,6 +1098,9 @@ mod tests {
         }
 
         fn burns(&self, nonces: &[Nonce]) -> Result<Vec<Burn>, String> {
+            if self.fail_burns.get() {
+                return Err("unreachable".into());
+            }
             nonces
                 .iter()
                 .map(|n| {
@@ -878,9 +1126,48 @@ mod tests {
         amount: u64,
     }
 
-    /// Build a request the way a wallet does. `psp_notes` are (note, key,
-    /// units). `signer` signs the spend signatures, normally the note's own key.
+    /// Split a total into powers of two, the way the wallet does: one note for
+    /// each bit set, largest first. Zero stays as one zero, so that the zero
+    /// test can build it.
+    fn split(total: u64) -> Vec<u64> {
+        if total == 0 {
+            return vec![0];
+        }
+        (0..64)
+            .rev()
+            .map(|bit| 1u64 << bit)
+            .filter(|p| total & p != 0)
+            .collect()
+    }
+
+    /// Split a total into exactly `n` powers of two, by halving the largest
+    /// note that is more than one until there are `n`. Needs
+    /// `split(total).len() <= n <= total`.
+    fn split_into(total: u64, n: usize) -> Vec<u64> {
+        let mut notes = split(total);
+        while notes.len() < n {
+            let i = notes.iter().position(|&a| a > 1).unwrap();
+            let half = notes[i] / 2;
+            notes[i] = half;
+            notes.insert(i + 1, half);
+        }
+        notes
+    }
+
+    /// Build a request the way a wallet does: each amount in `esp_amounts` is a
+    /// total, split into powers of two. `psp_notes` are (note, key, units).
+    /// `signer` signs the spend signatures, normally the note's own key.
     fn build(
+        psp_notes: &[(Note, &Keypair, u64)],
+        esp_amounts: &[u64],
+        signer: Option<&Keypair>,
+    ) -> (ExchangeRequest, Vec<Wanted>) {
+        let amounts: Vec<u64> = esp_amounts.iter().flat_map(|&a| split(a)).collect();
+        build_exact(psp_notes, &amounts, signer)
+    }
+
+    /// Like `build`, but each amount is an output as it stands, whatever it is.
+    fn build_exact(
         psp_notes: &[(Note, &Keypair, u64)],
         esp_amounts: &[u64],
         signer: Option<&Keypair>,
@@ -1071,8 +1358,210 @@ mod tests {
         let response = s.run(&request).unwrap();
         assert_eq!(s.psp.melts.get(), 1);
         assert_eq!(s.esp_issued(), ONE_PSP);
-        assert_eq!(response.signatures.len(), 1);
+        assert_eq!(response.signatures.len(), request.outputs.len());
         assert!(matches!(s.responses.get(&hash), Some(Entry::Done(_))));
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    /// The phases by hand, on the default settings: what `prepare` decided.
+    fn plan_of(s: &Setup, request: &ExchangeRequest) -> Plan {
+        match prepare(
+            &s.logic,
+            &s.responses,
+            NOW,
+            request,
+            &ExchangeSettings::default(),
+        )
+        .unwrap()
+        {
+            Prepared::Go(plan) => plan,
+            Prepared::Done(_) => panic!("the request was already done"),
+        }
+    }
+
+    fn reopen(s: &mut Setup) {
+        s.responses = Responses::open(&s.dir.join("esp").join("responses.json")).unwrap();
+    }
+
+    #[test]
+    fn the_phases_write_only_when_they_should_and_add_up_to_an_exchange() {
+        let mut s = setup("phases");
+        let (note, keypair) = s.psp.note(1);
+        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
+        let hash = request_hash(&request).unwrap();
+        let id = crate::rotation::keyset_id(&s.master);
+
+        // Checking writes nothing and does not touch the PSP's notes.
+        let plan = plan_of(&s, &request);
+        assert!(!plan.recovering());
+        assert!(s.responses.get(&hash).is_none());
+        precheck(&s.psp, &plan).unwrap();
+        assert!(s.responses.get(&hash).is_none());
+
+        // Reserving writes the pending entry, and still burns nothing.
+        reserve(&s.logic, &mut s.responses, &request, &plan).unwrap();
+        assert!(matches!(
+            s.responses.get(&hash),
+            Some(Entry::Pending { .. })
+        ));
+        assert_eq!(s.psp.melts.get(), 0);
+        assert!(!s.psp.logic.is_spent(note.nonce).unwrap());
+
+        // The burn writes nothing to the mint's own store.
+        burn_phase(&s.psp, &request, &plan).unwrap();
+        assert_eq!(s.psp.melts.get(), 1);
+        assert!(matches!(
+            s.responses.get(&hash),
+            Some(Entry::Pending { .. })
+        ));
+        assert_eq!(s.esp_issued(), 0);
+
+        // Finishing signs and replaces the entry.
+        let response = finish(&s.logic, &s.master, &id, &mut s.responses, &request, &plan).unwrap();
+        assert_eq!(response.signatures.len(), request.outputs.len());
+        assert_eq!(s.responses.get(&hash), Some(&Entry::Done(response.clone())));
+        assert_eq!(s.esp_issued(), ONE_PSP);
+
+        // A request that is done is found done by the first phase.
+        assert!(matches!(
+            prepare(
+                &s.logic,
+                &s.responses,
+                NOW,
+                &request,
+                &ExchangeSettings::default()
+            ),
+            Ok(Prepared::Done(done)) if done == response
+        ));
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_crash_after_any_phase_is_picked_up_by_the_retry_and_burns_once() {
+        // 0: after the checks. 1: after the PSP's look. 2: after the pending
+        // entry is written (the lock is let go here, with the PSP not yet
+        // asked to burn). 3: after the burn, before the signing.
+        for stop in 0..4 {
+            let mut s = setup(&format!("crash-after-{stop}"));
+            let (note, keypair) = s.psp.note(1);
+            let (request, wanted) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
+            let hash = request_hash(&request).unwrap();
+            let plan = plan_of(&s, &request);
+            if stop >= 1 {
+                precheck(&s.psp, &plan).unwrap();
+            }
+            if stop >= 2 {
+                reserve(&s.logic, &mut s.responses, &request, &plan).unwrap();
+            }
+            if stop >= 3 {
+                burn_phase(&s.psp, &request, &plan).unwrap();
+            }
+            // The mint restarts: whatever was in memory is gone.
+            reopen(&mut s);
+            let on_file = s.responses.get(&hash).is_some();
+            assert_eq!(on_file, stop >= 2, "stop {stop}");
+
+            let response = s.run(&request).unwrap();
+            assert_eq!(s.psp.melts.get(), 1, "stop {stop}");
+            assert_eq!(s.esp_issued(), ONE_PSP, "stop {stop}");
+            assert!(s.psp.logic.is_spent(note.nonce).unwrap());
+            assert_eq!(response.signatures.len(), wanted.len());
+            assert!(matches!(s.responses.get(&hash), Some(Entry::Done(_))));
+            assert_eq!(s.responses.pending_exchanges().count(), 0);
+            fs::remove_dir_all(&s.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_request_that_got_in_between_the_checks_and_the_reservation_is_caught() {
+        let mut s = setup("between");
+        let (note, keypair) = s.psp.note(1);
+        let (first, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
+        let (second, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
+        let (hash_a, hash_b) = (
+            request_hash(&first).unwrap(),
+            request_hash(&second).unwrap(),
+        );
+        // Both pass the checks, because neither has reserved anything yet.
+        let plan_a = plan_of(&s, &first);
+        let plan_b = plan_of(&s, &second);
+        precheck(&s.psp, &plan_a).unwrap();
+        precheck(&s.psp, &plan_b).unwrap();
+        // The first reserves. The second finds it there, and writes nothing.
+        reserve(&s.logic, &mut s.responses, &first, &plan_a).unwrap();
+        match reserve(&s.logic, &mut s.responses, &second, &plan_b) {
+            Err(ExchangeError::Rejected(r)) => assert_eq!(r, Rejection::NoteHeld),
+            other => panic!("expected NoteHeld, got {other:?}"),
+        }
+        assert!(s.responses.get(&hash_b).is_none());
+        assert!(matches!(
+            s.responses.get(&hash_a),
+            Some(Entry::Pending { .. })
+        ));
+        // The first goes on and finishes.
+        burn_phase(&s.psp, &first, &plan_a).unwrap();
+        let id = crate::rotation::keyset_id(&s.master);
+        finish(&s.logic, &s.master, &id, &mut s.responses, &first, &plan_a).unwrap();
+        assert_eq!(s.psp.melts.get(), 1);
+        assert_eq!(s.esp_issued(), ONE_PSP);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_psp_that_cannot_be_asked_leaves_nothing_reserved() {
+        let mut s = setup("psp-down-before");
+        let (note, keypair) = s.psp.note(1);
+        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
+        let hash = request_hash(&request).unwrap();
+        // The look at the notes fails before anything is written.
+        s.psp.fail_burns.set(true);
+        assert!(matches!(s.run(&request), Err(ExchangeError::Psp(_))));
+        assert!(s.responses.get(&hash).is_none());
+        assert_eq!(s.responses.pending_exchanges().count(), 0);
+        assert_eq!(s.psp.melts.get(), 0);
+        // Another request for the same note is not held back.
+        s.psp.fail_burns.set(false);
+        let (other, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
+        assert!(s.run(&other).is_ok());
+        assert_eq!(s.psp.melts.get(), 1);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_burn_that_failed_leaves_the_entry_for_the_retry_and_nothing_else_stuck() {
+        let mut s = setup("psp-down-during");
+        let (note, keypair) = s.psp.note(1);
+        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
+        let hash = request_hash(&request).unwrap();
+        // The PSP does not answer the burn. Whether it burned is not known, so
+        // the entry stays; it is what the retry works from.
+        s.psp.fail_before_burn.set(true);
+        assert!(matches!(s.run(&request), Err(ExchangeError::Psp(_))));
+        assert!(matches!(
+            s.responses.get(&hash),
+            Some(Entry::Pending { .. })
+        ));
+        s.psp.fail_before_burn.set(false);
+        // The retry asks the PSP what became of the note and finishes.
+        assert!(s.run(&request).is_ok());
+        assert_eq!(s.psp.melts.get(), 1);
+        assert_eq!(s.responses.pending_exchanges().count(), 0);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn finishing_needs_the_pending_entry_to_be_there() {
+        let mut s = setup("entry-gone");
+        let (note, keypair) = s.psp.note(1);
+        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
+        let plan = plan_of(&s, &request);
+        let id = crate::rotation::keyset_id(&s.master);
+        // Nothing was reserved, so there is nothing to finish.
+        assert!(matches!(
+            finish(&s.logic, &s.master, &id, &mut s.responses, &request, &plan),
+            Err(ExchangeError::Internal(_))
+        ));
+        assert_eq!(s.esp_issued(), 0);
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
@@ -1182,14 +1671,14 @@ mod tests {
         // nothing more is issued.
         s.responses = Responses::open(&s.dir.join("esp").join("responses.json")).unwrap();
         assert_eq!(rejection(s.run(&second)), Rejection::NoteHeld);
-        assert_eq!(s.esp_issued(), ONE_PSP / 2);
+        assert_eq!(s.esp_issued(), first.outputs[0].amount.units);
 
         // The retry skips the burn, signs the first output again (the same
         // signature) and the second for the first time.
         let response = s.run(&first).unwrap();
         assert_eq!(s.psp.melts.get(), 1);
         assert_eq!(s.esp_issued(), ONE_PSP);
-        assert_eq!(response.signatures.len(), 2);
+        assert_eq!(response.signatures.len(), first.outputs.len());
         assert_eq!(response.signatures[0], signed_before_stop);
         for (i, want) in wanted.iter().enumerate() {
             let sk = s.master.key_for(first.outputs[i].amount, &terms);
@@ -1410,7 +1899,7 @@ mod tests {
         s.logic.issue_with_key(&sk, &request.outputs[0]).unwrap();
         s.psp.fail_after_burn.set(false);
         let response = s.run(&request).unwrap();
-        assert_eq!(response.signatures.len(), 2);
+        assert_eq!(response.signatures.len(), request.outputs.len());
         assert_eq!(s.esp_issued(), ONE_PSP);
         fs::remove_dir_all(&s.dir).unwrap();
     }
@@ -1491,7 +1980,9 @@ mod tests {
             fee_per_byte: rate,
             ..ExchangeSettings::default()
         };
-        let size = fee::exchange_size(1, 1);
+        // The fee depends on how many outputs there are, and how many there are
+        // depends on the fee, because each output is a power of two.
+        let size = fee::exchange_size(1, split(ONE_PSP).len());
         let fee_esp = fee::charge(size, rate);
         let run = |s: &mut Setup, request: &ExchangeRequest, settings: &ExchangeSettings| {
             exchange_with(
@@ -1519,13 +2010,24 @@ mod tests {
         }
         assert!(!s.psp.logic.is_spent(note.nonce).unwrap());
         // With the fee left off the outputs, it goes through.
-        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP - fee_esp as u64], None);
+        // That takes the fewest outputs n for which the rest, ONE_PSP less the
+        // fee for n outputs, splits into exactly n powers of two.
+        let (n, rest, fee_esp, size) = (1..=MAX_ITEMS)
+            .find_map(|n| {
+                let size = fee::exchange_size(1, n);
+                let fee_esp = fee::charge(size, rate);
+                let rest = ONE_PSP - fee_esp as u64;
+                (split(rest).len() <= n && n as u64 <= rest).then_some((n, rest, fee_esp, size))
+            })
+            .unwrap();
+        let (request, _) = build_exact(&[(note, &keypair, 1)], &split_into(rest, n), None);
+        assert_eq!(request.outputs.len(), n);
         let response = run(&mut s, &request, &with_fee).unwrap();
         assert_eq!(
             (response.fee_per_byte, response.fee_esp, response.size_bytes),
             (rate, fee_esp, size)
         );
-        assert_eq!(s.esp_issued(), ONE_PSP - fee_esp as u64);
+        assert_eq!(s.esp_issued(), rest);
         // A retry after the rate was changed gets the reply stored at the old rate.
         let later = ExchangeSettings {
             fee_per_byte: rate * 5,
@@ -1542,7 +2044,10 @@ mod tests {
         let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
         let response = s.run(&request).unwrap();
         assert_eq!((response.fee_per_byte, response.fee_esp), (0, 0));
-        assert_eq!(response.size_bytes, fee::exchange_size(1, 1));
+        assert_eq!(
+            response.size_bytes,
+            fee::exchange_size(1, request.outputs.len())
+        );
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
@@ -1727,16 +2232,59 @@ mod tests {
     }
 
     #[test]
+    fn an_output_that_is_not_a_power_of_two_is_refused_before_anything_is_burned() {
+        let mut s = setup("denomination");
+        let (note, keypair) = s.psp.note(1);
+        // the right total (1 PSP), but as one odd output and not as powers of two
+        let (request, _) = build_exact(&[(note, &keypair, 1)], &[ONE_PSP], None);
+        let r = rejection(s.run(&request));
+        assert_eq!(r, Rejection::BadDenomination { index: 0 });
+        assert_eq!(
+            r.to_string(),
+            "output 0: ESP amounts are powers of two. Nothing was burned"
+        );
+        // one odd output among good ones names its place
+        let mut amounts = split(ONE_PSP);
+        let last = amounts.len() - 1;
+        amounts[last] = 3;
+        let (request, _) = build_exact(&[(note, &keypair, 1)], &amounts, None);
+        assert_eq!(
+            rejection(s.run(&request)),
+            Rejection::BadDenomination { index: last }
+        );
+        assert_eq!(s.psp.melts.get(), 0);
+        assert!(!s.psp.logic.is_spent(note.nonce).unwrap());
+        assert!(s.responses.is_empty());
+        assert_eq!(s.esp_issued(), 0);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_total_split_into_powers_of_two_is_exchanged() {
+        let mut s = setup("split");
+        let (note, keypair) = s.psp.note(1);
+        let amounts = split(ONE_PSP);
+        assert!(amounts.iter().all(|a| a.is_power_of_two()));
+        assert_eq!(amounts.iter().sum::<u64>(), ONE_PSP);
+        let (request, _) = build_exact(&[(note, &keypair, 1)], &amounts, None);
+        let response = s.run(&request).unwrap();
+        assert_eq!(response.signatures.len(), amounts.len());
+        assert_eq!(s.esp_issued(), ONE_PSP);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
     fn amounts_at_the_u64_limit_do_not_overflow() {
         let mut s = setup("limits");
         let (note, keypair) = s.psp.note(1);
-        // two outputs of u64::MAX total more than a u64, and far more than 1 PSP
-        let (request, _) = build(&[(note, &keypair, 1)], &[u64::MAX, u64::MAX], None);
+        // two outputs of 2^63 total more than a u64, and far more than 1 PSP
+        let top = 1u64 << 63;
+        let (request, _) = build_exact(&[(note, &keypair, 1)], &[top, top], None);
         assert_eq!(
             rejection(s.run(&request)),
             Rejection::NotExact {
                 paid: u128::from(ONE_PSP),
-                requested: 2 * u128::from(u64::MAX)
+                requested: 2 * u128::from(top)
             }
         );
         // the largest note and the largest sum of notes still compute

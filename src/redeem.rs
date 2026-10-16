@@ -195,6 +195,13 @@ impl OutputList {
 pub enum RedeemRejection {
     NoInputs,
     ZeroAmount,
+    /// A note or an output amount is not a power of two. `what` names the list
+    /// ("note", "decline output", "refund output") and `index` the position in
+    /// it. Nothing was burned and no fee was taken.
+    BadDenomination {
+        what: &'static str,
+        index: usize,
+    },
     MemoInvalid {
         max: usize,
     },
@@ -250,6 +257,7 @@ impl RedeemRejection {
             RedeemRejection::Malformed(_) => sp_wire::codes::MALFORMED_REQUEST,
             RedeemRejection::TooLarge { .. } => sp_wire::codes::REQUEST_TOO_LARGE,
             RedeemRejection::ZeroAmount => "zero_amount",
+            RedeemRejection::BadDenomination { .. } => crate::units::BAD_DENOMINATION,
             RedeemRejection::MemoInvalid { .. } => "memo_invalid",
             RedeemRejection::DuplicateBlindNonce => "duplicate_blind_nonce",
             RedeemRejection::BlindNonceAlreadyUsed => "blind_nonce_already_used",
@@ -308,6 +316,10 @@ impl fmt::Display for RedeemRejection {
                 )
             }
             RedeemRejection::ZeroAmount => write!(f, "a note or an output has amount zero"),
+            RedeemRejection::BadDenomination { what, index } => write!(
+                f,
+                "{what} {index}: ESP amounts are powers of two. Nothing was burned and no fee was taken"
+            ),
             RedeemRejection::MemoInvalid { max } => write!(
                 f,
                 "the payout memo must not be empty and must be at most {max} bytes"
@@ -448,6 +460,16 @@ fn validate(request: &RedeemRequest, max_memo_bytes: usize) -> Result<(), Redeem
     if request.inputs.iter().any(|i| i.input.amount.units == 0) {
         return Err(RedeemRejection::ZeroAmount);
     }
+    if let Some(index) = request
+        .inputs
+        .iter()
+        .position(|i| !crate::units::is_denomination(i.input.amount.units))
+    {
+        return Err(RedeemRejection::BadDenomination {
+            what: "note",
+            index,
+        });
+    }
     if !is_keyset_id(&request.output_keyset)
         || request.inputs.iter().any(|i| !is_keyset_id(&i.keyset))
     {
@@ -456,14 +478,26 @@ fn validate(request: &RedeemRequest, max_memo_bytes: usize) -> Result<(), Redeem
         ));
     }
     let mut blind_nonces = HashSet::new();
+    let lists = [
+        ("decline output", &request.decline_outputs),
+        ("refund output", &request.refund_outputs),
+    ];
+    for (what, list) in lists {
+        if list.iter().any(|o| o.output.amount.units == 0) {
+            return Err(RedeemRejection::ZeroAmount);
+        }
+        if let Some(index) = list
+            .iter()
+            .position(|o| !crate::units::is_denomination(o.output.amount.units))
+        {
+            return Err(RedeemRejection::BadDenomination { what, index });
+        }
+    }
     for o in request
         .decline_outputs
         .iter()
         .chain(request.refund_outputs.iter())
     {
-        if o.output.amount.units == 0 {
-            return Err(RedeemRejection::ZeroAmount);
-        }
         if !blind_nonces.insert(o.output.blind_nonce) {
             return Err(RedeemRejection::DuplicateBlindNonce);
         }
@@ -1103,11 +1137,15 @@ mod tests {
     const PAST2: u64 = 20_500;
     /// A day that has not come at NOW.
     const FUTURE: u64 = 21_100;
-    /// 1 USD (10 PSP) in ESP units. A test amount; the fee tests below depend on its size.
-    const ONE: u64 = 1_000_000_000_000;
-    /// The fee rate in these tests: 10^9 ESP units a byte, so a request of a few
-    /// hundred bytes pays about half a PSP.
-    const RATE: u128 = 1_000_000_000;
+    /// A test amount, a power of two (about $4.40); the fee tests below depend on
+    /// its size.
+    const ONE: u64 = 1 << 42;
+    /// A note smaller than the fee of a request of two notes.
+    const SMALL: u64 = 1 << 40;
+    /// The fee rate in these tests: 2^31 ESP units a byte. With `MEMO` a request
+    /// of one note is 512 bytes, so its fee is 2^40, a power of two: a note can
+    /// be worth exactly that fee, and every note is a power of two.
+    const RATE: u128 = 1 << 31;
 
     /// The fee of a request with this many inputs, decline outputs and refund
     /// outputs, with the memo `MEMO`.
@@ -1209,6 +1247,48 @@ mod tests {
 
     /// (units, service, day)
     type Out = (u64, XOnlyPublicKey, u64);
+
+    /// Split `total` into exactly `n` outputs that are powers of two, under the
+    /// same terms: the bits of `total`, then the largest output halved until
+    /// there are `n`. Needs `popcount(total) <= n <= total`.
+    fn split_out_into(total: u64, n: usize, service: XOnlyPublicKey, day: u64) -> Vec<Out> {
+        let mut outs = split_out(total, service, day);
+        while outs.len() < n {
+            let i = outs.iter().position(|o| o.0 > 1).unwrap();
+            outs[i].0 /= 2;
+            let half = outs[i];
+            outs.insert(i + 1, half);
+        }
+        outs
+    }
+
+    /// The fewest outputs `n`, from `fixed` + 1 up, for which the amount to
+    /// split, `rest_for(n)` (it falls as the fee for `n` outputs rises), and
+    /// that amount plus one both split into exactly `n - fixed` powers of two.
+    /// The fee depends on how many outputs there are, and how many there are
+    /// depends on the fee.
+    fn fewest_outputs(fixed: usize, rest_for: impl Fn(usize) -> u64) -> usize {
+        (fixed + 1..1_000)
+            .find(|&n| {
+                let rest = rest_for(n);
+                let k = n - fixed;
+                [rest, rest + 1]
+                    .iter()
+                    .all(|v| v.count_ones() as usize <= k && k as u64 <= *v)
+            })
+            .unwrap()
+    }
+
+    /// A total split into powers of two, the way the wallet does: one output for
+    /// each bit set, largest first, all under the same terms.
+    fn split_out(total: u64, service: XOnlyPublicKey, day: u64) -> Vec<Out> {
+        (0..64)
+            .rev()
+            .map(|bit| 1u64 << bit)
+            .filter(|p| total & p != 0)
+            .map(|p| (p, service, day))
+            .collect()
+    }
 
     fn dummy_signature() -> Signature {
         Signature::from_slice(&[0u8; 64]).unwrap()
@@ -1444,7 +1524,10 @@ mod tests {
         build_with(ins, decline, refund, MEMO, &service_keypair(), None).0
     }
 
-    const MEMO: &str = "btc:bc1qpayhere";
+    /// 207 bytes, so that a request of one note and no outputs is 512 bytes.
+    const MEMO: &str = "btc:bc1qpayhere-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    /// 126 bytes, so that a request of one note and one output is 512 bytes.
+    const SHORT_MEMO: &str = "btc:bc1qpayhere-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 
     fn rejection(result: Result<RedeemResponse, RedeemError>) -> RedeemRejection {
         match result {
@@ -1511,9 +1594,9 @@ mod tests {
     #[test]
     fn a_redemption_burns_the_notes_and_queues_the_payout_minus_the_fee() {
         let mut s = setup("happy");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(2 * ONE, service(), PAST2);
-        assert_eq!(s.totals(), (5 * ONE, 0));
+        assert_eq!(s.totals(), (6 * ONE, 0));
         let request = build(
             &[&a, &b],
             &[(2 * ONE, service(), PAST), (2 * ONE, service(), PAST2)],
@@ -1523,26 +1606,26 @@ mod tests {
 
         assert!(response.notes.iter().all(|n| n.accepted && n.burned));
         assert_eq!(reasons(&response), vec![None, None]);
-        assert_eq!(response.accepted_esp, u128::from(5 * ONE));
+        assert_eq!(response.accepted_esp, u128::from(6 * ONE));
         assert_eq!(response.rejected_esp, 0);
         assert_eq!(response.fee_esp, u128::from(fee(2, 2, 0)));
         assert_eq!(response.size_bytes, request.encode().len() as u64);
         assert_eq!(response.message, "payout queued");
-        assert_eq!(response.owed_esp, u128::from(5 * ONE - fee(2, 2, 0)));
+        assert_eq!(response.owed_esp, u128::from(6 * ONE - fee(2, 2, 0)));
         assert!(response.refund.is_empty());
         let view = response.entry.clone().unwrap();
         assert_eq!(view.status, Status::Open);
-        assert_eq!(view.owed_esp, u128::from(5 * ONE - fee(2, 2, 0)));
+        assert_eq!(view.owed_esp, u128::from(6 * ONE - fee(2, 2, 0)));
 
         assert!(s.is_spent(&a) && s.is_spent(&b));
         // the notes are redeemed and nothing is issued: the decline outputs wait
-        assert_eq!(s.totals(), (5 * ONE, 5 * ONE));
+        assert_eq!(s.totals(), (6 * ONE, 6 * ONE));
 
         let queue = s.queue();
         assert_eq!(queue.len(), 1);
         let entry = queue.get(&request_hash(&request)).unwrap();
         assert_eq!(entry.service, service());
-        assert_eq!(entry.owed_esp, u128::from(5 * ONE - fee(2, 2, 0)));
+        assert_eq!(entry.owed_esp, u128::from(6 * ONE - fee(2, 2, 0)));
         assert_eq!(entry.memo, MEMO);
         assert_eq!(entry.created_unix, NOW);
         assert_eq!(entry.status, Status::Open);
@@ -1558,10 +1641,10 @@ mod tests {
     #[test]
     fn a_request_with_no_decline_outputs_is_fine() {
         let mut s = setup("no-decline");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[], &[]);
         let response = s.run(&request).unwrap();
-        assert_eq!(response.owed_esp, u128::from(3 * ONE - fee(1, 0, 0)));
+        assert_eq!(response.owed_esp, u128::from(4 * ONE - fee(1, 0, 0)));
         assert!(s.is_spent(&a));
         fs::remove_dir_all(&s.dir).unwrap();
     }
@@ -1571,7 +1654,7 @@ mod tests {
     #[test]
     fn a_bad_service_signature_means_no_burn_no_fee_and_no_trace() {
         let mut s = setup("bad-sig");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let totals = s.totals();
         let (request, _, _) = build_with(&[&a], &[], &[], MEMO, &other_keypair(), None);
         assert_eq!(
@@ -1588,7 +1671,7 @@ mod tests {
     #[test]
     fn a_signature_over_another_request_does_not_cover_this_one() {
         let mut s = setup("sig-other-request");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let mut request = build(&[&a], &[], &[]);
         request.memo = "btc:bc1qsomewhereelse".to_string();
         assert_eq!(
@@ -1619,7 +1702,7 @@ mod tests {
     #[test]
     fn a_note_for_another_service_is_rejected_alone_and_left_unburned() {
         let mut s = setup("wrong-service");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(2 * ONE, other(), PAST);
         let request = build(&[&a, &b], &[(2 * ONE, service(), PAST)], &[]);
         let response = s.run(&request).unwrap();
@@ -1627,9 +1710,9 @@ mod tests {
         assert_eq!(reasons(&response), vec![None, Some(Reason::WrongService)]);
         assert!(response.notes[0].burned);
         assert!(!response.notes[1].burned);
-        assert_eq!(response.accepted_esp, u128::from(3 * ONE));
+        assert_eq!(response.accepted_esp, u128::from(4 * ONE));
         assert_eq!(response.rejected_esp, u128::from(2 * ONE));
-        assert_eq!(response.owed_esp, u128::from(3 * ONE - fee(2, 1, 0)));
+        assert_eq!(response.owed_esp, u128::from(4 * ONE - fee(2, 1, 0)));
         assert!(s.is_spent(&a));
         assert!(!s.is_spent(&b));
         fs::remove_dir_all(&s.dir).unwrap();
@@ -1638,7 +1721,7 @@ mod tests {
     #[test]
     fn a_note_claimed_under_the_wrong_terms_is_a_bad_proof_and_counts_for_nothing() {
         let mut s = setup("bad-proof");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let c = s.held(2 * ONE, service(), PAST);
         // the right service and amount, but a day it was not signed for
         let wrong_day = claiming(&c, service(), PAST2);
@@ -1656,7 +1739,7 @@ mod tests {
             reasons(&response),
             vec![None, Some(Reason::BadProof), Some(Reason::BadProof)]
         );
-        assert_eq!(response.accepted_esp, u128::from(3 * ONE));
+        assert_eq!(response.accepted_esp, u128::from(4 * ONE));
         assert_eq!(response.rejected_esp, 0);
         assert!(!s.is_spent(&c));
         fs::remove_dir_all(&s.dir).unwrap();
@@ -1665,7 +1748,7 @@ mod tests {
     #[test]
     fn a_spend_signature_by_the_wrong_key_is_a_bad_proof() {
         let mut s = setup("bad-spend");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(2 * ONE, service(), PAST);
         let thief = Keypair::new(SECP256K1, &mut OsRng);
         let (request, _, _) =
@@ -1695,7 +1778,7 @@ mod tests {
     #[test]
     fn a_spent_note_and_a_note_listed_twice_are_already_spent() {
         let mut s = setup("already-spent");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(2 * ONE, service(), PAST);
         s.spend_elsewhere(&b);
         let request = build(&[&a, &b, &a], &[(2 * ONE, service(), PAST)], &[]);
@@ -1706,9 +1789,9 @@ mod tests {
             vec![None, Some(Reason::AlreadySpent), Some(Reason::AlreadySpent)]
         );
         // the note listed twice counts once
-        assert_eq!(response.accepted_esp, u128::from(3 * ONE));
+        assert_eq!(response.accepted_esp, u128::from(4 * ONE));
         assert_eq!(response.rejected_esp, 0);
-        assert_eq!(response.owed_esp, u128::from(3 * ONE - fee(3, 1, 0)));
+        assert_eq!(response.owed_esp, u128::from(4 * ONE - fee(3, 1, 0)));
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
@@ -1717,15 +1800,15 @@ mod tests {
         let mut s = setup("below-fee-reasons");
         // two tiny notes, one of them spent by another request: what is left
         // is worth less than the fee
-        let a = s.held(10, service(), PAST);
-        let b = s.held(10, service(), PAST);
+        let a = s.held(8, service(), PAST);
+        let b = s.held(8, service(), PAST);
         s.spend_elsewhere(&b);
         let request = build(&[&a, &b], &[], &[]);
         let rejected = rejection(s.run(&request));
         let RedeemRejection::BelowFee { value, notes, .. } = &rejected else {
             panic!("expected below_fee, got {rejected:?}");
         };
-        assert_eq!(*value, 10);
+        assert_eq!(*value, 8);
         assert_eq!(
             notes.iter().map(|n| n.reason).collect::<Vec<_>>(),
             vec![None, Some(Reason::AlreadySpent)]
@@ -1733,7 +1816,7 @@ mod tests {
         assert!(notes.iter().all(|n| !n.burned));
         // the body a wallet reads carries the same list, and keeps the old fields
         let body = rejected.details();
-        assert_eq!(body["value_esp"], "10");
+        assert_eq!(body["value_esp"], "8");
         assert!(body["fee_esp"].is_string());
         assert_eq!(body["notes"][1]["reason"], "already_spent");
         assert_eq!(body["notes"][0]["reason"], Value::Null);
@@ -1745,13 +1828,13 @@ mod tests {
     #[test]
     fn a_note_that_is_not_mature_is_rejected_alone_and_stays_with_the_holder() {
         let mut s = setup("immature");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(2 * ONE, service(), FUTURE);
         let request = build(&[&a, &b], &[(2 * ONE, service(), PAST)], &[]);
         let response = s.run(&request).unwrap();
 
         assert_eq!(reasons(&response), vec![None, Some(Reason::Immature)]);
-        assert_eq!(response.owed_esp, u128::from(3 * ONE - fee(2, 1, 0)));
+        assert_eq!(response.owed_esp, u128::from(4 * ONE - fee(2, 1, 0)));
         assert_eq!(response.rejected_esp, u128::from(2 * ONE));
         assert!(s.is_spent(&a));
         assert!(!s.is_spent(&b));
@@ -1774,7 +1857,7 @@ mod tests {
     fn the_first_reason_that_applies_is_the_one_given() {
         let mut s = setup("reason-order");
         // another service's note that is also spent: WrongService wins
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let w = s.held(ONE, other(), PAST);
         s.spend_elsewhere(&w);
         // spent and not mature: AlreadySpent wins over Immature
@@ -1789,19 +1872,83 @@ mod tests {
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
+    // ---- amounts are powers of two ----
+
+    #[test]
+    fn a_note_or_an_output_that_is_not_a_power_of_two_is_refused_before_anything_is_burned_or_charged()
+     {
+        let mut s = setup("denomination");
+        let a = s.held(4 * ONE, service(), PAST);
+        let b = s.held(2 * ONE, service(), FUTURE);
+        // an odd note, issued directly: the mint holds it under that amount
+        let odd = s.held(ONE + 5, service(), PAST);
+        let totals = s.totals();
+
+        let check = |s: &mut Setup, request: &RedeemRequest, what: &'static str, index: usize| {
+            let r = rejection(s.run(request));
+            assert_eq!(r, RedeemRejection::BadDenomination { what, index });
+            assert_eq!(r.code(), "bad_denomination");
+            assert_eq!(
+                r.to_string(),
+                format!(
+                    "{what} {index}: ESP amounts are powers of two. Nothing was burned and no fee was taken"
+                )
+            );
+        };
+
+        // an incoming note
+        let request = build(&[&a, &odd], &[], &[]);
+        check(&mut s, &request, "note", 1);
+        // a decline output, among good ones
+        let request = build(
+            &[&a],
+            &[(ONE, service(), PAST), (ONE - 1, service(), PAST)],
+            &[],
+        );
+        check(&mut s, &request, "decline output", 1);
+        // a refund output
+        let request = build(&[&a, &b], &[], &[(ONE + 1, service(), FUTURE)]);
+        check(&mut s, &request, "refund output", 0);
+
+        for h in [&a, &b, &odd] {
+            assert!(!s.is_spent(h));
+        }
+        assert_eq!(s.totals(), (totals.0, totals.1));
+        assert!(s.responses.is_empty());
+        assert!(s.queue().is_empty());
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn outputs_split_into_powers_of_two_are_reissued() {
+        let mut s = setup("split-outputs");
+        let a = s.held(4 * ONE, service(), PAST);
+        // 4 ONE less the fee (two decline outputs or more), as powers of two
+        let n = fewest_outputs(0, |n| 4 * ONE - fee(1, n, 0));
+        let max = 4 * ONE - fee(1, n, 0);
+        let decline = split_out_into(max, n, service(), PAST);
+        assert!(decline.iter().all(|o| o.0.is_power_of_two()));
+        let request = build(&[&a], &decline, &[]);
+        assert_eq!(request.decline_outputs.len(), n);
+        let response = s.run(&request).unwrap();
+        assert_eq!(response.owed_esp, u128::from(max));
+        assert!(response.entry.is_some());
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
     // ---- fee ----
 
     #[test]
     fn the_fee_is_sized_by_the_whole_request_and_a_request_below_it_is_refused_whole() {
         let mut s = setup("below-fee");
-        let a = s.held(4 * (ONE / 10), service(), PAST);
-        let junk = forged(5 * ONE);
+        let a = s.held(SMALL, service(), PAST);
+        let junk = forged(8 * ONE);
         let totals = s.totals();
         let request = build(&[&a, &junk], &[], &[]);
         // the junk note is in the request, so it is in the size, but it is not value
         match rejection(s.run(&request)) {
             RedeemRejection::BelowFee { value, fee: f, .. } => {
-                assert_eq!(value, u128::from(4 * (ONE / 10)));
+                assert_eq!(value, u128::from(SMALL));
                 assert_eq!(f, u128::from(fee(2, 0, 0)));
             }
             other => panic!("expected below_fee, got {other:?}"),
@@ -1835,8 +1982,9 @@ mod tests {
             Some(Entry::RedeemDone(_))
         ));
 
-        // one unit less is below the fee
-        let b = s.held(f - 1, service(), PAST);
+        // half the fee is below the fee (every note is a power of two, so there
+        // is no note one unit short)
+        let b = s.held(f / 2, service(), PAST);
         let request = build(&[&b], &[], &[]);
         assert!(matches!(
             rejection(s.run(&request)),
@@ -1849,19 +1997,22 @@ mod tests {
     #[test]
     fn accepted_notes_that_do_not_cover_the_fee_take_the_rest_from_the_rejected_ones() {
         let mut s = setup("shortfall");
-        let a_units = 4 * (ONE / 10);
+        let a_units = SMALL;
         let a = s.held(a_units, service(), PAST);
-        let b = s.held(3 * ONE, service(), FUTURE);
+        let b = s.held(4 * ONE, service(), FUTURE);
         // the accepted note is less than the fee, so the rest of the fee comes from
         // the immature note, and what is left of it may come back
-        let f = fee(2, 0, 1);
+        // (the fee depends on how many refund outputs there are, and the
+        // refund is split into powers of two, so find the count that fits)
+        let n = fewest_outputs(0, |n| 4 * ONE - (fee(2, 0, n) - a_units));
+        let f = fee(2, 0, n);
         assert!(f > a_units);
         let shortfall = f - a_units;
-        let max_refund = 3 * ONE - shortfall;
+        let max_refund = 4 * ONE - shortfall;
         let (request, _, refund_wanted) = build_with(
             &[&a, &b],
             &[],
-            &[(max_refund, service(), FUTURE)],
+            &split_out_into(max_refund, n, service(), FUTURE),
             MEMO,
             &service_keypair(),
             None,
@@ -1877,13 +2028,15 @@ mod tests {
         assert_eq!(response.owed_esp, 0);
         assert_eq!(response.message, "nothing owed, fee taken");
         assert!(response.entry.is_none());
-        assert_eq!(response.refund.len(), 1);
-        assert_signed(&s, &response.refund[0], &refund_wanted[0]);
+        assert_eq!(response.refund.len(), refund_wanted.len());
+        for (issued, wanted) in response.refund.iter().zip(&refund_wanted) {
+            assert_signed(&s, issued, wanted);
+        }
         assert!(s.is_spent(&a) && s.is_spent(&b));
         assert!(s.queue().is_empty());
         // both notes redeemed, the refund issued, and the difference is the fee
         let (issued, redeemed) = s.totals();
-        assert_eq!(redeemed - before.1, a_units + 3 * ONE);
+        assert_eq!(redeemed - before.1, a_units + 4 * ONE);
         assert_eq!(issued - before.0, max_refund);
         assert_eq!((issued - before.0) + f, redeemed - before.1);
         fs::remove_dir_all(&s.dir).unwrap();
@@ -1892,7 +2045,7 @@ mod tests {
     #[test]
     fn a_refund_may_be_less_than_the_most_allowed_and_keeps_its_terms() {
         let mut s = setup("refund-less");
-        let b = s.held(3 * ONE, service(), FUTURE);
+        let b = s.held(4 * ONE, service(), FUTURE);
         let c = s.held(2 * ONE, other(), PAST);
         // nothing accepted: shortfall = 1, so up to 4 comes back, each part
         // under the terms of the notes it comes from
@@ -1920,14 +2073,14 @@ mod tests {
     #[test]
     fn without_refund_outputs_a_request_that_needs_them_is_refused_with_the_totals() {
         let mut s = setup("refund-required");
-        let a = s.held(4 * (ONE / 10), service(), PAST);
-        let b = s.held(3 * ONE, service(), FUTURE);
+        let a = s.held(SMALL, service(), PAST);
+        let b = s.held(4 * ONE, service(), FUTURE);
         let totals = s.totals();
         let request = build(&[&a, &b], &[], &[]);
         match rejection(s.run(&request)) {
             RedeemRejection::RefundRequired { totals: t } => {
-                assert_eq!(t.accepted_esp, u128::from(4 * (ONE / 10)));
-                assert_eq!(t.rejected_esp, u128::from(3 * ONE));
+                assert_eq!(t.accepted_esp, u128::from(SMALL));
+                assert_eq!(t.rejected_esp, u128::from(4 * ONE));
                 assert_eq!(t.fee_esp, u128::from(fee(2, 0, 0)));
                 assert_eq!(t.size_bytes, encoded_len(2, MEMO.len(), 0, 0));
                 assert_eq!(t.notes.len(), 2);
@@ -1935,7 +2088,7 @@ mod tests {
                 assert_eq!(t.notes[1].reason, Some(Reason::Immature));
                 assert_eq!(t.rejected_by_terms.len(), 1);
                 assert_eq!(t.rejected_by_terms[0].redeemable_after_day, FUTURE);
-                assert_eq!(t.rejected_by_terms[0].esp, u128::from(3 * ONE));
+                assert_eq!(t.rejected_by_terms[0].esp, u128::from(4 * ONE));
             }
             other => panic!("expected RefundRequired, got {other:?}"),
         }
@@ -1948,19 +2101,20 @@ mod tests {
     #[test]
     fn refund_outputs_over_the_limit_are_refused_before_anything_is_burned() {
         let mut s = setup("refund-over");
-        let a_units = 4 * (ONE / 10);
+        let a_units = SMALL;
         let a = s.held(a_units, service(), PAST);
-        let b = s.held(3 * ONE, service(), FUTURE);
-        let max = 3 * ONE - (fee(2, 0, 1) - a_units);
+        let b = s.held(4 * ONE, service(), FUTURE);
+        let n = fewest_outputs(0, |n| 4 * ONE - (fee(2, 0, n) - a_units));
+        let max = 4 * ONE - (fee(2, 0, n) - a_units);
         let cases: Vec<Vec<Out>> = vec![
             // one unit more than the most allowed
-            vec![(max + 1, service(), FUTURE)],
+            split_out_into(max + 1, n, service(), FUTURE),
             // terms that no rejected note has
             vec![(ONE, service(), PAST2)],
             // another service's terms
             vec![(ONE, other(), FUTURE)],
             // the accepted note's terms: it is burned for the fee, not refunded
-            vec![(ONE / 10, service(), PAST)],
+            vec![(ONE / 16, service(), PAST)],
         ];
         for refund in cases {
             let request = build(&[&a, &b], &[], &refund);
@@ -1972,7 +2126,7 @@ mod tests {
             }
         }
         // exactly the most allowed goes through
-        let request = build(&[&a, &b], &[], &[(max, service(), FUTURE)]);
+        let request = build(&[&a, &b], &[], &split_out_into(max, n, service(), FUTURE));
         assert!(s.run(&request).is_ok());
         fs::remove_dir_all(&s.dir).unwrap();
     }
@@ -1991,8 +2145,18 @@ mod tests {
         assert_eq!(s.totals(), (f, f));
 
         // and a refund output is then too much
-        let c = s.held(fee(1, 0, 1), service(), FUTURE);
-        let request = build(&[&c], &[], &[(1, service(), FUTURE)]);
+        // (the short memo makes this request 512 bytes too, so its fee is a
+        // power of two and a note can be worth exactly that)
+        let c = s.held(1 << 40, service(), FUTURE);
+        let (request, _, _) = build_with(
+            &[&c],
+            &[],
+            &[(1, service(), FUTURE)],
+            SHORT_MEMO,
+            &service_keypair(),
+            None,
+        );
+        assert_eq!(fee_for(request.encoded_len(), RATE), u128::from(1u64 << 40));
         assert!(matches!(
             rejection(s.run(&request)),
             RedeemRejection::OutputsOverLimit {
@@ -2007,7 +2171,7 @@ mod tests {
     #[test]
     fn a_request_of_all_rejected_notes_gets_them_back_minus_the_fee() {
         let mut s = setup("all-rejected");
-        let b = s.held(3 * ONE, service(), FUTURE);
+        let b = s.held(4 * ONE, service(), FUTURE);
         let (request, _, refund_wanted) = build_with(
             &[&b],
             &[],
@@ -2023,7 +2187,7 @@ mod tests {
         assert_signed(&s, &response.refund[1], &refund_wanted[1]);
         assert!(s.is_spent(&b));
         // the refunds are notes the service can hold and present later
-        assert_eq!(s.totals(), (5 * ONE, 3 * ONE));
+        assert_eq!(s.totals(), (6 * ONE, 4 * ONE));
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
@@ -2032,9 +2196,9 @@ mod tests {
         let mut s = setup("shortfall-junk");
         let a = s.held(ONE / 2, service(), PAST);
         let b = s.held(ONE, service(), FUTURE);
-        let spent = s.held(5 * ONE, service(), FUTURE);
+        let spent = s.held(8 * ONE, service(), FUTURE);
         s.spend_elsewhere(&spent);
-        let junk = forged(5 * ONE);
+        let junk = forged(8 * ONE);
         // A = 0.5, R = 1 (the immature one), shortfall 0.5, so 0.5 can be refunded
         let request = build(
             &[&a, &b, &spent, &junk],
@@ -2062,7 +2226,7 @@ mod tests {
     #[test]
     fn decline_outputs_over_the_limit_are_refused_with_the_totals_to_rebuild_from() {
         let mut s = setup("decline-over");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(ONE, service(), PAST2);
         let totals = s.totals();
         let cases: Vec<Vec<Out>> = vec![
@@ -2081,12 +2245,12 @@ mod tests {
             match rejection(s.run(&request)) {
                 RedeemRejection::OutputsOverLimit { list, totals: t } => {
                     assert_eq!(list, OutputList::Decline);
-                    assert_eq!(t.accepted_esp, u128::from(4 * ONE));
+                    assert_eq!(t.accepted_esp, u128::from(5 * ONE));
                     assert_eq!(t.rejected_esp, 0);
                     assert_eq!(t.fee_esp, u128::from(fee(2, n_decline, 0)));
                     assert_eq!(t.accepted_by_terms.len(), 2);
                     assert_eq!(t.accepted_by_terms[0].redeemable_after_day, PAST);
-                    assert_eq!(t.accepted_by_terms[0].esp, u128::from(3 * ONE));
+                    assert_eq!(t.accepted_by_terms[0].esp, u128::from(4 * ONE));
                     assert_eq!(t.accepted_by_terms[1].redeemable_after_day, PAST2);
                     assert_eq!(t.accepted_by_terms[1].esp, u128::from(ONE));
                 }
@@ -2102,7 +2266,7 @@ mod tests {
     #[test]
     fn decline_outputs_are_refused_when_a_note_the_wallet_counted_on_was_rejected() {
         let mut s = setup("decline-rebuild");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(2 * ONE, service(), FUTURE);
         // the wallet built for A = 5, so asked for 4 back; the mint accepts only 3
         let request = build(
@@ -2112,7 +2276,7 @@ mod tests {
         );
         match rejection(s.run(&request)) {
             RedeemRejection::OutputsOverLimit { totals, .. } => {
-                assert_eq!(totals.accepted_esp, u128::from(3 * ONE));
+                assert_eq!(totals.accepted_esp, u128::from(4 * ONE));
                 assert_eq!(totals.rejected_esp, u128::from(2 * ONE));
                 assert_eq!(totals.notes[1].reason, Some(Reason::Immature));
             }
@@ -2127,31 +2291,27 @@ mod tests {
     #[test]
     fn decline_outputs_of_exactly_the_most_allowed_go_through() {
         let mut s = setup("decline-exact");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(ONE, service(), PAST2);
-        // the most that can come back is A minus the fee
-        let max = 4 * ONE - fee(2, 2, 0);
-        let request = build(
-            &[&a, &b],
-            &[
-                (3 * ONE, service(), PAST),
-                (max - 3 * ONE + 1, service(), PAST2),
-            ],
-            &[],
-        );
+        // The most that can come back is A and B minus the fee. The fee depends on
+        // how many outputs there are, and all but the first output (4 ONE) are
+        // split into powers of two, so find the count that fits.
+        let n = fewest_outputs(1, |n| ONE - fee(2, n, 0));
+        let max = 5 * ONE - fee(2, n, 0);
+        let outputs = |rest: u64| {
+            [
+                vec![(4 * ONE, service(), PAST)],
+                split_out_into(rest, n - 1, service(), PAST2),
+            ]
+            .concat()
+        };
+        let request = build(&[&a, &b], &outputs(max - 4 * ONE + 1), &[]);
         // one unit over
         assert!(matches!(
             rejection(s.run(&request)),
             RedeemRejection::OutputsOverLimit { .. }
         ));
-        let request = build(
-            &[&a, &b],
-            &[
-                (3 * ONE, service(), PAST),
-                (max - 3 * ONE, service(), PAST2),
-            ],
-            &[],
-        );
+        let request = build(&[&a, &b], &outputs(max - 4 * ONE), &[]);
         let response = s.run(&request).unwrap();
         assert_eq!(response.owed_esp, u128::from(max));
         fs::remove_dir_all(&s.dir).unwrap();
@@ -2160,8 +2320,18 @@ mod tests {
     #[test]
     fn decline_outputs_are_refused_when_nothing_is_owed() {
         let mut s = setup("decline-nothing-owed");
-        let a = s.held(fee(1, 1, 0), service(), PAST);
-        let request = build(&[&a], &[(1, service(), PAST)], &[]);
+        // (the short memo makes this request 512 bytes, so its fee is 2^40 and
+        // a note can be worth exactly that)
+        let a = s.held(1 << 40, service(), PAST);
+        let (request, _, _) = build_with(
+            &[&a],
+            &[(1, service(), PAST)],
+            &[],
+            SHORT_MEMO,
+            &service_keypair(),
+            None,
+        );
+        assert_eq!(fee_for(request.encoded_len(), RATE), u128::from(1u64 << 40));
         assert!(matches!(
             rejection(s.run(&request)),
             RedeemRejection::OutputsOverLimit {
@@ -2176,7 +2346,7 @@ mod tests {
     #[test]
     fn refund_outputs_are_refused_when_the_accepted_notes_cover_the_fee() {
         let mut s = setup("refund-not-needed");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(ONE, service(), FUTURE);
         let request = build(&[&a, &b], &[], &[(ONE / 2, service(), FUTURE)]);
         assert!(matches!(
@@ -2297,9 +2467,46 @@ mod tests {
     }
 
     #[test]
+    fn only_powers_of_two_are_amounts() {
+        let bad = |what, index| Err(RedeemRejection::BadDenomination { what, index });
+        assert_eq!(
+            validate_default(&fake_request(
+                vec![fake_input(1), fake_input(6)],
+                vec![],
+                vec![]
+            )),
+            bad("note", 1)
+        );
+        assert_eq!(
+            validate_default(&fake_request(
+                vec![fake_input(1)],
+                vec![fake_output(4), fake_output(3)],
+                vec![]
+            )),
+            bad("decline output", 1)
+        );
+        assert_eq!(
+            validate_default(&fake_request(
+                vec![fake_input(1)],
+                vec![],
+                vec![fake_output(1), fake_output(2), fake_output(u64::MAX)]
+            )),
+            bad("refund output", 2)
+        );
+        assert_eq!(
+            validate_default(&fake_request(
+                vec![fake_input(1 << 63)],
+                vec![fake_output(1 << 62)],
+                vec![fake_output(2)]
+            )),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn an_output_blind_nonce_that_was_already_used_is_refused() {
         let mut s = setup("blind-used");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[(ONE, service(), PAST)], &[]);
         // use the blind nonce first
         let terms = Terms {
@@ -2323,7 +2530,7 @@ mod tests {
     #[test]
     fn the_digest_covers_the_terms_the_memo_and_both_lists() {
         let s = setup("digest");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let (request, _, _) = build_with(
             &[&a],
             &[(ONE, service(), PAST)],
@@ -2366,7 +2573,7 @@ mod tests {
     #[test]
     fn the_size_is_exact_and_a_request_survives_its_encoding() {
         let s = setup("encoding");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(2 * ONE, other(), PAST2);
         let request = build(
             &[&a, &b],
@@ -2374,8 +2581,8 @@ mod tests {
             &[(ONE, other(), PAST2), (1, service(), PAST)],
         );
         let bytes = request.encode();
-        // 119 + 186 * 2 + 15 (the memo) + 81 * 3
-        assert_eq!(bytes.len(), 119 + 372 + 15 + 243);
+        // 119 + 186 * 2 + the memo + 81 * 3
+        assert_eq!(bytes.len(), 119 + 372 + MEMO.len() + 243);
         assert_eq!(request.encoded_len(), bytes.len() as u64);
         assert_eq!(encoded_len(2, MEMO.len(), 1, 2), bytes.len() as u64);
         assert_eq!(bytes[0], FORMAT_VERSION);
@@ -2431,23 +2638,23 @@ mod tests {
     #[test]
     fn the_fee_taken_is_the_rate_times_the_measured_size() {
         let mut s = setup("fee-from-size");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let small = build(&[&a], &[], &[]);
         let r = s.run(&small).unwrap();
         assert_eq!(r.size_bytes, small.encode().len() as u64);
         assert_eq!(r.fee_esp, RATE * u128::from(r.size_bytes));
-        assert_eq!(r.owed_esp, u128::from(3 * ONE) - r.fee_esp);
+        assert_eq!(r.owed_esp, u128::from(4 * ONE) - r.fee_esp);
         // a second note in the request costs 186 bytes more
         let mut other_setup = setup("fee-from-size-2");
-        let c = other_setup.held(3 * ONE, service(), PAST);
-        let d = other_setup.held(3 * ONE, service(), PAST);
+        let c = other_setup.held(4 * ONE, service(), PAST);
+        let d = other_setup.held(4 * ONE, service(), PAST);
         let r2 = other_setup.run(&build(&[&c, &d], &[], &[])).unwrap();
         assert_eq!(r2.size_bytes, r.size_bytes + 186);
         assert_eq!(r2.fee_esp, r.fee_esp + RATE * 186);
         // the memo is in the size
-        let e = other_setup.held(3 * ONE, service(), PAST);
-        let longer = "btc:bc1qpayhere-and-a-bit-more";
-        let (long_memo, _, _) = build_with(&[&e], &[], &[], longer, &service_keypair(), None);
+        let e = other_setup.held(4 * ONE, service(), PAST);
+        let longer = format!("{MEMO}-and-a-bit-more");
+        let (long_memo, _, _) = build_with(&[&e], &[], &[], &longer, &service_keypair(), None);
         let r3 = other_setup.run(&long_memo).unwrap();
         assert_eq!(
             r3.size_bytes,
@@ -2460,7 +2667,7 @@ mod tests {
     #[test]
     fn a_body_that_is_not_exactly_one_request_does_not_decode() {
         let s = setup("decode");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[(ONE, service(), PAST)], &[]);
         let bytes = request.encode();
         assert!(decode(&bytes).is_ok());
@@ -2508,7 +2715,7 @@ mod tests {
     #[test]
     fn the_request_hash_covers_every_byte_that_is_measured() {
         let s = setup("hash-covers");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[(ONE, service(), PAST)], &[]);
         let base = request_hash(&request);
         let bytes = request.encode();
@@ -2531,7 +2738,7 @@ mod tests {
     #[test]
     fn the_same_request_twice_answers_the_same_and_burns_and_queues_once() {
         let mut s = setup("idempotent");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[(2 * ONE, service(), PAST)], &[]);
         let first = s.run(&request).unwrap();
         let totals = s.totals();
@@ -2545,16 +2752,16 @@ mod tests {
     #[test]
     fn a_crash_after_the_pending_entry_and_before_the_burn_is_finished_by_a_retry() {
         let mut s = setup("crash-before-burn");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(2 * ONE, service(), PAST);
-        let request = build(&[&a, &b], &[(3 * ONE, service(), PAST)], &[]);
+        let request = build(&[&a, &b], &[(4 * ONE, service(), PAST)], &[]);
         s.pend(&request);
         assert!(!s.is_spent(&a));
 
         let response = s.run(&request).unwrap();
-        assert_eq!(response.owed_esp, u128::from(5 * ONE - fee(2, 1, 0)));
+        assert_eq!(response.owed_esp, u128::from(6 * ONE - fee(2, 1, 0)));
         assert!(s.is_spent(&a) && s.is_spent(&b));
-        assert_eq!(s.totals(), (5 * ONE, 5 * ONE));
+        assert_eq!(s.totals(), (6 * ONE, 6 * ONE));
         assert_eq!(s.queue().len(), 1);
         assert!(matches!(
             s.responses.get(&request_hash(&request)),
@@ -2566,23 +2773,23 @@ mod tests {
     #[test]
     fn a_crash_part_way_through_the_burn_burns_each_note_once() {
         let mut s = setup("crash-mid-burn");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(2 * ONE, service(), PAST);
         let request = build(&[&a, &b], &[], &[]);
         s.pend(&request);
         s.burn(&request, 0);
-        assert_eq!(s.totals(), (5 * ONE, 3 * ONE));
+        assert_eq!(s.totals(), (6 * ONE, 4 * ONE));
 
         let response = s.run(&request).unwrap();
-        assert_eq!(response.owed_esp, u128::from(5 * ONE - fee(2, 0, 0)));
-        assert_eq!(s.totals(), (5 * ONE, 5 * ONE));
+        assert_eq!(response.owed_esp, u128::from(6 * ONE - fee(2, 0, 0)));
+        assert_eq!(s.totals(), (6 * ONE, 6 * ONE));
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
     #[test]
     fn a_retry_decides_nothing_again_it_uses_the_stored_decision() {
         let mut s = setup("stored-decision");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(2 * ONE, service(), PAST);
         let request = build(&[&a, &b], &[], &[]);
         let plan = s.pend(&request);
@@ -2592,15 +2799,15 @@ mod tests {
         let response = s.run(&request).unwrap();
         assert_eq!(response.notes, plan.totals.notes);
         assert_eq!(response.owed_esp, plan.owed_esp);
-        assert_eq!(s.totals(), (5 * ONE, 5 * ONE));
+        assert_eq!(s.totals(), (6 * ONE, 6 * ONE));
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
     #[test]
     fn a_crash_after_the_refunds_were_signed_gives_the_same_signatures_on_retry() {
         let mut s = setup("crash-after-refund");
-        let a = s.held(4 * (ONE / 10), service(), PAST);
-        let b = s.held(3 * ONE, service(), FUTURE);
+        let a = s.held(SMALL, service(), PAST);
+        let b = s.held(4 * ONE, service(), FUTURE);
         let (request, _, refund_wanted) = build_with(
             &[&a, &b],
             &[],
@@ -2633,7 +2840,7 @@ mod tests {
     #[test]
     fn a_crash_after_the_entry_was_queued_does_not_queue_it_twice() {
         let mut s = setup("crash-after-queue");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[], &[]);
         let plan = s.pend(&request);
         s.burn(&request, 0);
@@ -2648,7 +2855,7 @@ mod tests {
             ))
             .unwrap();
         let response = s.run(&request).unwrap();
-        assert_eq!(response.owed_esp, u128::from(3 * ONE - fee(1, 0, 0)));
+        assert_eq!(response.owed_esp, u128::from(4 * ONE - fee(1, 0, 0)));
         assert_eq!(s.queue().len(), 1);
         // the entry keeps the time it was first queued
         assert_eq!(
@@ -2661,7 +2868,7 @@ mod tests {
     #[test]
     fn another_kind_of_request_under_the_same_hash_is_a_fault() {
         let mut s = setup("wrong-kind");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[], &[]);
         s.responses
             .put(
@@ -2683,7 +2890,7 @@ mod tests {
     #[test]
     fn a_note_held_by_an_unfinished_redemption_is_already_spent_for_another_request() {
         let mut s = setup("held-note");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let c = s.held(2 * ONE, service(), PAST);
         let first = build(&[&a], &[], &[]);
         s.pend(&first);
@@ -2696,7 +2903,7 @@ mod tests {
         assert!(s.is_spent(&c));
         // the first can still finish
         let response = s.run(&first).unwrap();
-        assert_eq!(response.owed_esp, u128::from(3 * ONE - fee(1, 0, 0)));
+        assert_eq!(response.owed_esp, u128::from(4 * ONE - fee(1, 0, 0)));
         assert!(s.is_spent(&a));
         fs::remove_dir_all(&s.dir).unwrap();
     }
@@ -2704,7 +2911,7 @@ mod tests {
     #[test]
     fn a_note_held_by_an_unfinished_transfer_is_already_spent_for_a_redemption() {
         let mut s = setup("held-by-transfer");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let c = s.held(2 * ONE, service(), PAST);
         s.responses
             .put(
@@ -2726,10 +2933,10 @@ mod tests {
     #[test]
     fn output_blind_nonces_held_by_other_requests_are_refused() {
         let mut s = setup("held-outputs");
-        let a = s.held(3 * ONE, service(), PAST);
-        let c = s.held(3 * ONE, service(), PAST);
-        let d = s.held(3 * ONE, service(), PAST);
-        let e = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
+        let c = s.held(4 * ONE, service(), PAST);
+        let d = s.held(4 * ONE, service(), PAST);
+        let e = s.held(4 * ONE, service(), PAST);
         let key = service_keypair();
 
         // held by an unfinished redemption
@@ -2794,8 +3001,8 @@ mod tests {
     #[test]
     fn the_holds_of_redemptions_are_listed_apart_from_the_asker_and_survive_a_reopen() {
         let mut s = setup("holds");
-        let a = s.held(3 * ONE, service(), PAST);
-        let c = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
+        let c = s.held(4 * ONE, service(), PAST);
         let pending = build(&[&a], &[(ONE, service(), PAST)], &[]);
         let done = build(&[&c], &[(ONE, service(), PAST)], &[]);
         s.pend(&pending);
@@ -2872,7 +3079,7 @@ mod tests {
     #[test]
     fn asking_again_after_the_payout_shows_the_payment() {
         let mut s = setup("paid");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[], &[]);
         s.run(&request).unwrap();
         pay(&s, &request);
@@ -2887,7 +3094,7 @@ mod tests {
     #[test]
     fn a_decline_reissues_the_accepted_notes_minus_the_fee_under_their_own_terms() {
         let mut s = setup("decline");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let b = s.held(2 * ONE, service(), PAST2);
         let (request, decline_wanted, _) = build_with(
             &[&a, &b],
@@ -2899,7 +3106,7 @@ mod tests {
         );
         s.run(&request).unwrap();
         let id = request_hash(&request);
-        assert_eq!(s.totals(), (5 * ONE, 5 * ONE));
+        assert_eq!(s.totals(), (6 * ONE, 6 * ONE));
 
         let declined = decline(
             &s.logic,
@@ -2914,7 +3121,7 @@ mod tests {
         assert_eq!(declined.outputs, 2);
         assert_eq!(declined.reissued_esp, u128::from(4 * ONE));
         // 4 came back; the fee stays burned
-        assert_eq!(s.totals(), (9 * ONE, 5 * ONE));
+        assert_eq!(s.totals(), (10 * ONE, 6 * ONE));
 
         let queue = s.queue();
         let entry = queue.get(&id).unwrap();
@@ -2972,7 +3179,7 @@ mod tests {
     #[test]
     fn a_decline_that_stopped_after_signing_can_be_run_again() {
         let mut s = setup("decline-retry");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let (request, decline_wanted, _) = build_with(
             &[&a],
             &[(2 * ONE, service(), PAST)],
@@ -3018,7 +3225,7 @@ mod tests {
     #[test]
     fn a_decline_with_no_decline_outputs_just_closes_the_entry() {
         let mut s = setup("decline-empty");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[], &[]);
         s.run(&request).unwrap();
         let id = request_hash(&request);
@@ -3041,7 +3248,7 @@ mod tests {
     #[test]
     fn a_decline_is_refused_for_what_it_cannot_apply_to() {
         let mut s = setup("decline-refused");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[(ONE, service(), PAST)], &[]);
         s.run(&request).unwrap();
         let id = request_hash(&request);
@@ -3084,7 +3291,7 @@ mod tests {
             Err(DeclineError::Refused(_))
         ));
         // nothing was signed along the way
-        assert_eq!(s.totals(), (3 * ONE, 3 * ONE));
+        assert_eq!(s.totals(), (4 * ONE, 4 * ONE));
         assert_eq!(s.queue().get(&id).unwrap().status, Status::Completed);
         fs::remove_dir_all(&s.dir).unwrap();
     }
@@ -3117,8 +3324,8 @@ mod tests {
     #[test]
     fn the_rate_in_force_is_stored_on_the_reply_and_the_queue_entry() {
         let mut s = setup("rate-stored");
-        let a = s.held(3 * ONE, service(), PAST);
-        let b = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
+        let b = s.held(4 * ONE, service(), PAST);
         let first = build(&[&a], &[], &[]);
         let size = first.encode().len() as u128;
 
@@ -3131,7 +3338,7 @@ mod tests {
         assert_eq!(entry.fee_per_byte, 2_000_000_000);
         assert_eq!(entry.fee_esp, size * 2_000_000_000);
         assert_eq!(entry.size_bytes, size as u64);
-        assert_eq!(entry.owed_esp, u128::from(3 * ONE) - size * 2_000_000_000);
+        assert_eq!(entry.owed_esp, u128::from(4 * ONE) - size * 2_000_000_000);
         assert_eq!(response.entry.as_ref().unwrap().fee_per_byte, 2_000_000_000);
 
         // the operator changes the rate; a retry of the finished request still
@@ -3155,7 +3362,7 @@ mod tests {
     #[test]
     fn a_request_decided_at_one_rate_is_finished_at_that_rate_after_a_change() {
         let mut s = setup("rate-pending");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[], &[]);
         let size = request.encode().len() as u128;
         // decided and written at RATE, then the mint stops
@@ -3175,7 +3382,7 @@ mod tests {
     #[test]
     fn the_memo_and_reason_limits_come_from_the_settings() {
         let mut s = setup("limits");
-        let a = s.held(3 * ONE, service(), PAST);
+        let a = s.held(4 * ONE, service(), PAST);
         let request = build(&[&a], &[], &[]);
         let short = RedeemSettings {
             max_memo_bytes: 10,

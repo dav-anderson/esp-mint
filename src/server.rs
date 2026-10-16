@@ -50,6 +50,7 @@
 //! request runs at a time. That is fine for development and is not a design for
 //! load.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -90,6 +91,66 @@ pub struct EspState {
     /// mint (and after the responses and the queue, when those are taken).
     pub rotor: Option<Mutex<crate::rotation::Rotor>>,
     pub rollovers: Option<Mutex<crate::rotation::Rollovers>>,
+    /// The exchanges this process is in the middle of (see [`InFlight`]).
+    pub in_flight: InFlight,
+}
+
+/// The code of the `409` an exchange gets while the same request is already
+/// being processed.
+pub const IN_PROGRESS: &str = "in_progress";
+
+/// The exchanges being processed right now, by request hash.
+///
+/// An exchange does not hold the mint's lock while it waits on the PSP (see the
+/// phases in `exchange`), so a second copy of the same request can arrive in
+/// that wait. The `pending` entry cannot tell it from a retry after a crash, and
+/// a retry would carry on from the entry, so two copies would both call the PSP.
+/// This set is what tells them apart: it lives in memory, so a restart empties
+/// it, which is right, since after a restart nothing is running and the entry
+/// on file is a crashed request to be carried on. It is not storage and nothing
+/// of it needs to survive.
+#[derive(Default)]
+pub struct InFlight {
+    hashes: Mutex<HashSet<String>>,
+}
+
+/// A request's place in [`InFlight`]. Dropping it gives the place up, however
+/// the request ended.
+pub struct Claim<'a> {
+    set: &'a InFlight,
+    hash: String,
+}
+
+impl InFlight {
+    /// Take the place of `hash`, or `None` if something else already has it.
+    pub fn claim(&self, hash: &str) -> Option<Claim<'_>> {
+        // A set cannot be left half-changed by a panic, so a poisoned lock is
+        // still good to use.
+        let mut set = self.hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(hash.to_string()) {
+            return None;
+        }
+        Some(Claim {
+            set: self,
+            hash: hash.to_string(),
+        })
+    }
+
+    /// How many requests are in the middle of being processed.
+    pub fn len(&self) -> usize {
+        self.hashes.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        let mut set = self.set.hashes.lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.hash);
+    }
 }
 
 /// Lock the rotor and rotate as far as the clock says. The caller holds the
@@ -150,34 +211,84 @@ fn fee_details(
 }
 
 /// Run one exchange and map the outcome to a status and a body.
+///
+/// The mint's lock is held for the steps that touch the mint and let go while
+/// the PSP is called (see the phases in `exchange`), so a slow PSP holds up only
+/// the request that is waiting on it. The same request arriving again while it
+/// is being processed is answered `409` `in_progress` and is not processed a
+/// second time; the wallet keeps its request and sends it again.
 pub fn run_exchange(
     state: &EspState,
     request: &ExchangeRequest,
     now_unix: u64,
 ) -> (StatusCode, Value) {
     let settings = state.config.current().exchange_settings();
-    let (Ok(mut logic), Ok(mut responses)) = (state.logic.lock(), state.responses.lock()) else {
+    let hash = match exchange::request_hash(request) {
+        Ok(hash) => hash,
+        Err(e) => return exchange_outcome(Err(e)),
+    };
+    let Some(_claim) = state.in_flight.claim(&hash) else {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": "the mint lock is poisoned"}),
+            StatusCode::CONFLICT,
+            json!({
+                "error": "this exchange is already being processed. Nothing is lost: send the same request again in a moment",
+                "code": IN_PROGRESS,
+            }),
         );
     };
-    let rot = match rotor_of(state, &mut logic) {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
+    exchange_outcome(run_exchange_phases(state, request, now_unix, &settings))
+}
+
+/// Take the locks, build the key sets and run `f` on them.
+fn with_mint<T>(
+    state: &EspState,
+    f: impl FnOnce(&crate::rotation::Gens, &mut Responses) -> Result<T, ExchangeError>,
+) -> Result<T, ExchangeError> {
+    let (Ok(mut logic), Ok(mut responses)) = (state.logic.lock(), state.responses.lock()) else {
+        return Err(ExchangeError::Internal(
+            "the mint lock is poisoned".to_string(),
+        ));
     };
+    let rot = rotor_of(state, &mut logic).map_err(ExchangeError::Internal)?;
     let gens = match &rot {
         Some(r) => r.gens(&logic),
         None => crate::rotation::Gens::only(&logic, &state.master),
     };
-    match exchange::exchange_gens(
-        &gens,
-        state.psp.as_ref(),
-        &mut responses,
-        now_unix,
-        request,
-        &settings,
-    ) {
+    f(&gens, &mut responses)
+}
+
+fn run_exchange_phases(
+    state: &EspState,
+    request: &ExchangeRequest,
+    now_unix: u64,
+    settings: &exchange::ExchangeSettings,
+) -> Result<exchange::ExchangeResponse, ExchangeError> {
+    // 1. Every check, under the lock. Nothing is written.
+    let plan = match with_mint(state, |gens, responses| {
+        exchange::prepare_gens(gens, responses, now_unix, request, settings)
+    })? {
+        exchange::Prepared::Done(response) => return Ok(response),
+        exchange::Prepared::Go(plan) => plan,
+    };
+    // 2. The PSP's look at the notes, with no lock held.
+    exchange::precheck(state.psp.as_ref(), &plan)?;
+    // 3. Check again, now that the lock was let go, and reserve.
+    with_mint(state, |gens, responses| {
+        exchange::reserve_gens(gens, responses, request, &plan)
+    })?;
+    // 4. The burn, with no lock held. The reservation is on file.
+    exchange::burn_phase(state.psp.as_ref(), request, &plan)?;
+    // 5. Sign and finish, under the lock.
+    with_mint(state, |gens, responses| {
+        exchange::finish_gens(gens, responses, request, &plan)
+    })
+}
+
+/// The status and body an exchange's outcome is answered with.
+fn exchange_outcome(
+    result: Result<exchange::ExchangeResponse, ExchangeError>,
+) -> (StatusCode, Value) {
+    match result {
         Ok(response) => match serde_json::to_value(&response) {
             Ok(body) => (StatusCode::OK, body),
             Err(e) => (
@@ -191,6 +302,9 @@ pub fn run_exchange(
                 // The wallet reads these two to mark exactly those notes as spent.
                 Rejection::Keyset { code, .. } => body["code"] = json!(code),
                 Rejection::MissingKeyset => body["code"] = json!(sp_wire::codes::MISSING_KEYSET),
+                Rejection::BadDenomination { .. } => {
+                    body["code"] = json!(crate::units::BAD_DENOMINATION)
+                }
                 Rejection::NoteSpentElsewhere { spent } => {
                     body["code"] = json!(sp_wire::codes::NOTE_SPENT_ELSEWHERE);
                     body["spent"] = json!(spent);

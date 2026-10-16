@@ -164,6 +164,7 @@ fn start_esp(rt: &Runtime, dir: &PathBuf, psp_url: &str) -> String {
         config: esp_mint::config::Handle::default(),
         rotor: None,
         rollovers: None,
+        in_flight: Default::default(),
     });
     serve(rt, server::router(state))
 }
@@ -191,7 +192,30 @@ struct Wanted {
     amount: u64,
 }
 
+/// Split a total into powers of two, the way the wallet does: one note for each
+/// bit set, largest first.
+fn split(total: u64) -> Vec<u64> {
+    (0..64)
+        .rev()
+        .map(|bit| 1u64 << bit)
+        .filter(|p| total & p != 0)
+        .collect()
+}
+
+/// An exchange request the way a wallet builds it: each amount in
+/// `esp_amounts` is a total, split into powers of two.
 fn request(
+    note: Note,
+    keypair: &Keypair,
+    units: u64,
+    esp_amounts: &[u64],
+) -> (ExchangeRequest, Vec<Wanted>) {
+    let amounts: Vec<u64> = esp_amounts.iter().flat_map(|&a| split(a)).collect();
+    request_exact(note, keypair, units, &amounts)
+}
+
+/// Like `request`, but each amount is an output as it stands, whatever it is.
+fn request_exact(
     note: Note,
     keypair: &Keypair,
     units: u64,
@@ -408,6 +432,35 @@ fn a_note_burned_elsewhere_during_a_pending_exchange_is_a_400_and_signs_nothing(
     assert_eq!(body["code"], "note_spent_elsewhere");
     assert_eq!(body["spent"], serde_json::json!([0]));
     assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
+    rt.shutdown_background();
+}
+
+#[test]
+fn an_output_that_is_not_a_power_of_two_is_a_400_and_the_psp_note_survives() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("denomination");
+    let (psp_url, psp, _memos) = start_psp(&rt, &dir);
+    let esp = start_esp(&rt, &dir, &psp_url);
+
+    let (note, keypair) = psp_note(&psp, 1);
+    // the right total, as one output that is not a power of two
+    let (req, _) = request_exact(note, &keypair, 1, &[ONE_PSP]);
+    let (code, body) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(body["code"], "bad_denomination");
+    assert_eq!(
+        body["error"],
+        "output 0: ESP amounts are powers of two. Nothing was burned"
+    );
+    assert!(!psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
+    assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
+
+    // the same total split into powers of two goes through
+    let (req, _) = request(note, &keypair, 1, &[ONE_PSP]);
+    assert!(req.outputs.len() > 1);
+    let (code, body) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(get_json(&esp, "/audit").1["issued"], ONE_PSP);
     rt.shutdown_background();
 }
 
