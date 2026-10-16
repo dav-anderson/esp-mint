@@ -12,6 +12,10 @@
 //!   day. `200` with the response, `400` if the request is refused (nothing was
 //!   burned), `413` if the body is over `transfer.max_request_bytes`, `500` for a
 //!   fault in the mint (a retry is safe).
+//! - `POST /rollover`: ESP notes of the previous key set moved to the current
+//!   one. `200` with the response, `400` if the request is refused (nothing was
+//!   burned), `413` if the body is over `rollover.max_request_bytes`, `404` if
+//!   the mint does not rotate.
 //! - `POST /redeem`: a service's redemption. The body is the request in its
 //!   canonical binary encoding (`redeem::encode`), not JSON, so that its length
 //!   is the size the fee is charged on. `200` with the answer (which notes were
@@ -537,6 +541,10 @@ pub fn fees_body(config: &config::Config) -> Value {
                 "per_output": fee::OUTPUT_BYTES,
             },
         },
+        "rollover": {
+            "max_request_bytes": config.rollover_max_request_bytes,
+            "max_items": config.rollover_max_items,
+        },
         "redeem": {
             "fee_per_byte": config.redeem_fee_per_byte.to_string(),
             "max_request_bytes": config.redeem_max_request_bytes,
@@ -673,8 +681,21 @@ async fn rotation_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Js
 /// current one, same amounts and terms. Stored by request hash.
 async fn rollover_handler(
     State(state): State<Arc<EspState>>,
-    Json(req): Json<crate::rotation::RolloverRequest>,
+    headers: HeaderMap,
+    body: Body,
 ) -> (StatusCode, Json<Value>) {
+    let config = state.config.current();
+    let req: crate::rotation::RolloverRequest = match read_json(
+        &headers,
+        body,
+        config.rollover_max_request_bytes,
+        "Split the rollover into several requests.",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(refusal) => return refusal,
+    };
     let (Ok(mut logic), Ok(responses)) = (state.logic.lock(), state.responses.lock()) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -703,7 +724,14 @@ async fn rollover_handler(
         held.extend(p.inputs.iter().cloned());
     }
     let held: std::collections::HashSet<String> = held.into_iter().collect();
-    match crate::rotation::rollover(&rot.gens(&logic), &rot, &mut store, &held, &req) {
+    match crate::rotation::rollover(
+        &rot.gens(&logic),
+        &rot,
+        &mut store,
+        &held,
+        &req,
+        config.rollover_max_items,
+    ) {
         Ok(a) => (
             StatusCode::OK,
             Json(serde_json::to_value(a).unwrap_or_default()),

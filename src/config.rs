@@ -204,6 +204,22 @@ pub const SPECS: &[Spec] = &[
         what: "The ceiling on one transfer request body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned, nothing is charged.",
     },
     Spec {
+        key: "rollover.max_items",
+        env: "ESP_ROLLOVER_MAX_ITEMS",
+        default: "1000",
+        units: "notes",
+        reload: true,
+        what: "The most notes in one rollover. More is refused before anything is burned.",
+    },
+    Spec {
+        key: "rollover.max_request_bytes",
+        env: "ESP_ROLLOVER_MAX_BYTES",
+        default: "1048576",
+        units: "bytes",
+        reload: true,
+        what: "The ceiling on one rollover request body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned, nothing is charged.",
+    },
+    Spec {
         key: "transfer.fee_per_byte",
         env: "ESP_TRANSFER_FEE_PER_BYTE",
         default: "0",
@@ -278,6 +294,8 @@ pub struct Config {
     pub transfer_max_items: usize,
     pub transfer_max_request_bytes: usize,
     pub transfer_fee_per_byte: u64,
+    pub rollover_max_items: usize,
+    pub rollover_max_request_bytes: usize,
     pub admin_max_request_bytes: usize,
     pub redeem_fee_per_byte: u64,
     pub redeem_max_request_bytes: usize,
@@ -304,6 +322,8 @@ impl Default for Config {
             transfer_max_items: exchange::MAX_ITEMS,
             transfer_max_request_bytes: DEFAULT_SMALL_REQUEST_BYTES,
             transfer_fee_per_byte: 0,
+            rollover_max_items: crate::rotation::MAX_ROLLOVER_NOTES,
+            rollover_max_request_bytes: DEFAULT_SMALL_REQUEST_BYTES,
             admin_max_request_bytes: DEFAULT_SMALL_REQUEST_BYTES,
             redeem_fee_per_byte: redeem::DEFAULT_FEE_PER_BYTE as u64,
             redeem_max_request_bytes: redeem::DEFAULT_MAX_REQUEST_BYTES,
@@ -340,6 +360,8 @@ impl Config {
             "transfer.max_items" => self.transfer_max_items.to_string(),
             "transfer.max_request_bytes" => self.transfer_max_request_bytes.to_string(),
             "transfer.fee_per_byte" => self.transfer_fee_per_byte.to_string(),
+            "rollover.max_items" => self.rollover_max_items.to_string(),
+            "rollover.max_request_bytes" => self.rollover_max_request_bytes.to_string(),
             "admin.max_request_bytes" => self.admin_max_request_bytes.to_string(),
             "redeem.fee_per_byte" => self.redeem_fee_per_byte.to_string(),
             "redeem.max_request_bytes" => self.redeem_max_request_bytes.to_string(),
@@ -369,6 +391,8 @@ impl Config {
             "transfer.max_items" => self.transfer_max_items = whole(key, value)?,
             "transfer.max_request_bytes" => self.transfer_max_request_bytes = whole(key, value)?,
             "transfer.fee_per_byte" => self.transfer_fee_per_byte = whole(key, value)?,
+            "rollover.max_items" => self.rollover_max_items = whole(key, value)?,
+            "rollover.max_request_bytes" => self.rollover_max_request_bytes = whole(key, value)?,
             "admin.max_request_bytes" => self.admin_max_request_bytes = whole(key, value)?,
             "redeem.fee_per_byte" => self.redeem_fee_per_byte = whole(key, value)?,
             "redeem.max_request_bytes" => self.redeem_max_request_bytes = whole(key, value)?,
@@ -433,6 +457,13 @@ impl Config {
             100_000,
             "notes",
         );
+        range(
+            "rollover.max_items",
+            self.rollover_max_items as u64,
+            1,
+            100_000,
+            "notes",
+        );
         for (key, value) in [
             (
                 "exchange.max_request_bytes",
@@ -441,6 +472,10 @@ impl Config {
             (
                 "transfer.max_request_bytes",
                 self.transfer_max_request_bytes,
+            ),
+            (
+                "rollover.max_request_bytes",
+                self.rollover_max_request_bytes,
             ),
             ("admin.max_request_bytes", self.admin_max_request_bytes),
         ] {
@@ -883,6 +918,8 @@ mod tests {
         assert_eq!(c.exchange_max_items, 1000);
         assert_eq!(c.exchange_min_psp, 1);
         assert_eq!(c.transfer_max_items, 1000);
+        assert_eq!(c.rollover_max_items, 1000);
+        assert_eq!(c.rollover_max_request_bytes, 1024 * 1024);
         // exchange and transfer: 1 MiB ceilings and no fee, so nothing changes
         // for a wallet that does not know about them
         assert_eq!(c.exchange_max_request_bytes, 1024 * 1024);
@@ -1183,11 +1220,15 @@ mod tests {
                 ("ESP_EXCHANGE_MAX_BYTES", "65536"),
                 ("ESP_EXCHANGE_FEE_PER_BYTE", "0"),
                 ("ESP_TRANSFER_MAX_BYTES", "4096"),
+                ("ESP_ROLLOVER_MAX_BYTES", "8192"),
+                ("ESP_ROLLOVER_MAX_ITEMS", "50"),
             ]),
         )
         .unwrap();
         assert_eq!(fixed.config.exchange_fee_per_byte, 0);
         assert_eq!(fixed.config.transfer_max_request_bytes, 4096);
+        assert_eq!(fixed.config.rollover_max_request_bytes, 8192);
+        assert_eq!(fixed.config.rollover_max_items, 50);
         fs::write(dir.join(FILE_NAME), "").unwrap();
         let ok = load(
             &dir,

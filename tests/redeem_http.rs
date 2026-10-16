@@ -570,6 +570,14 @@ fn decline_outputs_over_the_limit_come_back_with_the_totals_to_rebuild_from() {
 const T0: u64 = 1_800_000_000;
 
 fn start_rotating(rt: &Runtime, dir: &PathBuf) -> Mint {
+    start_rotating_with(rt, dir, |_| {})
+}
+
+fn start_rotating_with(
+    rt: &Runtime,
+    dir: &PathBuf,
+    tweak: impl FnOnce(&mut esp_mint::config::Config),
+) -> Mint {
     let data = dir.join("esp");
     let (rotor, logic) = esp_mint::rotation::Rotor::open_at(&data, 1, 1, T0).unwrap();
     let master = rotor.current.master.clone();
@@ -585,6 +593,7 @@ fn start_rotating(rt: &Runtime, dir: &PathBuf) -> Mint {
         config: esp_mint::config::Handle::new({
             let mut c = esp_mint::config::Config::default();
             c.redeem_fee_per_byte = RATE as u64;
+            tweak(&mut c);
             c
         }),
         rollovers: Some(Mutex::new(
@@ -661,6 +670,23 @@ fn rollover_req(
 fn current_key(mint: &Mint, units: u64) -> secp256k1::PublicKey {
     let r = mint.state.rotor.as_ref().unwrap().lock().unwrap();
     r.current
+        .master
+        .key_for(
+            Amount::from_units(units),
+            &Terms {
+                service: service(),
+                redeemable_after_day: PAST,
+            },
+        )
+        .public_key(SECP256K1)
+}
+
+fn previous_key(mint: &Mint, units: u64) -> secp256k1::PublicKey {
+    let r = mint.state.rotor.as_ref().unwrap().lock().unwrap();
+    r.previous
+        .as_ref()
+        .unwrap()
+        .0
         .master
         .key_for(
             Amount::from_units(units),
@@ -964,15 +990,51 @@ fn rotate_once(mint: &Mint) -> (String, String) {
 }
 
 #[test]
-fn new_outputs_naming_the_previous_set_are_refused_keyset_not_current_and_nothing_is_burned() {
+fn new_outputs_naming_the_previous_set_are_signed_by_it() {
     let rt = Runtime::new().unwrap();
-    let dir = scratch("not-current");
+    let dir = scratch("previous-out");
     let mint = start_rotating(&rt, &dir);
     let a = esp_note(&mint, ONE, service(), PAST);
     let b = esp_note(&mint, 2 * ONE, service(), PAST);
+    let c = esp_note(&mint, 2 * ONE, service(), PAST);
     let (id0, id1) = rotate_once(&mint);
-    // Previous-set notes in, outputs asked of the previous set: refused.
+    assert_ne!(id0, id1);
+    // Previous-set notes in, outputs asked of the previous set: signed by it.
     set_keysets(&id0, &id0);
+    let (code, body) = post_json(
+        &mint.esp,
+        "/transfer",
+        &serde_json::to_value(transfer_req(&a, ONE)).unwrap(),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["keyset"], id0.as_str(), "the set that signed it");
+    let (code, body) = post_json(
+        &mint.esp,
+        "/rollover",
+        &serde_json::to_value(rollover_req(&b, 2 * ONE, 2 * ONE)).unwrap(),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["keyset"], id0.as_str(), "the set that signed it");
+    // A redemption naming the previous set for its decline outputs is
+    // accepted too; the keyset it names is stored with it.
+    let (req, _) = request(
+        &[(c.0, &c.1, 2 * ONE, PAST)],
+        &[(ONE, PAST)],
+        &service_keypair(),
+    );
+    let (code, body) = post_bytes(&mint.esp, req.encode());
+    assert_eq!(code, 200, "{body}");
+}
+
+#[test]
+fn outputs_naming_a_set_that_is_not_live_are_refused_and_nothing_is_burned() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("unknown-out");
+    let mint = start_rotating(&rt, &dir);
+    let a = esp_note(&mint, ONE, service(), PAST);
+    let b = esp_note(&mint, 2 * ONE, service(), PAST);
+    let (id0, _id1) = rotate_once(&mint);
+    set_keysets(&id0, &"ab".repeat(8));
     for (route, body) in [
         (
             "/transfer",
@@ -986,12 +1048,8 @@ fn new_outputs_naming_the_previous_set_are_refused_keyset_not_current_and_nothin
         let (code, body) = post_json(&mint.esp, route, &body);
         assert_eq!(
             (code, body["code"].as_str()),
-            (400, Some("keyset_not_current")),
+            (400, Some("unknown_keyset")),
             "{route}: {body}"
-        );
-        assert!(
-            body["error"].as_str().unwrap().contains(&id1),
-            "names the current set: {body}"
         );
     }
     let (req, _) = request(
@@ -1002,33 +1060,28 @@ fn new_outputs_naming_the_previous_set_are_refused_keyset_not_current_and_nothin
     let (code, body) = post_bytes(&mint.esp, req.encode());
     assert_eq!(
         (code, body["code"].as_str()),
-        (400, Some("keyset_not_current")),
+        (400, Some("unknown_keyset")),
         "{body}"
     );
-    {
-        let rotor = mint.state.rotor.as_ref().unwrap().lock().unwrap();
-        let (_, prev) = rotor.previous.as_ref().unwrap();
-        assert!(
-            !prev.is_spent(a.0.nonce).unwrap() && !prev.is_spent(b.0.nonce).unwrap(),
-            "nothing burned"
-        );
-    }
-    // Re-blinded for the current set, the same notes go through.
-    set_keysets(&id0, &id1);
-    let (code, body) = post_json(
-        &mint.esp,
-        "/transfer",
-        &serde_json::to_value(transfer_req(&a, ONE)).unwrap(),
+    assert!(
+        !is_spent_prev(&mint, &a.0) && !is_spent_prev(&mint, &b.0),
+        "nothing burned"
     );
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(body["keyset"], id1.as_str());
 }
 
 /// A rollover of a generation-0 note, accepted and burned before the
 /// rotations (its answer lost), then retried after generation 0 is deleted.
 /// A rollover left pending across a retirement. `burn`: its input was burned
-/// before the crash; `flag`: the burn was also recorded under its hash.
-fn rollover_after_retirement(name: &str, burn: bool, flag: bool) -> (u16, Value, String) {
+/// before the crash; `flag`: the burn was also recorded under its hash;
+/// `later`: the retry comes after the set the outputs name is deleted too.
+/// Returns the ID of the set that should sign: the one the request names while
+/// it is live, else the current one.
+fn rollover_after_retirement(
+    name: &str,
+    burn: bool,
+    flag: bool,
+    later: bool,
+) -> (u16, Value, String) {
     let rt = Runtime::new().unwrap();
     let dir = scratch(name);
     let mint = start_rotating(&rt, &dir);
@@ -1064,28 +1117,42 @@ fn rollover_after_retirement(name: &str, burn: bool, flag: bool) -> (u16, Value,
     }
     set_clock(&mint, T0 + 2 * 3600);
     let w = get_json(&mint.esp, "/rotation");
-    let current = w["current"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        w["previous"]["id"].as_str(),
+        Some(id1.as_str()),
+        "still live"
+    );
+    let expected = if later {
+        set_clock(&mint, T0 + 3 * 3600);
+        let w = get_json(&mint.esp, "/rotation");
+        assert_ne!(w["previous"]["id"].as_str(), Some(id1.as_str()), "deleted");
+        w["current"]["id"].as_str().unwrap().to_string()
+    } else {
+        id1.clone()
+    };
     let (code, body) = post_json(&mint.esp, "/rollover", &serde_json::to_value(&rq).unwrap());
     rt.shutdown_background();
-    (code, body, current)
+    (code, body, expected)
 }
 
 #[test]
 fn a_resumed_rollover_after_retirement_finishes_only_with_stored_proof_of_its_burn() {
-    let (code, body, current) = rollover_after_retirement("proof-yes", true, true);
+    // The input set is deleted; the set the outputs name is still live (the
+    // previous set now), so it signs.
+    let (code, body, signer) = rollover_after_retirement("proof-yes", true, true, false);
     assert_eq!(code, 200, "{body}");
+    assert_eq!(body["keyset"], signer.as_str(), "signed by the named set");
     assert_eq!(
-        body["keyset"],
-        current.as_str(),
-        "signed by the current set"
+        body["epoch"], 1,
+        "the answer carries the signing set's epoch"
     );
     // Crash injected after the burn, before the flag was written: the proof
     // taken from the spent list at the retirement finishes it.
-    let (code, body, current) = rollover_after_retirement("proof-crash", true, false);
+    let (code, body, signer) = rollover_after_retirement("proof-crash", true, false, false);
     assert_eq!(code, 200, "{body}");
-    assert_eq!(body["keyset"], current.as_str());
+    assert_eq!(body["keyset"], signer.as_str());
     // Crash before the burn: nothing proves it, refused.
-    let (code, body, _) = rollover_after_retirement("proof-no", false, false);
+    let (code, body, _) = rollover_after_retirement("proof-no", false, false, false);
     assert_eq!(
         (code, body["code"].as_str()),
         (400, Some("burn_not_proven")),
@@ -1094,59 +1161,92 @@ fn a_resumed_rollover_after_retirement_finishes_only_with_stored_proof_of_its_bu
 }
 
 #[test]
+fn a_resumed_rollover_whose_output_set_was_deleted_meanwhile_is_signed_by_the_current_set() {
+    let (code, body, signer) = rollover_after_retirement("proof-late", true, true, true);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["keyset"], signer.as_str(), "signed by the current set");
+}
+
+/// A transfer left pending across a retirement. `burn`: its input was burned
+/// before the crash; `flag`: the burn was also recorded under its hash;
+/// `later`: the retry comes after the set the outputs name is deleted too.
+/// Returns the status, the body and the ID of the set that should sign: the one
+/// the request names while it is live, else the current one.
+fn transfer_after_retirement(
+    name: &str,
+    burn: bool,
+    flag: bool,
+    later: bool,
+) -> (u16, Value, String) {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch(name);
+    let mint = start_rotating(&rt, &dir);
+    let n = esp_note(&mint, ONE, service(), PAST);
+    let (id0, id1) = rotate_once(&mint);
+    set_keysets(&id0, &id1);
+    let tr = transfer_req(&n, ONE);
+    let hash = esp_mint::transfer::request_hash(&tr);
+    {
+        let rotor = mint.state.rotor.as_ref().unwrap().lock().unwrap();
+        let (g, l) = rotor.previous.as_ref().unwrap();
+        let sk = g.master.key_for(
+            Amount::from_units(ONE),
+            &Terms {
+                service: service(),
+                redeemable_after_day: PAST,
+            },
+        );
+        if burn {
+            l.redeem_with_key(&sk, &tr.inputs[0], tr.digest()).unwrap();
+        }
+        mint.state
+            .responses
+            .lock()
+            .unwrap()
+            .put(
+                &hash,
+                esp_mint::responses::Entry::TransferPending(esp_mint::responses::TransferPending {
+                    inputs: vec![hex::encode(n.0.nonce.0.serialize())],
+                    outputs: vec![hex::encode(tr.outputs[0].blind_nonce.0.serialize())],
+                    burned: flag,
+                }),
+            )
+            .unwrap();
+    }
+    set_clock(&mint, T0 + 2 * 3600);
+    let w = get_json(&mint.esp, "/rotation");
+    assert_eq!(
+        w["previous"]["id"].as_str(),
+        Some(id1.as_str()),
+        "still live"
+    );
+    let expected = if later {
+        set_clock(&mint, T0 + 3 * 3600);
+        let w = get_json(&mint.esp, "/rotation");
+        assert_ne!(w["previous"]["id"].as_str(), Some(id1.as_str()), "deleted");
+        w["current"]["id"].as_str().unwrap().to_string()
+    } else {
+        id1.clone()
+    };
+    let (code, body) = post_json(&mint.esp, "/transfer", &serde_json::to_value(&tr).unwrap());
+    rt.shutdown_background();
+    (code, body, expected)
+}
+
+#[test]
 fn a_resumed_transfer_after_retirement_finishes_only_with_stored_proof_of_its_burn() {
-    // (burned before the crash, flag written, finishes)
+    // (burned before the crash, flag written, finishes): the input set is
+    // deleted, the set the outputs name is still live, so it signs.
     for (burn, flag, ok) in [
         (true, true, true),
         (true, false, true),
         (false, false, false),
     ] {
-        let rt = Runtime::new().unwrap();
-        let dir = scratch(&format!("tproof-{burn}-{flag}"));
-        let mint = start_rotating(&rt, &dir);
-        let n = esp_note(&mint, ONE, service(), PAST);
-        let (id0, id1) = rotate_once(&mint);
-        set_keysets(&id0, &id1);
-        let tr = transfer_req(&n, ONE);
-        let hash = esp_mint::transfer::request_hash(&tr);
-        {
-            let rotor = mint.state.rotor.as_ref().unwrap().lock().unwrap();
-            let (g, l) = rotor.previous.as_ref().unwrap();
-            let sk = g.master.key_for(
-                Amount::from_units(ONE),
-                &Terms {
-                    service: service(),
-                    redeemable_after_day: PAST,
-                },
-            );
-            if burn {
-                l.redeem_with_key(&sk, &tr.inputs[0], tr.digest()).unwrap();
-            }
-            mint.state
-                .responses
-                .lock()
-                .unwrap()
-                .put(
-                    &hash,
-                    esp_mint::responses::Entry::TransferPending(
-                        esp_mint::responses::TransferPending {
-                            inputs: vec![hex::encode(n.0.nonce.0.serialize())],
-                            outputs: vec![hex::encode(tr.outputs[0].blind_nonce.0.serialize())],
-                            burned: flag,
-                        },
-                    ),
-                )
-                .unwrap();
-        }
-        set_clock(&mint, T0 + 2 * 3600);
-        let current = get_json(&mint.esp, "/rotation")["current"]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let (code, body) = post_json(&mint.esp, "/transfer", &serde_json::to_value(&tr).unwrap());
+        let (code, body, signer) =
+            transfer_after_retirement(&format!("tproof-{burn}-{flag}"), burn, flag, false);
         if ok {
             assert_eq!(code, 200, "{body}");
-            assert_eq!(body["keyset"], current.as_str());
+            assert_eq!(body["keyset"], signer.as_str(), "signed by the named set");
         } else {
             assert_eq!(
                 (code, body["code"].as_str()),
@@ -1154,8 +1254,14 @@ fn a_resumed_transfer_after_retirement_finishes_only_with_stored_proof_of_its_bu
                 "{body}"
             );
         }
-        rt.shutdown_background();
     }
+}
+
+#[test]
+fn a_resumed_transfer_whose_output_set_was_deleted_meanwhile_is_signed_by_the_current_set() {
+    let (code, body, signer) = transfer_after_retirement("tproof-late", true, true, true);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["keyset"], signer.as_str(), "signed by the current set");
 }
 
 #[test]
@@ -1201,10 +1307,14 @@ fn every_keyset_field_is_in_the_request_hash() {
 }
 
 #[test]
-fn a_decline_whose_requested_set_is_now_previous_is_signed_by_the_current_set() {
+fn a_decline_whose_requested_set_is_still_live_is_signed_by_that_set() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("queue-previous");
     let mint = start_rotating(&rt, &dir);
+    let id0 = get_json(&mint.esp, "/rotation")["current"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let a = esp_note(&mint, 2 * ONE, service(), PAST);
     let (req, _) = request(
         &[(a.0, &a.1, 2 * ONE, PAST)],
@@ -1213,8 +1323,9 @@ fn a_decline_whose_requested_set_is_now_previous_is_signed_by_the_current_set() 
     );
     let bytes = req.encode();
     assert_eq!(post_bytes(&mint.esp, bytes.clone()).0, 200);
-    // One rotation: the requested set is previous, still live, but not current.
-    let (_, id1) = rotate_once(&mint);
+    // One rotation: the requested set is previous, still live.
+    let (id0b, _id1) = rotate_once(&mint);
+    assert_eq!(id0, id0b);
     let (code, declined) = post_json(
         &mint.admin,
         "/payouts/decline",
@@ -1223,9 +1334,9 @@ fn a_decline_whose_requested_set_is_now_previous_is_signed_by_the_current_set() 
     assert_eq!(code, 200, "{declined}");
     let (_, after) = post_bytes(&mint.esp, bytes);
     for sig in after["entry"]["decline_signatures"].as_array().unwrap() {
-        assert_eq!(sig["keyset"], id1.as_str());
+        assert_eq!(sig["keyset"], id0.as_str(), "signed by the set it named");
         let key: secp256k1::PublicKey = serde_json::from_value(sig["key"].clone()).unwrap();
-        assert_eq!(key, current_key(&mint, ONE));
+        assert_eq!(key, previous_key(&mint, ONE));
     }
 }
 
@@ -1454,4 +1565,33 @@ fn a_resumed_redemption_after_retirement_finishes_only_with_stored_proof_of_its_
             .as_array()
             .is_some_and(|p| p.iter().any(|n| n == nonce.as_str()))
     );
+}
+
+#[test]
+fn a_rollover_over_the_configured_note_count_is_refused_and_nothing_is_burned() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("rollover-count");
+    let mint = start_rotating_with(&rt, &dir, |c| c.rollover_max_items = 1);
+    let a = esp_note(&mint, ONE, service(), PAST);
+    let b = esp_note(&mint, ONE, service(), PAST);
+    let mut rq = rollover_req(&a, ONE, ONE);
+    let (o, _, _) = blinded(ONE);
+    rq.outputs.push(o);
+    rq.inputs.push(MintInput {
+        amount: Amount::from_units(ONE),
+        note: b.0,
+        spend_signature: Signature::from_slice(&[0u8; 64]).unwrap(),
+    });
+    rq.input_keysets.push(in_ks());
+    let d = rq.digest();
+    rq.inputs[0].spend_signature = SECP256K1.sign_schnorr(&d, &a.1);
+    rq.inputs[1].spend_signature = SECP256K1.sign_schnorr(&d, &b.1);
+    let (code, body) = post_json(&mint.esp, "/rollover", &serde_json::to_value(&rq).unwrap());
+    assert_eq!(code, 400, "{body}");
+    assert!(body.to_string().contains("1 to 1 notes"), "{body}");
+    // the notes are still good: a rollover of one of them goes through
+    let one = rollover_req(&a, ONE, ONE);
+    let (code, body) = post_json(&mint.esp, "/rollover", &serde_json::to_value(&one).unwrap());
+    assert_eq!(code, 200, "{body}");
+    std::fs::remove_dir_all(&dir).unwrap();
 }

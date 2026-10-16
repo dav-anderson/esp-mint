@@ -60,6 +60,7 @@ fn start(rt: &Runtime, dir: &PathBuf) -> (String, Arc<EspState>) {
     let mut cfg = Config::default();
     cfg.exchange_max_request_bytes = CEILING;
     cfg.transfer_max_request_bytes = CEILING;
+    cfg.rollover_max_request_bytes = CEILING;
     cfg.redeem_max_request_bytes = CEILING;
     let state = Arc::new(EspState {
         logic: Mutex::new(logic),
@@ -95,7 +96,7 @@ fn a_body_over_the_ceiling_is_refused_before_it_is_parsed_on_every_route() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("ceilings");
     let (base, state) = start(&rt, &dir);
-    for route in ["exchange", "transfer", "redeem"] {
+    for route in ["exchange", "transfer", "rollover", "redeem"] {
         let url = format!("{base}/{route}");
         // not a request at all, and too big: 413, not 400, so it was never parsed
         let (status, body) = post(&url, vec![b'x'; CEILING + 1]);
@@ -132,6 +133,8 @@ fn a_reload_changes_the_ceiling_and_the_rates_for_the_next_request_only() {
     assert_eq!(fees["exchange"]["size"]["per_input"], 146);
     assert_eq!(fees["redeem"]["size"]["per_input"], 186);
     assert_eq!(fees["exchange"]["max_request_bytes"], CEILING as u64);
+    assert_eq!(fees["rollover"]["max_request_bytes"], CEILING as u64);
+    assert_eq!(fees["rollover"]["max_items"], 1000);
 
     // a request of 5000 bytes is over the ceiling now ...
     let url = format!("{base}/exchange");

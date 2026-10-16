@@ -277,28 +277,23 @@ impl<'a> Gens<'a> {
         Ok((l, m.key_for(input.amount, terms)))
     }
 
-    /// The generation to sign outputs with. New signing is by the **current**
-    /// set only: a new request naming the previous set is refused
-    /// `keyset_not_current` (the wallet re-blinds for the current set and
-    /// sends again), a deleted one `keyset_retired`, anything else
-    /// `unknown_keyset`. A request accepted earlier and finished now
-    /// (`resumed`), and a queued decline or refund, is signed by the current
-    /// set whatever it named. The ID returned is the one that signs, and goes
-    /// in the reply.
+    /// The generation to sign outputs with: the live one the request names,
+    /// current or previous. A set that is not live is refused: a deleted one
+    /// `keyset_retired`, anything else `unknown_keyset`. The exception is a
+    /// request accepted earlier and finished now (`resumed`), and a queued
+    /// decline or refund signed later: the burn is already done, so if the set
+    /// it named has since been deleted it is signed by the current set
+    /// (blinding does not depend on the key). The ID returned is the one that
+    /// signs, and goes in the reply.
     pub fn signer(
         &self,
         id: &str,
         resumed: bool,
     ) -> Result<(&'a MintLogic, &'a MasterSecret, String), KeysetError> {
-        if resumed {
-            return Ok((self.current.0, self.current.1, self.current_id.clone()));
-        }
-        match self.resolve(id)? {
-            Side::Current => Ok((self.current.0, self.current.1, self.current_id.clone())),
-            Side::Previous => Err(KeysetError::NotCurrent {
-                named: id.to_string(),
-                current: self.current_id.clone(),
-            }),
+        match self.named(id) {
+            Ok(found) => Ok(found),
+            Err(_) if resumed => Ok((self.current.0, self.current.1, self.current_id.clone())),
+            Err(e) => Err(e),
         }
     }
 
@@ -326,9 +321,6 @@ pub enum KeysetError {
     Retired(String),
     /// Never a keyset of this mint (or trimmed from the retired list).
     Unknown(String),
-    /// Live, but not the current set: new outputs are signed only by the
-    /// current one.
-    NotCurrent { named: String, current: String },
 }
 
 impl KeysetError {
@@ -341,9 +333,6 @@ impl KeysetError {
             KeysetError::Unknown(id) => {
                 format!("{what}: keyset {id} is not a keyset of this mint. Nothing was burned")
             }
-            KeysetError::NotCurrent { named, current } => format!(
-                "{what}: keyset {named} is the previous keyset; new outputs are signed only by the current keyset {current}. Re-blind the outputs for {current} and send the request again. Nothing was burned"
-            ),
         }
     }
 
@@ -351,7 +340,6 @@ impl KeysetError {
         match self {
             KeysetError::Retired(_) => sp_wire::codes::KEYSET_RETIRED,
             KeysetError::Unknown(_) => sp_wire::codes::UNKNOWN_KEYSET,
-            KeysetError::NotCurrent { .. } => sp_wire::codes::KEYSET_NOT_CURRENT,
         }
     }
 }
@@ -745,12 +733,11 @@ pub fn rollover(
     store: &mut Rollovers,
     held: &std::collections::HashSet<String>,
     req: &RolloverRequest,
+    max_notes: usize,
 ) -> Result<RolloverResponse, RolloverError> {
     use RolloverError::*;
-    if req.inputs.is_empty() || req.inputs.len() > MAX_ROLLOVER_NOTES {
-        return Err(Refused(format!(
-            "a rollover takes 1 to {MAX_ROLLOVER_NOTES} notes"
-        )));
+    if req.inputs.is_empty() || req.inputs.len() > max_notes {
+        return Err(Refused(format!("a rollover takes 1 to {max_notes} notes")));
     }
     let mut a: Vec<u64> = req.inputs.iter().map(|i| i.amount.units).collect();
     let mut b: Vec<u64> = req.outputs.iter().map(|o| o.amount.units).collect();
@@ -824,12 +811,12 @@ pub fn rollover(
         }
         plan.push((logic, sk, input, spent));
     }
-    let (current, master, out_id) = gens
+    let (out_logic, master, out_id) = gens
         .signer(&req.keyset, resumed.is_some())
         .map_err(|e| Keyset(e.code(), e.why("the outputs")))?;
     if resumed.is_none() {
         for o in &req.outputs {
-            if current
+            if out_logic
                 .is_blind_nonce_used(&o.blind_nonce)
                 .map_err(|e| Internal(e.to_string()))?
             {
@@ -861,7 +848,7 @@ pub fn rollover(
     let mut keys = Vec::new();
     for o in &req.outputs {
         let sk = master.key_for(o.amount, &terms);
-        let sig = match current.issue_with_key(&sk, o) {
+        let sig = match out_logic.issue_with_key(&sk, o) {
             Ok(out) => out.0,
             Err(MintOutputError::BlindNonceAlreadyUsed) if resumed.is_some() => {
                 bdhke::sign_message(&sk, &o.blind_nonce.0)
@@ -871,13 +858,14 @@ pub fn rollover(
         signatures.push(sig);
         keys.push(sk.public_key(SECP256K1));
     }
-    debug_assert_eq!(
-        out_id, rotor.current.id,
-        "new signing is by the current set"
-    );
+    // The epoch of the set that signed: the wallet records it with the notes.
+    let out_epoch = match &rotor.previous {
+        Some((g, _)) if g.id == out_id => g.epoch,
+        _ => rotor.current.epoch,
+    };
     let answer = RolloverResponse {
         keyset: out_id,
-        epoch: rotor.current.epoch,
+        epoch: out_epoch,
         service: req.service,
         redeemable_after_day: req.redeemable_after_day,
         signatures,
@@ -983,6 +971,39 @@ mod retired_list_tests {
             vec![0, 1, 2],
             "audit bookkeeping is not trimmed"
         );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn outputs_are_signed_by_the_live_set_named_and_a_set_that_is_not_live_is_refused() {
+        let d = scratch("signer");
+        let t = 10_000;
+        let (mut r, mut cur) = Rotor::open_at(&d, 1, 1, t).unwrap();
+        r.first_issue = Some(t);
+        let mut ids = vec![r.current.id.clone()];
+        for k in 1..=3u64 {
+            r.clock.store(t + 3600 * k, Ordering::SeqCst);
+            r.refresh(&mut cur).unwrap();
+            ids.push(r.current.id.clone());
+        }
+        // ids[3] is current, ids[2] previous, ids[0] and ids[1] retired.
+        let gens = r.gens(&cur);
+        let who = |id: &str, resumed: bool| gens.signer(id, resumed).map(|s| s.2);
+        assert_eq!(who(&ids[3], false), Ok(ids[3].clone()));
+        assert_eq!(
+            who(&ids[2], false),
+            Ok(ids[2].clone()),
+            "the previous set signs when it is named"
+        );
+        assert_eq!(who(&ids[0], false).unwrap_err().code(), "keyset_retired");
+        assert_eq!(
+            who(&"ab".repeat(8), false).unwrap_err().code(),
+            "unknown_keyset"
+        );
+        // A request finished after its set was deleted is signed by the
+        // current set; one whose set is still live keeps it.
+        assert_eq!(who(&ids[0], true), Ok(ids[3].clone()));
+        assert_eq!(who(&ids[2], true), Ok(ids[2].clone()));
         let _ = fs::remove_dir_all(&d);
     }
 
