@@ -75,6 +75,7 @@ Two things are not settings: `ESP_DATA_DIR` (default `~/.esp-mint`: the config f
 | `[rotation] period_hours` | `ESP_ROTATION_PERIOD_HOURS` | `87600` | whole hours | restart | Hours between rotations (10 years). 1 to 10,000,000: no policy minimum, but 0 is refused here (it is an off switch only in psp-mint). |
 | `[admin] max_request_bytes` | `ESP_ADMIN_MAX_BYTES` | `1048576` | bytes | restart | The ceiling on one request body on the operator's listener (1 MiB). |
 | `[queue] max_payment_ref_bytes` | `ESP_QUEUE_MAX_REF_BYTES` | `256` | bytes | SIGHUP | The longest payment reference accepted when an entry is marked paid. |
+| `[storage] mint_state` | `ESP_STORAGE_MINT_STATE` | none (local only) | service IDs | restart | Service IDs (64 hex, comma-separated) that will keep the mint's state; index 0 is the primary. One is valid; at most 8. **Setting only: nothing reads or writes the AIR yet.** See [DESIGN.md](DESIGN.md), "Storage policy". |
 
 ## HTTP API
 

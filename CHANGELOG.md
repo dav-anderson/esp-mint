@@ -2,6 +2,11 @@
 
 esp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.4.0 (2026-10-16)
+
+- **Setting `storage.mint_state` (`ESP_STORAGE_MINT_STATE`): which AIR services will keep this mint's state.** An ordered list of service IDs (index 0 the primary, the rest secondaries); one entry is valid, empty (the default) means local only, at most 8, no duplicates. Config and validation only: nothing reads or writes the AIR, the state is still local files. The parser and checks are `sp_wire::storage` (sp-wire 0.4.0), shared with the other mints and the wallet. In `esp-mint.toml` the value is an array of strings or one string. DESIGN.md has "Storage policy (setting only)"; the planned behaviour is in sandbox-mint's DESIGN.md, "AIR storage requirements". It is a restart setting (marked so in `SPECS`): a `SIGHUP` reload keeps the running list and logs that a change needs a restart.
+- `sp-wire` is now the `v0.4.0` tag. Tests: the setting from the file and the environment, both forms, and every kind of refusal.
+
 ## 0.3.0 (2026-10-16)
 
 - **ESP amounts must be powers of two.** The exchange, the transfer and the redemption refuse any amount that is not a power of two (zero included), with `400` and code `bad_denomination` (the same as the FSP mint), before anything is burned or charged. Checked: the exchange's outputs; the transfer's inputs and outputs; the redemption's input notes, decline outputs and refund outputs. Rollover is unchanged (its outputs must equal its inputs). Why: notes of one size look alike, so an amount no longer identifies a holder. New in `src/units.rs`: `BAD_DENOMINATION` and `is_denomination`. No setting for a largest denomination was added.

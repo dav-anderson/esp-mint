@@ -31,6 +31,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use sp_wire::storage::StoragePolicy;
 use std::sync::{Arc, RwLock};
 
 use crate::exchange::{self, ExchangeSettings};
@@ -283,6 +285,14 @@ pub const SPECS: &[Spec] = &[
         reload: true,
         what: "The longest payment reference accepted when an entry is marked paid.",
     },
+    Spec {
+        key: "storage.mint_state",
+        env: "ESP_STORAGE_MINT_STATE",
+        default: "",
+        units: "service IDs",
+        reload: false,
+        what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is a 32-byte x-only key in hex (64 characters); a 33-byte DID key is reduced to it. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +321,8 @@ pub struct Config {
     pub redeem_max_memo_bytes: usize,
     pub redeem_max_reason_bytes: usize,
     pub queue_max_payment_ref_bytes: usize,
+    /// Which AIR services keep this mint's state (setting only for now).
+    pub storage_mint_state: StoragePolicy,
 }
 
 impl Default for Config {
@@ -340,6 +352,7 @@ impl Default for Config {
             redeem_max_memo_bytes: redeem::DEFAULT_MAX_MEMO_BYTES,
             redeem_max_reason_bytes: redeem::DEFAULT_MAX_REASON_BYTES,
             queue_max_payment_ref_bytes: queue::MAX_REF_LEN,
+            storage_mint_state: StoragePolicy::default(),
         }
     }
 }
@@ -379,6 +392,7 @@ impl Config {
             "redeem.max_memo_bytes" => self.redeem_max_memo_bytes.to_string(),
             "redeem.max_reason_bytes" => self.redeem_max_reason_bytes.to_string(),
             "queue.max_payment_ref_bytes" => self.queue_max_payment_ref_bytes.to_string(),
+            "storage.mint_state" => self.storage_mint_state.to_config_string(),
             _ => return None,
         })
     }
@@ -411,6 +425,10 @@ impl Config {
             "redeem.max_memo_bytes" => self.redeem_max_memo_bytes = whole(key, value)?,
             "redeem.max_reason_bytes" => self.redeem_max_reason_bytes = whole(key, value)?,
             "queue.max_payment_ref_bytes" => self.queue_max_payment_ref_bytes = whole(key, value)?,
+            "storage.mint_state" => {
+                self.storage_mint_state =
+                    StoragePolicy::parse(value).map_err(|e| format!("{key} = `{value}`: {e}"))?
+            }
             other => return Err(format!("unknown setting `{other}`")),
         }
         Ok(())
@@ -622,6 +640,7 @@ impl Config {
         self.psp_timeout_secs = running.psp_timeout_secs;
         self.psp_startup_retry_secs = running.psp_startup_retry_secs;
         self.admin_max_request_bytes = running.admin_max_request_bytes;
+        self.storage_mint_state = running.storage_mint_state.clone();
         ignored
     }
 }
@@ -703,6 +722,16 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
             match value {
                 toml::Value::Integer(n) => pairs.push((key, n.to_string())),
                 toml::Value::String(s) => pairs.push((key, s.clone())),
+                toml::Value::Array(items) if key.starts_with("storage.") => {
+                    let ids: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
+                    if ids.len() == items.len() {
+                        pairs.push((key, ids.join(",")));
+                    } else {
+                        problems.push(format!(
+                            "{key} must be a list of strings (service IDs), not {items:?}"
+                        ));
+                    }
+                }
                 _ => problems.push(format!(
                     "{key} must be a whole number or a string, not {}",
                     value.type_str()
@@ -889,6 +918,79 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name: &str| map.get(name).cloned()
+    }
+
+    #[test]
+    fn the_storage_policy_comes_from_the_file_and_the_environment() {
+        const A: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        const B: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        let dir = scratch("storage");
+        let first = load(&dir, &no_env).unwrap();
+        assert!(first.config.storage_mint_state.is_local_only());
+        assert_eq!(first.config.get("storage.mint_state").as_deref(), Some(""));
+
+        fs::write(
+            dir.join(FILE_NAME),
+            format!("[storage]\nmint_state = [\"{A}\", \"{B}\"]\n"),
+        )
+        .unwrap();
+        let l = load(&dir, &no_env).unwrap();
+        let p = &l.config.storage_mint_state;
+        assert_eq!(p.primary().unwrap().to_hex(), A);
+        assert_eq!(p.secondaries().len(), 1);
+        assert_eq!(l.sources["storage.mint_state"], Source::File);
+        assert_eq!(
+            l.config.get("storage.mint_state").unwrap(),
+            format!("{A},{B}")
+        );
+
+        // The environment wins over the file. One entry is valid, and a DID key
+        // is reduced to its service.
+        let did = format!("02{A}");
+        let l = load(&dir, &env_of(&[("ESP_STORAGE_MINT_STATE", did.as_str())])).unwrap();
+        assert_eq!(l.config.storage_mint_state.to_config_string(), A);
+        assert!(l.config.storage_mint_state.secondaries().is_empty());
+        assert_eq!(
+            l.sources["storage.mint_state"],
+            Source::Env("ESP_STORAGE_MINT_STATE")
+        );
+
+        // One string in the file works too, and so does an empty list.
+        fs::write(
+            dir.join(FILE_NAME),
+            format!("[storage]\nmint_state = \"{B}, {A}\"\n"),
+        )
+        .unwrap();
+        let l = load(&dir, &no_env).unwrap();
+        assert_eq!(l.config.storage_mint_state.primary().unwrap().to_hex(), B);
+        fs::write(dir.join(FILE_NAME), "[storage]\nmint_state = []\n").unwrap();
+        let l = load(&dir, &no_env).unwrap();
+        assert!(l.config.storage_mint_state.is_local_only());
+
+        // Every kind of mistake is refused, naming the variable or the setting.
+        let twice = format!("{A},{A}");
+        let p = load(&dir, &env_of(&[("ESP_STORAGE_MINT_STATE", twice.as_str())])).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("ESP_STORAGE_MINT_STATE") && x.contains("listed twice")),
+            "{p:?}"
+        );
+        let gap = format!("{A},,{B}");
+        let p = load(&dir, &env_of(&[("ESP_STORAGE_MINT_STATE", gap.as_str())])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("entry 2")), "{p:?}");
+        let p = load(&dir, &env_of(&[("ESP_STORAGE_MINT_STATE", "not-a-key")])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("must be hex")), "{p:?}");
+        fs::write(dir.join(FILE_NAME), "[storage]\nmint_state = [1]\n").unwrap();
+        let p = load(&dir, &no_env).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("list of strings")), "{p:?}");
+        fs::write(dir.join(FILE_NAME), "[storage]\nwallet = \"x\"\n").unwrap();
+        let p = load(&dir, &no_env).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("unknown setting `storage.wallet`")),
+            "{p:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1209,7 +1311,8 @@ mod tests {
                 "psp.startup_retry_secs",
                 "rotation.activation_hours",
                 "rotation.period_hours",
-                "admin.max_request_bytes"
+                "admin.max_request_bytes",
+                "storage.mint_state"
             ]
         );
     }
