@@ -3,6 +3,7 @@ pub mod config;
 pub mod exchange;
 pub mod fee;
 pub mod keys;
+pub mod ledger;
 pub mod mint;
 pub mod netdir;
 pub mod payouts;

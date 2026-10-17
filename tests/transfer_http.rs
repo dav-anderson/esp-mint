@@ -5,7 +5,7 @@
 //! These are plain tests with their own runtime, because they use the blocking
 //! HTTP client.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -92,7 +92,7 @@ fn ks() -> String {
     KS.with(|k| k.borrow().clone())
 }
 
-fn start_esp(rt: &Runtime, dir: &PathBuf) -> (String, Arc<EspState>) {
+fn start_esp(rt: &Runtime, dir: &Path) -> (String, Arc<EspState>) {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     KS.with(|k| *k.borrow_mut() = esp_mint::rotation::keyset_id(&master));
     let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
@@ -196,7 +196,7 @@ fn request_exact(
         .collect();
     let sighash = transfer::digest(&service(), day(), &inputs, &outputs);
     for (input, (_, keypair, _)) in inputs.iter_mut().zip(notes) {
-        input.spend_signature = SECP256K1.sign_schnorr(&sighash, *keypair);
+        input.spend_signature = SECP256K1.sign_schnorr(&sighash, keypair);
     }
     let service_signature = SECP256K1.sign_schnorr(&sighash, service_signer);
     (
@@ -478,5 +478,47 @@ fn a_transfer_naming_no_keyset_or_an_unknown_one_is_a_400_and_nothing_is_burned(
     assert!(!is_spent(&state, &a), "nothing was burned");
     let (code, _) = post_json(&esp, "/transfer", &req);
     assert_eq!(code, 200);
+    rt.shutdown_background();
+}
+
+#[test]
+fn a_transfer_moves_nothing_between_the_parts_of_the_audit_split() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("split");
+    let (esp, state) = start_esp(&rt, &dir);
+    // Notes minted straight from the mint are not in the ledger (as the notes of
+    // a mint from before 0.5.0 are not), so all of it is outstanding and unsplit.
+    let (a, ka) = esp_note(&state, 2 * ONE_PSP, service());
+    let split = |audit: &serde_json::Value| {
+        (
+            audit["outstanding"].as_u64().unwrap(),
+            audit["outstanding_matured"].as_u64().unwrap(),
+            audit["outstanding_unmatured"].as_u64().unwrap(),
+            audit["outstanding_unsplit"].as_u64().unwrap(),
+            audit["requests_unfinished"].as_u64().unwrap(),
+        )
+    };
+    let before = get_json(&esp, "/audit").1;
+    assert_eq!(split(&before), (2 * ONE_PSP, 0, 0, 2 * ONE_PSP, 0));
+
+    let (req, _) = request(
+        &[(a, &ka, 2 * ONE_PSP)],
+        &[ONE_PSP, ONE_PSP],
+        &service_keypair(),
+    );
+    let (code, body) = post_json(&esp, "/transfer", &req);
+    assert_eq!(code, 200, "{body}");
+
+    // The transfer is net zero for its day, so the split does not move, and the
+    // same request again changes nothing.
+    assert_eq!(
+        split(&get_json(&esp, "/audit").1),
+        (2 * ONE_PSP, 0, 0, 2 * ONE_PSP, 0)
+    );
+    assert_eq!(post_json(&esp, "/transfer", &req), (200, body));
+    assert_eq!(
+        split(&get_json(&esp, "/audit").1),
+        (2 * ONE_PSP, 0, 0, 2 * ONE_PSP, 0)
+    );
     rt.shutdown_background();
 }

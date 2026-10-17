@@ -6,7 +6,7 @@
 //! blocking and must not be created or used on an async thread.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
@@ -117,7 +117,7 @@ async fn burns(
 }
 
 /// A PSP with `/melt` and `/burns`, in the form of the real PSP's.
-fn start_psp(rt: &Runtime, dir: &PathBuf) -> (String, Arc<AppState>, Memos) {
+fn start_psp(rt: &Runtime, dir: &Path) -> (String, Arc<AppState>, Memos) {
     let cfg = keygen::generate(&gen_denominations(2, Amount::from_units(1024)));
     let logic = MintLogic::new(cfg, Store::open(&dir.join("psp-db")).unwrap());
     let state = Arc::new(AppState {
@@ -143,14 +143,26 @@ fn ks() -> String {
 
 /// For a request built before the ESP mint starts: its keyset, from the
 /// master secret the mint will load.
-fn preset_ks(dir: &PathBuf) {
+fn preset_ks(dir: &Path) {
     std::fs::create_dir_all(dir.join("esp")).unwrap();
     let master =
         esp_mint::keys::load_or_generate(&dir.join("esp").join("master_secret.hex")).unwrap();
     KS.with(|k| *k.borrow_mut() = esp_mint::rotation::keyset_id(&master));
 }
 
-fn start_esp(rt: &Runtime, dir: &PathBuf, psp_url: &str) -> String {
+fn start_esp(rt: &Runtime, dir: &Path, psp_url: &str) -> String {
+    start_esp_with(rt, dir, psp_url, esp_mint::config::Config::default()).0
+}
+
+/// An ESP server with these settings, and its state. Dropping the state and the
+/// runtime stops the mint and lets go of its data folder, so that the same
+/// folder can be opened again, as after a restart.
+fn start_esp_with(
+    rt: &Runtime,
+    dir: &Path,
+    psp_url: &str,
+    config: esp_mint::config::Config,
+) -> (String, Arc<EspState>) {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     KS.with(|k| *k.borrow_mut() = esp_mint::rotation::keyset_id(&master));
     let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
@@ -161,12 +173,12 @@ fn start_esp(rt: &Runtime, dir: &PathBuf, psp_url: &str) -> String {
         responses: Mutex::new(responses),
         queue_path: dir.join("esp").join("queue.json"),
         queue_lock: Mutex::new(()),
-        config: esp_mint::config::Handle::default(),
+        config: esp_mint::config::Handle::new(config),
         rotor: None,
         rollovers: None,
         in_flight: Default::default(),
     });
-    serve(rt, server::router(state))
+    (serve(rt, server::router(Arc::clone(&state))), state)
 }
 
 fn psp_note(psp: &AppState, units: u64) -> (Note, Keypair) {
@@ -346,7 +358,7 @@ fn held(req: &ExchangeRequest) -> (Vec<String>, Vec<String>) {
 
 /// An exchange that is validated and pending, as it is after a crash, in the
 /// ESP mint's responses file.
-fn write_pending(dir: &PathBuf, req: &ExchangeRequest) {
+fn write_pending(dir: &Path, req: &ExchangeRequest) {
     std::fs::create_dir_all(dir.join("esp")).unwrap();
     let mut responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
     let (inputs, outputs) = held(req);
@@ -514,4 +526,96 @@ fn nothing_but_the_documented_routes_exist() {
         assert_eq!(status.as_u16(), 404, "{path}");
     }
     rt.shutdown_background();
+}
+
+/// The split on `/audit`, as (matured, unmatured, unsplit, unfinished).
+fn split_of(esp: &str) -> (u64, u64, u64, u64) {
+    let (code, audit) = get_json(esp, "/audit");
+    assert_eq!(code, 200, "{audit}");
+    assert_eq!(
+        audit["outstanding_matured"].as_u64().unwrap()
+            + audit["outstanding_unmatured"].as_u64().unwrap()
+            + audit["outstanding_unsplit"].as_u64().unwrap(),
+        audit["outstanding"].as_u64().unwrap(),
+        "the parts add up: {audit}"
+    );
+    (
+        audit["outstanding_matured"].as_u64().unwrap(),
+        audit["outstanding_unmatured"].as_u64().unwrap(),
+        audit["outstanding_unsplit"].as_u64().unwrap(),
+        audit["requests_unfinished"].as_u64().unwrap(),
+    )
+}
+
+#[test]
+fn the_audit_splits_the_outstanding_esp_by_maturity_and_keeps_the_split_across_a_restart() {
+    let rt_psp = Runtime::new().unwrap();
+    let dir = scratch("split");
+    let (psp_url, psp, _memos) = start_psp(&rt_psp, &dir);
+
+    // A mint whose notes are redeemable the day they are issued (terms.maturity_days = 0).
+    let rt1 = Runtime::new().unwrap();
+    let config = esp_mint::config::Config {
+        maturity_days: 0,
+        ..Default::default()
+    };
+    let (esp, state) = start_esp_with(&rt1, &dir, &psp_url, config);
+    assert_eq!(split_of(&esp), (0, 0, 0, 0));
+    let (note, keypair) = psp_note(&psp, 2);
+    let (first, _) = request(note, &keypair, 2, &[2 * ONE_PSP]);
+    let (code, first_body) = post_json(&esp, "/exchange", &first);
+    assert_eq!(code, 200, "{first_body}");
+    assert_eq!(split_of(&esp), (2 * ONE_PSP, 0, 0, 0));
+    drop(state);
+    drop(rt1);
+
+    // The restart, with the default of 365 days: what was issued before is still
+    // matured, and what is issued now is not.
+    let rt2 = Runtime::new().unwrap();
+    let (esp, state) = start_esp_with(&rt2, &dir, &psp_url, esp_mint::config::Config::default());
+    assert_eq!(split_of(&esp), (2 * ONE_PSP, 0, 0, 0));
+    let (note, keypair) = psp_note(&psp, 1);
+    let (second, _) = request(note, &keypair, 1, &[ONE_PSP]);
+    let (code, body) = post_json(&esp, "/exchange", &second);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(split_of(&esp), (2 * ONE_PSP, ONE_PSP, 0, 0));
+    // asking again counts nothing twice
+    assert_eq!(post_json(&esp, "/exchange", &second), (200, body));
+    assert_eq!(post_json(&esp, "/exchange", &first), (200, first_body));
+    assert_eq!(split_of(&esp), (2 * ONE_PSP, ONE_PSP, 0, 0));
+
+    // ESP the mint signed without the ledger (as before 0.5.0) is outstanding
+    // and not split.
+    {
+        let terms = Terms {
+            service: service(),
+            redeemable_after_day: 1,
+        };
+        let amount = Amount::from_units(1 << 36);
+        let sk = state.master.key_for(amount, &terms);
+        let keypair = Keypair::new(SECP256K1, &mut OsRng);
+        let (blind, _) =
+            bdhke::blind_message(&Nonce(keypair.public_key()).as_hash_preimage(), None);
+        state
+            .logic
+            .lock()
+            .unwrap()
+            .issue_with_key(
+                &sk,
+                &MintOutput {
+                    amount,
+                    blind_nonce: BlindNonce(blind),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            split_of(&esp),
+            (2 * ONE_PSP, ONE_PSP, amount.units, 0),
+            "the new notes are not in the ledger, so they are unsplit"
+        );
+    }
+    drop(state);
+    drop(rt2);
+    rt_psp.shutdown_background();
+    let _ = std::fs::remove_dir_all(&dir);
 }

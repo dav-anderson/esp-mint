@@ -254,13 +254,26 @@ fn queue_path(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("queue.json")
 }
 
-const USAGE: &str = "usage:
-  esp-mint serve
-  esp-mint config
-  esp-mint migrate      (once: move pre-network files into <ESP_DATA_DIR>/regtest)
-  esp-mint payouts [--json]
-  esp-mint pay <service> <ref> <entry id>... [--mixed-memos]
-  esp-mint decline <entry id> --reason TEXT";
+const USAGE: &str = "\
+esp-mint <command>
+
+  serve                 Run the public API and the operator's listener.
+  config                Print the settings in use and where each came from.
+  payouts [--json]      The payout report: what is owed to each service.
+  pay <service> <ref> <entry id>... [--mixed-memos]
+                        Mark exactly those entries paid, with one payment
+                        reference. --mixed-memos if one payment covers entries
+                        with different memos.
+  decline <entry id> --reason TEXT
+                        Decline a payout and sign its stored decline outputs.
+                        Asks the running serve, on its operator listener.
+  migrate               Once: move files from before the per-network split into
+                        <ESP_DATA_DIR>/regtest.
+  --help                Print this text.
+
+Settings: esp-mint.toml in ESP_DATA_DIR (default ~/.esp-mint) or the file
+ESP_CONFIG names, then ESP_... variables. The network is main unless
+server.network (ESP_NETWORK) says otherwise.";
 
 /// `esp-mint config`: every setting with the value in use and where it came from.
 fn run_config() -> Result<String, Box<dyn Error>> {
@@ -332,7 +345,16 @@ fn run_decline(args: &[String]) -> Result<String, Box<dyn Error>> {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
+    // An error is printed as plain text, not as the debug form of the value
+    // (`Error: "usage:\n ..."`), which is what returning it from `main` does.
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("serve") => serve(),
@@ -367,6 +389,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             print!("{}", run_decline(&args[1..])?);
             Ok(())
         }
-        _ => Err(USAGE.into()),
+        // Asking for help is not an error: the usage goes to stdout and the
+        // exit status is 0. A command that is missing or unknown prints the same
+        // text to stderr, as plain text, and exits with 2.
+        Some("--help") | Some("-h") | Some("help") => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        _ => {
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
     }
 }

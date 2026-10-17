@@ -3,7 +3,7 @@
 //! The client is blocking, so these are plain tests with their own runtime, as
 //! in `http.rs`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use esp_mint::admin::{self, AdminState};
@@ -34,9 +34,9 @@ fn service() -> XOnlyPublicKey {
     XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
 }
 
-fn start(rt: &Runtime, queue_path: &PathBuf, token: Option<&str>) -> String {
+fn start(rt: &Runtime, queue_path: &Path, token: Option<&str>) -> String {
     let state = Arc::new(AdminState {
-        queue_path: queue_path.clone(),
+        queue_path: queue_path.to_path_buf(),
         lock: Mutex::new(()),
         token: token.map(str::to_string),
         esp: None,
@@ -52,7 +52,7 @@ fn start(rt: &Runtime, queue_path: &PathBuf, token: Option<&str>) -> String {
     format!("http://{addr}")
 }
 
-fn seed(path: &PathBuf) {
+fn seed(path: &Path) {
     let mut q = Queue::open(path).unwrap();
     q.add(Entry::open("e1", service(), 10 * ONE_USD, "btc:x", DAY1))
         .unwrap();

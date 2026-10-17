@@ -25,6 +25,7 @@ esp-mint asks the PSP for its network at startup. If the PSP cannot be reached i
 | `pay <service> <ref> <entry id>...` | Marks exactly those entries paid, with one payment reference. `--mixed-memos` if one payment covers entries with different memos. |
 | `decline <entry id> --reason TEXT` | Declines a payout and signs its stored decline outputs. |
 | `migrate` | Moves files from before the per-network split into `regtest/`. |
+| `--help` | Prints the commands and exits with status 0. An unknown or missing command prints the same text on standard error and exits with status 2. |
 
 How `payouts`, `pay` and `decline` work is in [DESIGN.md](DESIGN.md), "Payout report" and "Declined and paid". The operator's HTTP routes (`GET /payouts`, `POST /payouts/pay`, `POST /payouts/decline`) are on the loopback listener `ESP_ADMIN_BIND`, with `ESP_ADMIN_TOKEN` as a bearer token if it is set.
 
@@ -36,7 +37,7 @@ Nothing an operator might tune is a constant in the code. Each setting has a def
 
 ```toml
 [redeem]
-fee_per_byte = 1000000
+max_memo_bytes = 128
 
 [exchange]
 max_request_bytes = 1048576
@@ -67,7 +68,7 @@ Two things are not settings: `ESP_DATA_DIR` (default `~/.esp-mint`: the config f
 | `[rollover] max_items` | `ESP_ROLLOVER_MAX_ITEMS` | `1000` | notes | SIGHUP | The most notes in one rollover. More is refused `400` before anything is burned. |
 | `[rollover] max_request_bytes` | `ESP_ROLLOVER_MAX_BYTES` | `1048576` | bytes | SIGHUP | The ceiling on one rollover request body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned, nothing is charged. |
 | `[transfer] fee_per_byte` | `ESP_TRANSFER_FEE_PER_BYTE` | `0` | ESP units per canonical byte | SIGHUP | The transfer fee rate. 0 means no mint fee (the AIR send fee covers a transfer). If set, a request pays this times its canonical size (120 + 146 per note + 41 per output bytes), paid in ESP on top of the exact amount, at the rate in force when it is accepted; the rate is stored on the reply. |
-| `[redeem] fee_per_byte` | `ESP_REDEEM_FEE_PER_BYTE` | `1000000` | ESP units per encoded byte | SIGHUP | The redemption fee rate. A request pays this times its encoded size, at the rate in force when it is accepted; the rate is stored on the reply and on the queue entry. 10^6 units is $0.000001, so $1 per MiB. Placeholder. |
+| `[redeem] fee_per_byte` | `ESP_REDEEM_FEE_PER_BYTE` | `0` | ESP units per encoded byte | SIGHUP | The redemption fee rate. 0 means no mint fee. If set, a request pays this times its encoded size, at the rate in force when it is accepted; the rate is stored on the reply and on the queue entry. |
 | `[redeem] max_request_bytes` | `ESP_REDEEM_MAX_BYTES` | `67108864` | bytes | SIGHUP | The ceiling on one encoded redemption request (64 MiB). A larger body is refused with 413 before it is parsed: no burn, no fee. |
 | `[redeem] max_memo_bytes` | `ESP_REDEEM_MAX_MEMO_BYTES` | `256` | bytes | SIGHUP | The longest payout memo in a redemption request. |
 | `[redeem] max_reason_bytes` | `ESP_REDEEM_MAX_REASON_BYTES` | `1024` | bytes | SIGHUP | The longest reason the operator may give when declining a payout. |
@@ -76,6 +77,8 @@ Two things are not settings: `ESP_DATA_DIR` (default `~/.esp-mint`: the config f
 | `[admin] max_request_bytes` | `ESP_ADMIN_MAX_BYTES` | `1048576` | bytes | restart | The ceiling on one request body on the operator's listener (1 MiB). |
 | `[queue] max_payment_ref_bytes` | `ESP_QUEUE_MAX_REF_BYTES` | `256` | bytes | SIGHUP | The longest payment reference accepted when an entry is marked paid. |
 | `[storage] mint_state` | `ESP_STORAGE_MINT_STATE` | none (local only) | service IDs | restart | Service IDs (64 hex, comma-separated) that will keep the mint's state; index 0 is the primary. One is valid; at most 8. **Setting only: nothing reads or writes the AIR yet.** See [DESIGN.md](DESIGN.md), "Storage policy". |
+
+**Every fee defaults to 0.** The three fee settings, `[exchange] fee_per_byte`, `[transfer] fee_per_byte` and `[redeem] fee_per_byte`, are all `0`: the mint charges nothing unless the operator sets a rate. Each can be set from `0` to 10^15 and is changed on `SIGHUP`; a request is charged at the rate in force when it is accepted, and the rate is stored with its reply.
 
 ## HTTP API
 
@@ -90,7 +93,7 @@ Two things are not settings: `ESP_DATA_DIR` (default `~/.esp-mint`: the config f
 | `GET /keysets` | `{current, previous}` keyset IDs. On every mint, rotating or not. |
 | `GET /rotation` | Whether rotation is on, the first-issue time, and the current and previous keysets with their start and retirement times. |
 | `GET /fees` | The fee rates, size formulas and ceilings now in force. |
-| `GET /audit` | `issued`, `redeemed`, `outstanding`, in ESP units. |
+| `GET /audit` | `issued`, `redeemed`, `outstanding`, in ESP units, and the outstanding split by whether its redeemable-after day has come: `outstanding_matured`, `outstanding_unmatured` and `outstanding_unsplit` (ESP issued before 0.5.0, whose day was not kept; zero on a mint that has run 0.5.0 from its first note). Also `requests_unfinished` (exchanges, transfers and redemptions still pending, which the split does not count yet) and `as_of_day` (the day, since the Unix epoch, that "has come" is measured at). The three parts add up to `outstanding`, except for what a request in the middle of being finished has done and the split does not count yet. See [DESIGN.md](DESIGN.md), "The audit split". |
 | `GET /health` | `200` while the locks are sound, `503` otherwise. The body has `status`, `network` and `wire_version` (an integer: the version of the wire format this mint speaks; a wallet refuses a mint whose number is not its own). |
 
 The process exits with status 1 if a lock is poisoned, so a supervisor can restart it. The mint's lock is taken for the steps that touch the mint and let go while an exchange waits on the PSP, so a slow PSP holds up only the exchange that is waiting on it (see [DESIGN.md](DESIGN.md), "Not holding the lock while the PSP is called"). The same exchange sent again while it is being processed gets `409` with `code: "in_progress"` and is not processed twice; send it again in a moment. There is no authentication and no TLS: a note authorizes its own spend, so a caller can only burn notes they hold. Bind to localhost. Only one process can open the mint's database.

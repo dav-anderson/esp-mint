@@ -152,15 +152,15 @@ So the **size** is `119 + 186 × notes + memo bytes + 81 × (decline outputs + r
 
 ### The fee
 
-**Fee = `redeem.fee_per_byte` × the canonical encoded size of the whole request**: every note, accepted or rejected, both output lists and the memo. There is no flat fee and no per-note fee. The size is measured on the one encoding the request hash covers, so the service computes the fee before it sends. The rate is a setting; the placeholder is **10^6 ESP units a byte** (10^12 ESP units is 1 PSP, about $1, so that is $0.000001 a byte or $1 a MiB). Worked examples:
+**Fee = `redeem.fee_per_byte` × the canonical encoded size of the whole request**: every note, accepted or rejected, both output lists and the memo. There is no flat fee and no per-note fee. The size is measured on the one encoding the request hash covers, so the service computes the fee before it sends. The rate is a setting and **defaults to 0**: like the exchange and transfer fees, the mint charges nothing until the operator sets a rate (0 to 10^15 ESP units a byte). What a rate should be is not decided here. Worked examples of the size, with a rate of 10^6 ESP units a byte chosen only for the arithmetic:
 
-| Request | Size | Fee (ESP units) | Fee (USD) |
-|---|---|---|---|
-| 5 notes, 1 decline output, 40-byte memo | 119 + 930 + 40 + 81 = 1,170 bytes | 1,170,000,000 | $0.001170 |
-| 1 note, no outputs, 40-byte memo | 345 bytes | 345,000,000 | $0.000345 |
-| a 64 MiB request (the ceiling) | 67,108,864 bytes | 67,108,864,000,000 | about $67.11 |
+| Request | Size | Fee at 10^6 units a byte |
+|---|---|---|
+| 5 notes, 1 decline output, 40-byte memo | 119 + 930 + 40 + 81 = 1,170 bytes | 1,170,000,000 |
+| 1 note, no outputs, 40-byte memo | 345 bytes | 345,000,000 |
+| a 64 MiB request (the ceiling) | 67,108,864 bytes | 67,108,864,000,000 |
 
-**Why this rate.** 10^6 ESP units a byte (about $1 a MiB) is the current setting. It is charged per byte because what spam costs the mint grows with the size of a request, while a typical request of a few notes is about a kilobyte and pays about a tenth of a cent. The rate is expected to come down once there is real usage data. For example, a request with 3 notes, 3 outputs and a 15-byte memo is 935 bytes and pays 935,000,000 ESP units, about $0.0009.
+**Why it is per byte.** If a fee is set, it is charged per byte because what a request costs the mint grows with its size, while a typical request of a few notes is about a kilobyte. With the default of 0 a request of any size pays nothing, so the ceiling on one request (`redeem.max_request_bytes`) and the limits on outputs are what bound it.
 
 The fee is never returned. A request is charged at the rate in force when it is accepted, and that rate is stored on the reply and on the queue entry (`fee_per_byte`, `fee_esp`, `size_bytes`).
 
@@ -333,6 +333,38 @@ How it fits ESP:
 
 The spent list itself is left as it is (in the sled database). A **redeem deadline** (a date after which a matured note can no longer be redeemed, so that its entry could be dropped) was considered and declined. It is not built and not planned.
 
+## The audit split
+
+`GET /audit` adds up mint-core's counters, which say how much ESP is outstanding. An operator who plans payouts also needs to know *when* it can be redeemed, and a note's day (`redeemable_after_day`, part of its terms) is something only the mint sees, each time it signs or burns a note. So the mint keeps a **per-day ledger**: for each day, the ESP units signed under it (`issued`) and burned under it (`redeemed`). Outstanding for a day is the difference. A day is *matured* if the mint's clock is on that day or past it, the same rule it applies to a note (`Terms::is_redeemable_at`), and *unmatured* otherwise. The audit adds the days up: `outstanding_matured` is what a service could redeem today, `outstanding_unmatured` is what it could not yet. The code is `src/ledger.rs`; the ledger is stored by `Responses`.
+
+**What counts, and when.** A request's movements are fixed by the request, and added once, when the request finishes:
+
+| Event | Movements |
+|---|---|
+| Exchange finished | `issued` += the outputs, under the exchange's day. The fee is paid in PSP on top, so it is not ESP and not issued. |
+| Transfer finished | `redeemed` += the inputs and `issued` += the outputs, under the notes' day. The difference is the fee, which is burned and not reissued. |
+| Redemption finished | `redeemed` += each note the decision burned, under its own day; `issued` += each refund output, under its own day. The redemption fee and the payout come out of burned notes and are not reissued. |
+| Decline of a payout | `issued` += each decline output, under its own day. |
+| Rollover | Nothing: it moves notes to the current key set under the same terms. |
+
+**Why it survives restarts and torn writes.** The ledger is in `responses.json`, in the same JSON document as the stored requests (`{"entries": {...}, "ledger": {...}}`), and that document is replaced by one atomic write (temporary file, fsync, rename, directory fsync) on every change. An exchange, transfer or redemption is added to the ledger in the very write that turns its entry into the finished one, and only if the entry it replaces is not finished already (`Responses::finish`). So:
+
+- a crash before the write leaves the old file, with the request unfinished and not counted, and the retry finishes it and counts it;
+- a crash after the write leaves it finished and counted, and a retry is answered from the entry and counts nothing;
+- a half-written temporary file is ignored, and replaced by the next write;
+- a request is never counted without being finished, or finished without being counted, and never twice.
+
+A decline is the one exception, because it is marked in another file (`queue.json`). It is counted by the queue entry's id (`Responses::count_decline`, which keeps the ids it has counted in the ledger), before the entry is marked. The outputs are signed first, which is safe to repeat (signing is deterministic), so if the mint stops between counting and marking, running the decline again signs the same outputs, counts nothing a second time, and marks the entry.
+
+**What it does not do, and what that shows.**
+
+- *The counters move first.* mint-core adds to its counters as each note is burned or signed. The ledger adds a whole request when it finishes. While a request is unfinished the two differ by what it has done so far. `requests_unfinished` says how many there are; a request that stays unfinished keeps the difference there until it is finished by a retry or looked at by a person.
+- *History before 0.5.0 is not in it.* Earlier versions kept neither the amounts nor the days of what they signed, so the ledger starts empty on an existing mint. `outstanding_unsplit` is `outstanding` minus the split parts, never below zero: what the counters say is outstanding and the ledger can not place. It is exactly the old ESP still outstanding, and it falls as that is redeemed. On a mint that has run 0.5.0 from its first note it is zero. A day is counted only while it is ahead (issued more than redeemed): a day that is behind means old notes were redeemed or reissued under it, and those come out of the unsplit part, not out of another day.
+- *Per-day detail is not exposed.* The ledger has one line per day; `/audit` gives only the two sums and the rest. A listing by day is a small addition if it is needed.
+- *Notes of a deleted key set* are counted like the others: the ledger is not per key set, and the counters of a deleted set stay in `retired.json`.
+
+**The file shape.** Before 0.5.0, `responses.json` was a bare object from request hash to entry. It is still read as it is, with an empty ledger, and the first change writes the new shape. An older version refuses the new shape (its entries would not parse) rather than reading it as the old one, so going back needs the old file restored from a copy. Take a copy of `responses.json` before the upgrade.
+
 ## Fees and junk requests
 
 Fees are charged on requests that carry value. A request that carries no value (malformed, unverifiable, or a replay of a spent note) is refused before anything can be charged, so fees do not stop junk requests; the size ceilings and the order of checks (cheap checks first) bound their cost. Per-DID and per-connection rate limits at the AIR layer are a possible further mitigation, not yet explored.
@@ -348,18 +380,19 @@ The mint's state is in files and a sled database today. Both are stand-ins for t
 5. **Recovery shows everything that was durable and nothing else.** After a restart, every entry whose write had returned is there, and an entry whose write had not returned is either there whole or not there. The retry of a request depends on this: it finds a `pending` entry and works out from the PSP what happened.
 6. **The mint-core v0.1.3 rule.** Marking an output's blind nonce used and adding its amount to the issued total are one atomic step; so are marking an input spent and adding its amount to the redeemed total.
 7. **Listing.** The pending entries can be listed, since the reservation checks read them all.
+8. **More than one change in one atomic write.** A request's finishing entry and its movements on the per-day ledger are one write (see "The audit split"). The stand-in does this because they are in one file. The AIR storage needs a transaction over several keys, or the ledger has to be derived from the entries instead.
 
-The mint needs no delete, no rollback of a write, and no ordering between two different entries, apart from items 2 and 4. If the AIR storage cannot give one of these, the code that depends on it has to change; the list is here so that is known in advance.
+The mint needs no delete, no rollback of a write, and no ordering between two different entries, apart from items 2, 4 and 8. If the AIR storage cannot give one of these, the code that depends on it has to change; the list is here so that is known in advance.
 
 ## Storage policy (setting only)
 
 `storage.mint_state` (`ESP_STORAGE_MINT_STATE`) names the AIR services that will keep this mint's state: an ordered list of service IDs, index 0 the primary and the rest secondaries in promotion order. A service ID is a 32-byte x-only key in hex (64 characters); a 33-byte DID key is accepted and reduced to it. In the environment the IDs are comma-separated; in `esp-mint.toml` the value is an array of strings or one string. One entry is valid (that service holds the state and the mint keeps a local backup copy); empty, the default, means local only; at most 8, no duplicates, no empty entry. The parser and checks are `sp_wire::storage` (sp-wire), shared by all three mints and the wallet, so a list means the same thing everywhere.
 
-This is configuration and validation only. **Nothing reads or writes the AIR yet:** the state is still in local files, whatever the list says. The mint logs the list at startup like any setting (it is a restart setting: `SIGHUP` keeps the running list and says a change needs a restart, because only the mint itself will change its list, when it promotes a secondary). What the list will do, and what the mint's storage layer must then provide (a spend written to the primary and at least one secondary before the mint answers, batched; only the mint promotes a secondary and updates its config; writes carry a sequence number so a returning primary is overwritten from the working copy; a local backup copy with one service), is written in [sandbox-mint DESIGN.md](../sandbox-mint/DESIGN.md), "AIR storage requirements". That replication belongs in mint-core's storage layer and is a candidate for AIR upstream. If the primary and every secondary are unreachable, the mint's own local copy becomes the primary, as the last entry in the storage order: every spend is fsynced before the mint answers, unreplicated spends are queued and replicated in order to the first service that comes back (which becomes primary again), the number of unreplicated spends is capped by an operator setting (count and/or time) with spends refused at the cap, and `/health` reports a degraded state throughout. None of this is built, and the cap settings do not exist yet.
+This is configuration and validation only. **Nothing reads or writes the AIR yet:** the state is still in local files, whatever the list says. The mint logs the list at startup like any setting (it is a restart setting: `SIGHUP` keeps the running list and says a change needs a restart, because only the mint itself will change its list, when it promotes a secondary). What the list will do, and what the mint's storage layer must then provide (eight numbered requirements: 1 a spend is written to the primary and at least one secondary before the mint answers, batched; 2 a local backup copy with one service; 3 only the mint promotes a secondary and updates its config; 4 writes carry a sequence number, so a returning primary is overwritten from the working copy; 5 the wallet file carries a version and is merged; 6 networks stay apart; 7 the mint's own local copy is the last fallback, fsynced and capped; 8 a request's finishing entry and its ledger movements are one atomic write, which only esp-mint's per-day ledger needs), is that list: it is the whole set, and nothing else is promised. That replication belongs in mint-core's storage layer and is a candidate for AIR upstream. If the primary and every secondary are unreachable, the mint's own local copy becomes the primary, as the last entry in the storage order: every spend is fsynced before the mint answers, unreplicated spends are queued and replicated in order to the first service that comes back (which becomes primary again), the number of unreplicated spends is capped by an operator setting (count and/or time) with spends refused at the cap, and `/health` reports a degraded state throughout. None of this is built, and the cap settings do not exist yet.
 
 ## Running as a service
 
-`esp-mint serve` runs under `launchd` (macOS) or `systemd` (Linux) as a user that is not root, with its data directory (`ESP_DATA_DIR`) and settings file (`ESP_CONFIG`) named in an env file, so it needs no home directory and reads nothing it was not given. The definitions, the install and uninstall steps and the health monitor are in [OPERATIONS.md](../sandbox-mint/OPERATIONS.md) (in `sandbox-mint`).
+`esp-mint serve` runs under `launchd` (macOS) or `systemd` (Linux) as a user that is not root, with its data directory (`ESP_DATA_DIR`) and settings file (`ESP_CONFIG`) named in an env file, so it needs no home directory and reads nothing it was not given. The definitions, the install and uninstall steps and the health monitor are in the README of the SPI repository ("Running as services"): `spi install` generates the systemd units or launchd property lists, the env and settings files and the health monitor from its `spi.toml`, and prints the root steps to put them in place.
 
 **Failure and restart.** A fatal fault (a poisoned lock) makes the process exit with status 1, and the service manager starts it again after a delay that grows (systemd) or is fixed (launchd) and never gives up. A restart is picked up from what is on disk by the same rules as a crash: the `pending` entry of an exchange, transfer or redemption is what a retry works from.
 
@@ -369,11 +402,11 @@ This is configuration and validation only. **Nothing reads or writes the AIR yet
 
 **Opening the data twice.** The database allows one process at a time (a second open fails with an error; there is a test), so a new process that starts while the old one is still stopping cannot open the data. It exits with an error and the service manager starts it again after its delay. This is item 4 of "What the storage must provide", and the AIR storage has to give the same refusal or an equivalent single-writer guarantee.
 
-**Health.** `GET /health` is `200` while the locks are sound and `503` after, and the process also exits when a lock is poisoned. The monitor in `sandbox-mint/ops` polls it and reports or restarts a mint that stays unhealthy (interval, thresholds and action are settings of the monitor, in its file and environment). It catches a mint that is up but hung or wrong, which the exit-on-fault cannot.
+**Health.** `GET /health` is `200` while the locks are sound and `503` after, and the process also exits when a lock is poisoned. The health monitor that `spi install` sets up (`sp-health-monitor.sh`, see the SPI README, "The health monitor") polls it and reports or restarts a mint that stays unhealthy (interval, thresholds and action are settings of the monitor, in its file and environment). It catches a mint that is up but hung or wrong, which the exit-on-fault cannot.
 
 ## Source map
 
-Source map: terms and the date rule (`src/terms.rs`), unit constants and checked sums (`src/units.rs`; both are re-exports of `sp-wire`, see "Wire format and versions"), per-terms key derivation (`src/keys.rs`), the exchange (`src/exchange.rs`), stored responses (`src/responses.rs`), the PSP client (`src/psp_client.rs`), the API (`src/server.rs`), the transfer (`src/transfer.rs`), redemption (`src/redeem.rs`), the queue and payout report (`src/queue.rs`, `src/payouts.rs`, `src/admin.rs`), fees (`src/fee.rs`), rotation (`src/rotation.rs`) and settings (`src/config.rs`).
+Source map: terms and the date rule (`src/terms.rs`), unit constants and checked sums (`src/units.rs`; both are re-exports of `sp-wire`, see "Wire format and versions"), per-terms key derivation (`src/keys.rs`), the exchange (`src/exchange.rs`), stored responses (`src/responses.rs`), the per-day ledger (`src/ledger.rs`), the PSP client (`src/psp_client.rs`), the API (`src/server.rs`), the transfer (`src/transfer.rs`), redemption (`src/redeem.rs`), the queue and payout report (`src/queue.rs`, `src/payouts.rs`, `src/admin.rs`), fees (`src/fee.rs`), rotation (`src/rotation.rs`) and settings (`src/config.rs`).
 
 ## Settings
 

@@ -11,7 +11,7 @@
 //! blocking and must not be created or used on an async thread.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -185,7 +185,7 @@ async fn burns(
     Json(serde_json::json!({ "burns": burns }))
 }
 
-fn start_psp(rt: &Runtime, dir: &PathBuf, gate: &Arc<Gate>) -> (String, Arc<AppState>) {
+fn start_psp(rt: &Runtime, dir: &Path, gate: &Arc<Gate>) -> (String, Arc<AppState>) {
     let cfg = keygen::generate(&gen_denominations(2, Amount::from_units(1024)));
     let logic = MintLogic::new(cfg, Store::open(&dir.join("psp-db")).unwrap());
     let state = Arc::new(AppState {
@@ -212,7 +212,7 @@ fn ks() -> String {
 /// The ESP mint, with its PSP client giving up after `psp_timeout_secs`.
 fn start_esp(
     rt: &Runtime,
-    dir: &PathBuf,
+    dir: &Path,
     psp_url: &str,
     psp_timeout_secs: u64,
 ) -> (String, Arc<EspState>) {

@@ -13,7 +13,7 @@
 //!    names (which must exist);
 //! 3. the default.
 //!
-//! The file is TOML in sections (`[redeem]`, `fee_per_byte = 1000000`). A key
+//! The file is TOML in sections (`[redeem]`, `max_memo_bytes = 128`). A key
 //! the mint does not know is an error, so a misspelt setting never silently
 //! does nothing. So is a value of the wrong type or out of range: the mint
 //! lists every problem and does not start. The admin token is a secret and is
@@ -240,10 +240,10 @@ pub const SPECS: &[Spec] = &[
     Spec {
         key: "redeem.fee_per_byte",
         env: "ESP_REDEEM_FEE_PER_BYTE",
-        default: "1000000",
+        default: "0",
         units: "ESP units per encoded byte",
         reload: true,
-        what: "The redemption fee rate. A request pays this times its encoded size, at the rate in force when it is accepted; the rate is stored on the reply and on the queue entry. 10^6 units is $0.000001, so $1 per MiB. Placeholder.",
+        what: "The redemption fee rate. 0 means no mint fee. If set, a request pays this times its encoded size, at the rate in force when it is accepted; the rate is stored on the reply and on the queue entry.",
     },
     Spec {
         key: "redeem.max_request_bytes",
@@ -527,6 +527,7 @@ impl Config {
         for (key, value) in [
             ("exchange.fee_per_byte", self.exchange_fee_per_byte),
             ("transfer.fee_per_byte", self.transfer_fee_per_byte),
+            ("redeem.fee_per_byte", self.redeem_fee_per_byte),
         ] {
             range(
                 key,
@@ -536,13 +537,6 @@ impl Config {
                 "ESP units per byte; 0 means no fee",
             );
         }
-        range(
-            "redeem.fee_per_byte",
-            self.redeem_fee_per_byte,
-            1,
-            1_000_000_000_000_000,
-            "ESP units per byte; 0 would make requests free",
-        );
         range(
             "redeem.max_request_bytes",
             self.redeem_max_request_bytes as u64,
@@ -1033,7 +1027,7 @@ mod tests {
     fn the_defaults_are_the_ones_the_design_sets() {
         let c = Config::default();
         assert_eq!(c.maturity_days, 365);
-        assert_eq!(c.redeem_fee_per_byte, 1_000_000);
+        assert_eq!(c.redeem_fee_per_byte, 0);
         assert_eq!(c.redeem_max_request_bytes, 64 * 1024 * 1024);
         assert_eq!(c.redeem_max_memo_bytes, 256);
         assert_eq!(c.redeem_max_reason_bytes, 1024);
@@ -1049,6 +1043,8 @@ mod tests {
         assert_eq!(c.admin_max_request_bytes, 1024 * 1024);
         assert_eq!(c.exchange_fee_per_byte, 0);
         assert_eq!(c.transfer_fee_per_byte, 0);
+        // every fee defaults to 0
+        assert_eq!(c.redeem_settings().fee_per_byte, 0);
         assert_eq!(c.validate(), Ok(()));
     }
 
@@ -1163,13 +1159,13 @@ mod tests {
         let dir = scratch("ranges");
         fs::write(
             dir.join(FILE_NAME),
-            "[redeem]\nfee_per_byte = 0\nmax_request_bytes = 100\nmax_memo_bytes = 5000\n[terms]\nmaturity_days = 99999\n[server]\nadmin_bind = \"0.0.0.0:3101\"\n",
+            "[redeem]\nfee_per_byte = 2000000000000000\nmax_request_bytes = 100\nmax_memo_bytes = 5000\n[terms]\nmaturity_days = 99999\n[server]\nadmin_bind = \"0.0.0.0:3101\"\n",
         )
         .unwrap();
         let problems = load(&dir, &no_env).unwrap_err();
         let all = problems.join("\n");
         assert!(
-            all.contains("redeem.fee_per_byte = 0 is out of range"),
+            all.contains("redeem.fee_per_byte = 2000000000000000 is out of range"),
             "{all}"
         );
         assert!(
@@ -1208,16 +1204,18 @@ mod tests {
 
     #[test]
     fn the_settings_become_the_settings_structs_the_mint_uses() {
-        let mut c = Config::default();
-        c.maturity_days = 30;
-        c.exchange_max_items = 10;
-        c.exchange_min_psp = 5;
-        c.redeem_fee_per_byte = 7;
-        c.redeem_max_memo_bytes = 99;
-        c.redeem_max_reason_bytes = 55;
-        c.exchange_fee_per_byte = 11;
-        c.transfer_fee_per_byte = 13;
-        c.transfer_max_items = 20;
+        let c = Config {
+            maturity_days: 30,
+            exchange_max_items: 10,
+            exchange_min_psp: 5,
+            redeem_fee_per_byte: 7,
+            redeem_max_memo_bytes: 99,
+            redeem_max_reason_bytes: 55,
+            exchange_fee_per_byte: 11,
+            transfer_fee_per_byte: 13,
+            transfer_max_items: 20,
+            ..Config::default()
+        };
         let e = c.exchange_settings();
         assert_eq!((e.max_items, e.maturity_days, e.min_psp), (10, 30, 5));
         assert_eq!(e.fee_per_byte, 11);
@@ -1234,7 +1232,7 @@ mod tests {
     fn a_reload_swaps_in_the_new_values_and_keeps_the_old_ones_on_any_problem() {
         let dir = scratch("reload");
         let handle = Handle::new(load(&dir, &no_env).unwrap().config);
-        assert_eq!(handle.current().redeem_fee_per_byte, 1_000_000);
+        assert_eq!(handle.current().redeem_fee_per_byte, 0);
         let before = handle.current();
 
         fs::write(dir.join(FILE_NAME), "[redeem]\nfee_per_byte = 5000000\n").unwrap();
@@ -1243,20 +1241,24 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("redeem.fee_per_byte changed from 1000000 to 5000000"))
+                .any(|l| l.contains("redeem.fee_per_byte changed from 0 to 5000000"))
         );
         // a request that took its settings before still has the old ones
-        assert_eq!(before.redeem_fee_per_byte, 1_000_000);
+        assert_eq!(before.redeem_fee_per_byte, 0);
 
         // a bad file changes nothing
-        fs::write(dir.join(FILE_NAME), "[redeem]\nfee_per_byte = 0\n").unwrap();
+        fs::write(
+            dir.join(FILE_NAME),
+            "[redeem]\nfee_per_byte = 2000000000000000\n",
+        )
+        .unwrap();
         assert!(handle.reload(&dir, &no_env).is_err());
         assert_eq!(handle.current().redeem_fee_per_byte, 5_000_000);
 
         // removing the file puts the defaults back
         fs::remove_file(dir.join(FILE_NAME)).unwrap();
         handle.reload(&dir, &no_env).unwrap();
-        assert_eq!(handle.current().redeem_fee_per_byte, 1_000_000);
+        assert_eq!(handle.current().redeem_fee_per_byte, 0);
         // and nothing changing says so
         let lines = handle.reload(&dir, &no_env).unwrap();
         assert_eq!(lines, vec!["  no setting changed".to_string()]);

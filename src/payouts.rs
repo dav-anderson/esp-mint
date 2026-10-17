@@ -426,7 +426,7 @@ mod tests {
         q.add(Entry::open(
             "e3",
             xyz(),
-            1 * ESP_PER_USD,
+            ESP_PER_USD,
             "btc:bc1qnew",
             DAY1 + DAY,
         ))

@@ -74,6 +74,7 @@ use secp256k1::XOnlyPublicKey;
 
 use crate::fee;
 use crate::keys::MasterSecret;
+use crate::ledger::Movements;
 use crate::responses::{Entry, Responses};
 use crate::terms::Terms;
 use crate::units::{self, ESP_PER_PSP};
@@ -907,8 +908,15 @@ fn finish(
         fee_esp: plan.fee_esp,
         size_bytes: plan.size_bytes,
     };
+    // The ledger counts the outputs under the exchange's day, in the same write
+    // that finishes the entry (see `ledger`).
+    let mut movements = Movements::new();
+    movements.issue(
+        plan.redeemable_after_day,
+        units::total(request.outputs.iter().map(|o| o.amount.units)),
+    );
     responses
-        .put(&plan.hash, Entry::Done(response.clone()))
+        .finish(&plan.hash, Entry::Done(response.clone()), &movements)
         .map_err(internal)?;
     Ok(response)
 }
@@ -956,7 +964,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use mint_core::keygen;
     use mint_core::store::Store;
@@ -1001,7 +1009,7 @@ mod tests {
     }
 
     impl FakePsp {
-        fn new(dir: &PathBuf) -> Self {
+        fn new(dir: &Path) -> Self {
             let cfg = keygen::generate(&gen_denominations(2, Amount::from_units(1024)));
             let store = Store::open(&dir.join("psp-db")).unwrap();
             FakePsp {
@@ -2094,7 +2102,7 @@ mod tests {
             Ok(())
         );
         assert!(check_exact(units::psp_to_esp(u64::MAX), units::psp_to_esp(u64::MAX) - 1).is_err());
-        let many = units::total(std::iter::repeat(u64::MAX).take(MAX_ITEMS));
+        let many = units::total(std::iter::repeat_n(u64::MAX, MAX_ITEMS));
         assert_eq!(check_exact(many, many), Ok(()));
         assert_eq!(
             check_exact(many + one, many),
@@ -2289,7 +2297,7 @@ mod tests {
         );
         // the largest note and the largest sum of notes still compute
         assert!(check_exact(units::psp_to_esp(u64::MAX), units::psp_to_esp(u64::MAX)).is_ok());
-        let many = units::total(std::iter::repeat(u64::MAX).take(MAX_ITEMS));
+        let many = units::total(std::iter::repeat_n(u64::MAX, MAX_ITEMS));
         assert_eq!(many, u128::from(u64::MAX) * MAX_ITEMS as u128);
         assert!(check_exact(many, many).is_ok());
         fs::remove_dir_all(&s.dir).unwrap();
@@ -2369,6 +2377,72 @@ mod tests {
                 minimum: u128::from(ONE_PSP)
             }
         );
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_finished_exchange_is_counted_once_in_the_ledger_under_its_day() {
+        use crate::ledger::Day;
+        let mut s = setup("ledger");
+        let (note, keypair) = s.psp.note(4);
+        let (request, _) = build(&[(note, &keypair, 4)], &[2 * ONE_PSP, 2 * ONE_PSP], None);
+        let day = NOW / 86_400 + 365;
+        assert_eq!(s.responses.ledger().day(day), Day::default());
+        s.run(&request).unwrap();
+        let counted = Day {
+            issued: u128::from(4 * ONE_PSP),
+            redeemed: 0,
+        };
+        assert_eq!(s.responses.ledger().day(day), counted);
+        // the split at the time of issue, and a year on
+        let ledger = s.responses.ledger();
+        assert_eq!(ledger.split(NOW).unmatured, u128::from(4 * ONE_PSP));
+        assert_eq!(ledger.split(NOW).matured, 0);
+        assert_eq!(ledger.split(day * 86_400).matured, u128::from(4 * ONE_PSP));
+        // a retry, and a retry after a restart, count nothing more
+        s.run(&request).unwrap();
+        s.responses = Responses::open(&s.dir.join("esp").join("responses.json")).unwrap();
+        s.run(&request).unwrap();
+        assert_eq!(s.responses.ledger().day(day), counted);
+        assert_eq!(s.psp.melts.get(), 1);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn an_exchange_that_stopped_before_the_burn_counts_nothing_until_it_is_finished() {
+        use crate::ledger::Day;
+        let mut s = setup("ledger-recover");
+        let (note, keypair) = s.psp.note(1);
+        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
+        let day = NOW / 86_400 + 365;
+        s.psp.fail_before_burn.set(true);
+        assert!(matches!(s.run(&request), Err(ExchangeError::Psp(_))));
+        s.psp.fail_before_burn.set(false);
+        // pending on file, nothing counted, and a restart keeps it so
+        s.responses = Responses::open(&s.dir.join("esp").join("responses.json")).unwrap();
+        assert_eq!(s.responses.unfinished(), 1);
+        assert_eq!(s.responses.ledger().day(day), Day::default());
+
+        s.run(&request).unwrap();
+        let counted = Day {
+            issued: u128::from(ONE_PSP),
+            redeemed: 0,
+        };
+        assert_eq!(s.responses.unfinished(), 0);
+        assert_eq!(s.responses.ledger().day(day), counted);
+        s.run(&request).unwrap();
+        assert_eq!(s.responses.ledger().day(day), counted);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_exchange_counts_nothing() {
+        let mut s = setup("ledger-refused");
+        let (note, keypair) = s.psp.note(1);
+        // off by one unit: not exact
+        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP - 1], None);
+        assert!(s.run(&request).is_err());
+        assert_eq!(s.responses.ledger().days().count(), 0);
         fs::remove_dir_all(&s.dir).unwrap();
     }
 }

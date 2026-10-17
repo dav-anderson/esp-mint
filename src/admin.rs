@@ -269,7 +269,7 @@ async fn decline_handler(
         let Some(esp) = state.esp.as_ref() else {
             return Err((StatusCode::NOT_IMPLEMENTED, "no mint".to_string()));
         };
-        let (Ok(mut logic), Ok(responses), Ok(_queue)) = (
+        let (Ok(mut logic), Ok(mut responses), Ok(_queue)) = (
             esp.logic.lock(),
             esp.responses.lock(),
             esp.queue_lock.lock(),
@@ -289,7 +289,7 @@ async fn decline_handler(
         };
         redeem::decline_gens(
             &gens,
-            &responses,
+            &mut responses,
             &state.queue_path,
             &body.entry_id,
             &body.reason,

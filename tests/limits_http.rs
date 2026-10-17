@@ -4,7 +4,7 @@
 //!
 //! Plain tests with their own runtime, because they use the blocking HTTP client.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -54,14 +54,16 @@ fn serve(rt: &Runtime, app: Router) -> String {
     format!("http://{addr}")
 }
 
-fn start(rt: &Runtime, dir: &PathBuf) -> (String, Arc<EspState>) {
+fn start(rt: &Runtime, dir: &Path) -> (String, Arc<EspState>) {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
-    let mut cfg = Config::default();
-    cfg.exchange_max_request_bytes = CEILING;
-    cfg.transfer_max_request_bytes = CEILING;
-    cfg.rollover_max_request_bytes = CEILING;
-    cfg.redeem_max_request_bytes = CEILING;
+    let cfg = Config {
+        exchange_max_request_bytes: CEILING,
+        transfer_max_request_bytes: CEILING,
+        rollover_max_request_bytes: CEILING,
+        redeem_max_request_bytes: CEILING,
+        ..Config::default()
+    };
     let state = Arc::new(EspState {
         logic: Mutex::new(logic),
         master,

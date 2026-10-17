@@ -6,7 +6,7 @@
 //! These are plain tests with their own runtime, because they use the blocking
 //! HTTP client.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -113,12 +113,12 @@ fn out_ks() -> String {
     KS.with(|k| k.borrow().1.clone())
 }
 
-fn start(rt: &Runtime, dir: &PathBuf, max_bytes: usize) -> Mint {
+fn start(rt: &Runtime, dir: &Path, max_bytes: usize) -> Mint {
     start_at_rate(rt, dir, max_bytes, RATE)
 }
 
 /// `start`, with the redemption fee rate (ESP units per byte) chosen.
-fn start_at_rate(rt: &Runtime, dir: &PathBuf, max_bytes: usize, rate: u128) -> Mint {
+fn start_at_rate(rt: &Runtime, dir: &Path, max_bytes: usize, rate: u128) -> Mint {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     let id = esp_mint::rotation::keyset_id(&master);
     set_keysets(&id, &id);
@@ -131,11 +131,10 @@ fn start_at_rate(rt: &Runtime, dir: &PathBuf, max_bytes: usize, rate: u128) -> M
         responses: Mutex::new(responses),
         queue_path: queue_path.clone(),
         queue_lock: Mutex::new(()),
-        config: esp_mint::config::Handle::new({
-            let mut config = esp_mint::config::Config::default();
-            config.redeem_fee_per_byte = rate as u64;
-            config.redeem_max_request_bytes = max_bytes;
-            config
+        config: esp_mint::config::Handle::new(esp_mint::config::Config {
+            redeem_fee_per_byte: rate as u64,
+            redeem_max_request_bytes: max_bytes,
+            ..esp_mint::config::Config::default()
         }),
         rotor: None,
         rollovers: None,
@@ -403,6 +402,25 @@ fn a_bad_service_signature_is_a_400_with_no_burn_and_no_fee() {
 }
 
 #[test]
+fn by_default_a_redemption_costs_no_fee_and_the_whole_amount_is_owed() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("default-fee");
+    // The rate a mint has when nothing sets one.
+    let rate = u128::from(esp_mint::config::Config::default().redeem_fee_per_byte);
+    assert_eq!(rate, 0);
+    let mint = start_at_rate(&rt, &dir, 64 * 1024 * 1024, rate);
+    let (note, key) = esp_note(&mint, 4 * ONE, service(), PAST);
+    let (req, _) = request(&[(note, &key, 4 * ONE, PAST)], &[], &service_keypair());
+    let (code, body) = post_bytes(&mint.esp, req.encode());
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["fee_esp"], "0");
+    assert_eq!(body["owed_esp"], (4 * ONE).to_string());
+    assert_eq!(body["message"], "payout queued");
+    assert!(is_spent(&mint, &note));
+    rt.shutdown_background();
+}
+
+#[test]
 fn a_redemption_is_queued_then_declined_and_the_service_collects_the_reissued_notes() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("flow");
@@ -632,13 +650,13 @@ fn decline_outputs_over_the_limit_come_back_with_the_totals_to_rebuild_from() {
 
 const T0: u64 = 1_800_000_000;
 
-fn start_rotating(rt: &Runtime, dir: &PathBuf) -> Mint {
+fn start_rotating(rt: &Runtime, dir: &Path) -> Mint {
     start_rotating_with(rt, dir, |_| {})
 }
 
 fn start_rotating_with(
     rt: &Runtime,
-    dir: &PathBuf,
+    dir: &Path,
     tweak: impl FnOnce(&mut esp_mint::config::Config),
 ) -> Mint {
     let data = dir.join("esp");
@@ -654,8 +672,10 @@ fn start_rotating_with(
         queue_path: queue_path.clone(),
         queue_lock: Mutex::new(()),
         config: esp_mint::config::Handle::new({
-            let mut c = esp_mint::config::Config::default();
-            c.redeem_fee_per_byte = RATE as u64;
+            let mut c = esp_mint::config::Config {
+                redeem_fee_per_byte: RATE as u64,
+                ..esp_mint::config::Config::default()
+            };
             tweak(&mut c);
             c
         }),
@@ -902,7 +922,7 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
     );
     // A transfer and a redemption naming the retired set are refused the
     // same way, and nothing is burned.
-    set_keysets(&id0, &w["current"]["id"].as_str().unwrap().to_string());
+    set_keysets(&id0, w["current"]["id"].as_str().unwrap());
     let (late, _) = request(&[(d.0, &d.1, ONE, PAST)], &[], &service_keypair());
     let (code, body) = post_bytes(&mint.esp, late.encode());
     assert_eq!(
@@ -910,10 +930,7 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
         "below the fee once the expired note is out: {body}"
     );
     // An unknown keyset is told apart from a retired one.
-    set_keysets(
-        &"ab".repeat(8),
-        &w["current"]["id"].as_str().unwrap().to_string(),
-    );
+    set_keysets(&"ab".repeat(8), w["current"]["id"].as_str().unwrap());
     let (code, body) = post_json(
         &mint.esp,
         "/rollover",
@@ -1010,6 +1027,15 @@ fn a_decline_after_the_requested_keyset_retires_is_signed_by_the_current_set_and
         &serde_json::json!({"entry_id": id, "reason": "terms"}),
     );
     assert_eq!(code, 200, "{declined}");
+    // The decline is on the ledger once, and the parts of /audit still add up.
+    let audit = get_json(&mint.esp, "/audit");
+    let part = |k: &str| audit[k].as_u64().unwrap();
+    assert_eq!(
+        part("outstanding_matured") + part("outstanding_unmatured") + part("outstanding_unsplit"),
+        part("outstanding"),
+        "{audit}"
+    );
+    assert_eq!(audit["requests_unfinished"], 0, "{audit}");
     let (code, after) = post_bytes(&mint.esp, bytes);
     assert_eq!(code, 200, "{after}");
     let sigs = after["entry"]["decline_signatures"].as_array().unwrap();

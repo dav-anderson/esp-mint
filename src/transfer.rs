@@ -63,6 +63,7 @@ use secp256k1::schnorr::Signature;
 use crate::exchange::MAX_ITEMS;
 use crate::fee;
 use crate::keys::MasterSecret;
+use crate::ledger::Movements;
 use crate::responses::{Entry, Responses, TransferPending};
 use crate::rotation::Gens;
 use crate::terms::Terms;
@@ -491,7 +492,7 @@ pub fn transfer_gens(
         // 1. Each input: genuine under the key derived for its amount and the
         //    terms, and a spend signature over the digest. Public keys only.
         for (index, input) in request.inputs.iter().enumerate() {
-            let (logic, sk) = in_keys[index].clone().expect("resolved");
+            let (logic, sk) = in_keys[index].expect("resolved");
             logic
                 .verify_note_with_key(&sk, input)
                 .map_err(|_| TransferRejection::BadNote { index })?;
@@ -625,8 +626,21 @@ pub fn transfer_gens(
         fee_esp,
         size_bytes,
     };
+    // The ledger counts the burned inputs and the signed outputs under the
+    // notes' day, in the same write that finishes the entry (see `ledger`). The
+    // difference is the fee.
+    let mut movements = Movements::new();
+    movements
+        .redeem(
+            request.redeemable_after_day,
+            units::total(request.inputs.iter().map(|i| i.amount.units)),
+        )
+        .issue(
+            request.redeemable_after_day,
+            units::total(request.outputs.iter().map(|o| o.amount.units)),
+        );
     responses
-        .put(&hash, Entry::Done(response.clone()))
+        .finish(&hash, Entry::Done(response.clone()), &movements)
         .map_err(internal)?;
     Ok(response)
 }
@@ -640,6 +654,8 @@ mod tests {
     use mint_types::{Amount, BlindNonce, Nonce, Note};
     use rand::rngs::OsRng;
     use secp256k1::{Keypair, SecretKey};
+
+    use crate::ledger::Day;
 
     const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
     const NOW: u64 = 1_791_571_184;
@@ -1656,21 +1672,49 @@ mod tests {
     fn the_digest_covers_every_field_and_not_the_signatures() {
         let (a, b) = (fake_input(5), fake_input(6));
         let out = fake_output(11);
-        let base = digest(&service(), DAY, &[a.clone(), b.clone()], &[out.clone()]);
+        let base = digest(
+            &service(),
+            DAY,
+            &[a.clone(), b.clone()],
+            std::slice::from_ref(&out),
+        );
         let other = other_keypair().x_only_public_key().0;
         assert_ne!(
             base,
-            digest(&other, DAY, &[a.clone(), b.clone()], &[out.clone()])
+            digest(
+                &other,
+                DAY,
+                &[a.clone(), b.clone()],
+                std::slice::from_ref(&out)
+            )
         );
         assert_ne!(
             base,
-            digest(&service(), DAY + 1, &[a.clone(), b.clone()], &[out.clone()])
+            digest(
+                &service(),
+                DAY + 1,
+                &[a.clone(), b.clone()],
+                std::slice::from_ref(&out)
+            )
         );
         assert_ne!(
             base,
-            digest(&service(), DAY, &[b.clone(), a.clone()], &[out.clone()])
+            digest(
+                &service(),
+                DAY,
+                &[b.clone(), a.clone()],
+                std::slice::from_ref(&out)
+            )
         );
-        assert_ne!(base, digest(&service(), DAY, &[a.clone()], &[out.clone()]));
+        assert_ne!(
+            base,
+            digest(
+                &service(),
+                DAY,
+                std::slice::from_ref(&a),
+                std::slice::from_ref(&out)
+            )
+        );
         assert_ne!(
             base,
             digest(&service(), DAY, &[a.clone(), b.clone()], &[fake_output(11)])
@@ -1679,7 +1723,12 @@ mod tests {
         a2.amount = Amount::from_units(6);
         assert_ne!(
             base,
-            digest(&service(), DAY, &[a2, b.clone()], &[out.clone()])
+            digest(
+                &service(),
+                DAY,
+                &[a2, b.clone()],
+                std::slice::from_ref(&out)
+            )
         );
         // the spend signature is not part of the digest
         let mut signed = a.clone();
@@ -1720,6 +1769,96 @@ mod tests {
         let back: TransferRequest = serde_json::from_str(&text).unwrap();
         assert_eq!(back.digest(), request.digest());
         assert_eq!(request_hash(&back), request_hash(&request));
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_finished_transfer_is_counted_once_in_the_ledger_under_the_notes_day() {
+        let mut s = setup("ledger");
+        let (a, ka) = s.esp_note(2 * ONE_PSP, service(), DAY);
+        let (b, kb) = s.esp_note(ONE_PSP, service(), DAY);
+        assert_eq!(s.responses.ledger().day(DAY), Day::default());
+        let (request, _) = build(
+            &[(a, &ka, 2 * ONE_PSP), (b, &kb, ONE_PSP)],
+            &[ONE_PSP, 2 * ONE_PSP],
+        );
+        s.run(&request).unwrap();
+        // The notes were minted straight from the mint here, so the ledger has
+        // only the transfer: the inputs burned and the outputs signed, equal.
+        let counted = Day {
+            issued: u128::from(3 * ONE_PSP),
+            redeemed: u128::from(3 * ONE_PSP),
+        };
+        assert_eq!(s.responses.ledger().day(DAY), counted);
+        assert_eq!(s.responses.ledger().day(DAY + 1), Day::default());
+        // A retry, and a retry after a restart, count nothing more.
+        s.run(&request).unwrap();
+        assert_eq!(s.responses.ledger().day(DAY), counted);
+        s.responses = Responses::open(&s.dir.join("esp").join("responses.json")).unwrap();
+        s.run(&request).unwrap();
+        assert_eq!(s.responses.ledger().day(DAY), counted);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_transfer_fee_leaves_the_ledger_short_of_the_outputs_by_the_fee() {
+        let mut s = setup("ledger-fee");
+        let rate = 1_000u128;
+        let with_fee = TransferSettings {
+            fee_per_byte: rate,
+            ..TransferSettings::default()
+        };
+        let (a, ka) = s.esp_note(ONE_PSP, service(), DAY);
+        let (n, rest, fee_esp, _) = (1..=MAX_ITEMS)
+            .find_map(|n| {
+                let size = fee::transfer_size(1, n);
+                let fee_esp = fee::charge(size, rate);
+                let rest = ONE_PSP - fee_esp as u64;
+                (split(rest).len() <= n && n as u64 <= rest).then_some((n, rest, fee_esp, size))
+            })
+            .unwrap();
+        let (request, _) = build_exact(&[(a, &ka, ONE_PSP)], &split_into(rest, n));
+        transfer_with(&s.logic, &s.master, &mut s.responses, &request, &with_fee).unwrap();
+        let day = s.responses.ledger().day(DAY);
+        assert_eq!(day.redeemed, u128::from(ONE_PSP));
+        assert_eq!(day.issued, u128::from(rest));
+        assert_eq!(day.redeemed - day.issued, fee_esp);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_transfer_that_stopped_part_way_counts_nothing_until_it_is_finished_and_then_once() {
+        let mut s = setup("ledger-recover");
+        let (a, ka) = s.esp_note(2 * ONE_PSP, service(), DAY);
+        let (request, _) = build(&[(a, &ka, 2 * ONE_PSP)], &[ONE_PSP, ONE_PSP]);
+        let hash = request_hash(&request);
+        let terms = s.terms();
+        s.responses
+            .put(&hash, Entry::TransferPending(held_by(&request)))
+            .unwrap();
+        // The input is burned and the first output signed, then it stops.
+        let sk_in = s.master.key_for(request.inputs[0].amount, &terms);
+        s.logic
+            .redeem_with_key(&sk_in, &request.inputs[0], request.digest())
+            .unwrap();
+        let sk_out = s.master.key_for(request.outputs[0].amount, &terms);
+        s.logic
+            .issue_with_key(&sk_out, &request.outputs[0])
+            .unwrap();
+        // The counters moved, the ledger has not, and a restart keeps it so.
+        s.responses = Responses::open(&s.dir.join("esp").join("responses.json")).unwrap();
+        assert_eq!(s.responses.ledger().day(DAY), Day::default());
+        assert_eq!(s.responses.unfinished(), 1);
+
+        s.run(&request).unwrap();
+        let counted = Day {
+            issued: u128::from(2 * ONE_PSP),
+            redeemed: u128::from(2 * ONE_PSP),
+        };
+        assert_eq!(s.responses.ledger().day(DAY), counted);
+        assert_eq!(s.responses.unfinished(), 0);
+        s.run(&request).unwrap();
+        assert_eq!(s.responses.ledger().day(DAY), counted);
         fs::remove_dir_all(&s.dir).unwrap();
     }
 }

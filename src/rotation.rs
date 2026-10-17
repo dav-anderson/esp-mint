@@ -669,7 +669,7 @@ pub fn describe_offline(base: &Path, activation_hours: u64, period_hours: u64) -
 #[cfg(test)]
 use mint_types::MintOutput;
 use mint_types::MintOutputError;
-use secp256k1::{PublicKey, SECP256K1};
+use secp256k1::SECP256K1;
 use std::collections::BTreeMap;
 
 pub const ROLLOVERS_FILE: &str = "rollovers.json";

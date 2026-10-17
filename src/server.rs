@@ -26,7 +26,10 @@
 //!   mint (a retry is safe).
 //! - `GET /fees`: the fee rates, size formulas and ceilings now in force, for a
 //!   wallet that builds a request.
-//! - `GET /audit`: issued, redeemed and outstanding ESP units.
+//! - `GET /audit`: issued, redeemed and outstanding ESP units, and the
+//!   outstanding split into `outstanding_matured` (days that have come),
+//!   `outstanding_unmatured` (days ahead) and `outstanding_unsplit` (issued
+//!   before 0.5.0, day unknown), from the per-day ledger (see `ledger`).
 //! - `GET /health`: `200` while the mint locks are sound, `503` otherwise.
 //!
 //! Every route that takes a body checks its size first. A body whose
@@ -678,7 +681,7 @@ async fn fees_handler(State(state): State<Arc<EspState>>) -> Json<Value> {
 }
 
 async fn audit_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<Value>) {
-    let Ok(mut logic) = state.logic.lock() else {
+    let (Ok(mut logic), Ok(responses)) = (state.logic.lock(), state.responses.lock()) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "the mint lock is poisoned"})),
@@ -705,17 +708,48 @@ async fn audit_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<
     match totals {
         Ok((issued, redeemed)) => (
             StatusCode::OK,
-            Json(json!({
-                "issued": issued.units,
-                "redeemed": redeemed.units,
-                "outstanding": issued.units.saturating_sub(redeemed.units),
-            })),
+            Json(audit_body(
+                issued.units,
+                redeemed.units,
+                &responses,
+                now_secs(),
+            )),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
         ),
     }
+}
+
+/// The body of `GET /audit`: mint-core's counters, and the split of what is
+/// outstanding by whether its day has come at `now_unix`, from the per-day
+/// ledger (see `ledger`).
+///
+/// - `outstanding_matured` / `outstanding_unmatured`: what the ledger knows is
+///   outstanding under days that have come / days still ahead.
+/// - `outstanding_unsplit`: the rest of `outstanding`, which the ledger can not
+///   place: ESP issued before 0.5.0, whose day was not kept. Zero on a mint that
+///   has run 0.5.0 from its first note. It also moves by what an unfinished
+///   request has burned or signed and the ledger does not count yet (see
+///   `requests_unfinished`), and is never below zero.
+/// - `requests_unfinished`: exchanges, transfers and redemptions not finished.
+/// - `as_of_day`: the day (since the Unix epoch) that "has come" is measured at.
+pub fn audit_body(issued: u64, redeemed: u64, responses: &Responses, now_unix: u64) -> Value {
+    let outstanding = issued.saturating_sub(redeemed);
+    let split = responses.ledger().split(now_unix);
+    let known = split.matured.saturating_add(split.unmatured);
+    let as_units = |v: u128| u64::try_from(v).unwrap_or(u64::MAX);
+    json!({
+        "issued": issued,
+        "redeemed": redeemed,
+        "outstanding": outstanding,
+        "outstanding_matured": as_units(split.matured),
+        "outstanding_unmatured": as_units(split.unmatured),
+        "outstanding_unsplit": as_units(u128::from(outstanding).saturating_sub(known)),
+        "requests_unfinished": responses.unfinished(),
+        "as_of_day": now_unix / crate::terms::SECONDS_PER_DAY,
+    })
 }
 
 async fn health_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<Value>) {
@@ -883,4 +917,144 @@ pub fn router(state: Arc<EspState>) -> Router {
         .route("/audit", get(audit_handler))
         .route("/health", get(health_handler))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::Movements;
+    use crate::responses::Entry;
+    use crate::terms::SECONDS_PER_DAY as DAY;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("esp-mint-audit-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn pending(day: u64) -> Entry {
+        Entry::Pending {
+            redeemable_after_day: day,
+            inputs: vec![],
+            outputs: vec![],
+        }
+    }
+
+    /// A store whose ledger has issued 100 under day 10 and 40 under day 11 and
+    /// redeemed 25 under day 10, as exchanges and a redemption would have left it.
+    fn known(dir: &std::path::Path) -> Responses {
+        let mut r = Responses::open(&dir.join("responses.json")).unwrap();
+        let mut m = Movements::new();
+        m.issue(10, 100).issue(11, 40).redeem(10, 25);
+        // `finish` needs an entry to finish; any unfinished one will do
+        r.put("h", pending(10)).unwrap();
+        r.finish("h", done(10), &m).unwrap();
+        r
+    }
+
+    fn done(day: u64) -> Entry {
+        let service = secp256k1::XOnlyPublicKey::from_slice(
+            &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap(),
+        )
+        .unwrap();
+        Entry::Done(sp_wire::esp::exchange::ExchangeResponse {
+            keyset: String::new(),
+            service,
+            redeemable_after_day: day,
+            signatures: vec![],
+            keys: vec![],
+            fee_per_byte: 0,
+            fee_esp: 0,
+            size_bytes: 0,
+        })
+    }
+
+    #[test]
+    fn an_empty_mint_audits_to_zeros() {
+        let dir = scratch("empty");
+        let r = Responses::open(&dir.join("responses.json")).unwrap();
+        let body = audit_body(0, 0, &r, 10 * DAY);
+        assert_eq!(body["outstanding"], 0);
+        assert_eq!(body["outstanding_matured"], 0);
+        assert_eq!(body["outstanding_unmatured"], 0);
+        assert_eq!(body["outstanding_unsplit"], 0);
+        assert_eq!(body["requests_unfinished"], 0);
+        assert_eq!(body["as_of_day"], 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_split_moves_from_unmatured_to_matured_across_a_day_boundary() {
+        let dir = scratch("boundary");
+        let r = known(&dir);
+        // The counters agree with the ledger: 140 issued, 25 redeemed.
+        let at = |now| audit_body(140, 25, &r, now);
+
+        let before = at(10 * DAY - 1);
+        assert_eq!(before["as_of_day"], 9);
+        assert_eq!(before["outstanding"], 115);
+        assert_eq!(before["outstanding_matured"], 0);
+        assert_eq!(before["outstanding_unmatured"], 115);
+        assert_eq!(before["outstanding_unsplit"], 0);
+
+        // the first second of day 10: what was issued for day 10 has matured
+        let day10 = at(10 * DAY);
+        assert_eq!(day10["as_of_day"], 10);
+        assert_eq!(day10["outstanding_matured"], 75);
+        assert_eq!(day10["outstanding_unmatured"], 40);
+        assert_eq!(day10["outstanding_unsplit"], 0);
+
+        // and the next day, the rest
+        let day11 = at(11 * DAY);
+        assert_eq!(day11["outstanding_matured"], 115);
+        assert_eq!(day11["outstanding_unmatured"], 0);
+
+        // the parts always add up to the outstanding total
+        for now in [9 * DAY, 10 * DAY, 10 * DAY + 5, 11 * DAY, 400 * DAY] {
+            let b = at(now);
+            let sum = b["outstanding_matured"].as_u64().unwrap()
+                + b["outstanding_unmatured"].as_u64().unwrap()
+                + b["outstanding_unsplit"].as_u64().unwrap();
+            assert_eq!(sum, b["outstanding"].as_u64().unwrap());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn esp_issued_before_the_ledger_is_reported_as_unsplit() {
+        let dir = scratch("legacy");
+        // an existing mint upgraded: 500 outstanding, the ledger knows nothing
+        let r = Responses::open(&dir.join("responses.json")).unwrap();
+        let body = audit_body(500, 0, &r, 10 * DAY);
+        assert_eq!(body["outstanding"], 500);
+        assert_eq!(body["outstanding_matured"], 0);
+        assert_eq!(body["outstanding_unmatured"], 0);
+        assert_eq!(body["outstanding_unsplit"], 500);
+
+        // then 115 more is issued under the ledger: only the old part is unsplit
+        let known = known(&scratch("legacy-known"));
+        let body = audit_body(500 + 140, 25, &known, 10 * DAY);
+        assert_eq!(body["outstanding"], 615);
+        assert_eq!(body["outstanding_matured"], 75);
+        assert_eq!(body["outstanding_unmatured"], 40);
+        assert_eq!(body["outstanding_unsplit"], 500);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_request_part_way_through_never_makes_the_unsplit_amount_negative() {
+        let dir = scratch("inflight");
+        let mut r = known(&dir);
+        r.put("e", pending(12)).unwrap();
+        // A transfer burned its inputs (the counters say 20 redeemed more) and
+        // has not been counted yet, so the counters are below the ledger.
+        let body = audit_body(140, 45, &r, 11 * DAY);
+        assert_eq!(body["outstanding"], 95);
+        assert_eq!(body["outstanding_unsplit"], 0);
+        assert_eq!(body["requests_unfinished"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

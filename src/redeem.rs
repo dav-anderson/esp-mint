@@ -76,14 +76,14 @@ use std::path::Path;
 
 use mint_core::MintLogic;
 #[cfg(test)]
-use mint_types::{Amount, BlindNonce, MintOutput, Nonce, Note};
+use mint_types::MintOutput;
 use mint_types::{MintInput, MintOutputError};
-use secp256k1::schnorr::Signature;
 use secp256k1::{SECP256K1, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::keys::MasterSecret;
+use crate::ledger::Movements;
 use crate::queue::{self, Queue, QueueError, SignedOutput, Status, dec};
 use crate::responses::{Entry, Responses};
 use crate::rotation::Gens;
@@ -108,9 +108,10 @@ pub const DEFAULT_MAX_REASON_BYTES: usize = 1024;
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 /// The default fee rate, in ESP units per encoded byte
-/// (`redeem.fee_per_byte`). A placeholder: 10^6 units is $0.000001, so $1 for
-/// every MiB of request (about $67 at the 64 MiB ceiling).
-pub const DEFAULT_FEE_PER_BYTE: u128 = 1_000_000;
+/// (`redeem.fee_per_byte`): 0, so a redemption costs no fee unless the operator
+/// sets one. Like every fee in the mint it is a setting, not a policy of the
+/// code.
+pub const DEFAULT_FEE_PER_BYTE: u128 = 0;
 
 /// The settings a redemption uses. They come from the mint's config
 /// (`config::Config::redeem_settings`); the defaults are the documented ones.
@@ -929,8 +930,20 @@ pub fn redeem_gens(
         decline_outputs: request.decline_outputs.clone(),
         output_keyset: request.output_keyset.clone(),
     };
+    // The ledger counts each burned note under its own day and each refund
+    // output under its own day, in the same write that finishes the entry (see
+    // `ledger`). The decline outputs are counted if the payout is declined.
+    let mut movements = Movements::new();
+    for (ri, note) in request.inputs.iter().zip(&record.plan.totals.notes) {
+        if note.burned {
+            movements.redeem(ri.redeemable_after_day, u128::from(ri.input.amount.units));
+        }
+    }
+    for o in &request.refund_outputs {
+        movements.issue(o.redeemable_after_day, u128::from(o.output.amount.units));
+    }
     responses
-        .put(&hash, Entry::RedeemDone(record.clone()))
+        .finish(&hash, Entry::RedeemDone(record.clone()), &movements)
         .map_err(internal)?;
     respond(queue_path, &hash, &record)
 }
@@ -974,7 +987,7 @@ impl Error for DeclineError {}
 pub fn decline(
     logic: &MintLogic,
     master: &MasterSecret,
-    responses: &Responses,
+    responses: &mut Responses,
     queue_path: &Path,
     entry_id: &str,
     reason: &str,
@@ -997,7 +1010,7 @@ pub fn decline(
 pub fn decline_with(
     logic: &MintLogic,
     master: &MasterSecret,
-    responses: &Responses,
+    responses: &mut Responses,
     queue_path: &Path,
     entry_id: &str,
     reason: &str,
@@ -1023,7 +1036,7 @@ pub fn decline_with(
 /// depend on the key.
 pub fn decline_gens(
     gens: &Gens,
-    responses: &Responses,
+    responses: &mut Responses,
     queue_path: &Path,
     entry_id: &str,
     reason: &str,
@@ -1048,7 +1061,7 @@ pub fn decline_gens(
         Some(_) => {}
     }
     let record = match responses.get(entry_id) {
-        Some(Entry::RedeemDone(record)) => record,
+        Some(Entry::RedeemDone(record)) => record.clone(),
         _ => {
             return Err(DeclineError::Refused(format!(
                 "entry {entry_id} has no stored redemption, so there is nothing to reissue"
@@ -1082,6 +1095,16 @@ pub fn decline_gens(
             keyset: keyset.clone(),
         });
     }
+    // The ledger counts the reissued notes under their own days, once per
+    // entry, before the queue entry is marked: if this stops in between, running
+    // it again signs the same outputs and counts nothing twice.
+    let mut movements = Movements::new();
+    for o in &record.decline_outputs {
+        movements.issue(o.redeemable_after_day, u128::from(o.output.amount.units));
+    }
+    responses
+        .count_decline(entry_id, &movements)
+        .map_err(|e| DeclineError::Internal(e.to_string()))?;
     let count = signatures.len();
     queue
         .decline(entry_id, reason, signatures, now_unix)
@@ -1124,6 +1147,7 @@ mod tests {
 
     use mint_types::{Amount, BlindNonce, Nonce, Note};
     use rand::rngs::OsRng;
+    use secp256k1::schnorr::Signature;
     use secp256k1::{Keypair, SecretKey};
 
     use crate::queue::Payment;
@@ -2621,16 +2645,22 @@ mod tests {
     #[test]
     fn the_fee_is_the_rate_times_the_encoded_size() {
         assert_eq!(fee_for(0, 5), 0);
-        assert_eq!(fee_for(1000, 1_000_000), 1_000_000_000);
-        assert_eq!(DEFAULT_FEE_PER_BYTE, 1_000_000);
+        // a rate chosen for the arithmetic; the default is 0 (below)
+        const EXAMPLE_RATE: u128 = 1_000_000;
+        assert_eq!(fee_for(1000, EXAMPLE_RATE), 1_000_000_000);
         // a typical request: five notes, one decline output, a 40 byte memo
         let typical = encoded_len(5, 40, 1, 0);
         assert_eq!(typical, 119 + 930 + 40 + 81);
-        assert_eq!(fee_for(typical, DEFAULT_FEE_PER_BYTE), 1_170_000_000);
+        assert_eq!(fee_for(typical, EXAMPLE_RATE), 1_170_000_000);
         // a request at the ceiling
         let ceiling = DEFAULT_MAX_REQUEST_BYTES as u64;
         assert_eq!(ceiling, 67_108_864);
-        assert_eq!(fee_for(ceiling, DEFAULT_FEE_PER_BYTE), 67_108_864_000_000);
+        assert_eq!(fee_for(ceiling, EXAMPLE_RATE), 67_108_864_000_000);
+        // by default there is no fee, whatever the size
+        assert_eq!(DEFAULT_FEE_PER_BYTE, 0);
+        assert_eq!(fee_for(typical, DEFAULT_FEE_PER_BYTE), 0);
+        assert_eq!(fee_for(ceiling, DEFAULT_FEE_PER_BYTE), 0);
+        assert_eq!(RedeemSettings::default().fee_per_byte, 0);
         // no overflow however large the rate
         assert_eq!(fee_for(u64::MAX, u128::MAX), u128::MAX);
     }
@@ -3111,7 +3141,7 @@ mod tests {
         let declined = decline(
             &s.logic,
             &s.master,
-            &s.responses,
+            &mut s.responses,
             &s.queue_path,
             &id,
             "uptime terms were not met",
@@ -3153,7 +3183,7 @@ mod tests {
             decline(
                 &s.logic,
                 &s.master,
-                &s.responses,
+                &mut s.responses,
                 &s.queue_path,
                 &id,
                 "again",
@@ -3167,7 +3197,7 @@ mod tests {
                 .complete(&Payment {
                     service: service(),
                     payment_ref: "late",
-                    entry_ids: &[id.clone()],
+                    entry_ids: std::slice::from_ref(&id),
                     allow_mixed_memos: false,
                     now_unix: NOW + 80,
                 })
@@ -3204,7 +3234,7 @@ mod tests {
         let declined = decline(
             &s.logic,
             &s.master,
-            &s.responses,
+            &mut s.responses,
             &s.queue_path,
             &id,
             "late",
@@ -3232,7 +3262,7 @@ mod tests {
         let declined = decline(
             &s.logic,
             &s.master,
-            &s.responses,
+            &mut s.responses,
             &s.queue_path,
             &id,
             "no",
@@ -3252,11 +3282,11 @@ mod tests {
         let request = build(&[&a], &[(ONE, service(), PAST)], &[]);
         s.run(&request).unwrap();
         let id = request_hash(&request);
-        let call = |s: &Setup, id: &str, reason: &str| {
+        let call = |s: &mut Setup, id: &str, reason: &str| {
             decline(
                 &s.logic,
                 &s.master,
-                &s.responses,
+                &mut s.responses,
                 &s.queue_path,
                 id,
                 reason,
@@ -3265,14 +3295,17 @@ mod tests {
         };
         // no such entry
         assert!(matches!(
-            call(&s, "nope", "why"),
+            call(&mut s, "nope", "why"),
             Err(DeclineError::Refused(_))
         ));
         // no reason, or one that is too long
-        assert!(matches!(call(&s, &id, "  "), Err(DeclineError::Refused(_))));
+        assert!(matches!(
+            call(&mut s, &id, "  "),
+            Err(DeclineError::Refused(_))
+        ));
         let long = "x".repeat(queue::DEFAULT_MAX_REASON_BYTES + 1);
         assert!(matches!(
-            call(&s, &id, &long),
+            call(&mut s, &id, &long),
             Err(DeclineError::Refused(_))
         ));
         // an entry with no stored redemption behind it
@@ -3281,13 +3314,13 @@ mod tests {
             .add(queue::Entry::open("manual", service(), 5, "m", NOW))
             .unwrap();
         assert!(matches!(
-            call(&s, "manual", "why"),
+            call(&mut s, "manual", "why"),
             Err(DeclineError::Refused(_))
         ));
         // an entry that is already paid
         pay(&s, &request);
         assert!(matches!(
-            call(&s, &id, "why"),
+            call(&mut s, &id, "why"),
             Err(DeclineError::Refused(_))
         ));
         // nothing was signed along the way
@@ -3406,7 +3439,7 @@ mod tests {
         let refused = decline_with(
             &s.logic,
             &s.master,
-            &s.responses,
+            &mut s.responses,
             &s.queue_path,
             &id,
             "too long a reason",
@@ -3417,7 +3450,7 @@ mod tests {
         let done = decline_with(
             &s.logic,
             &s.master,
-            &s.responses,
+            &mut s.responses,
             &s.queue_path,
             &id,
             "short",
@@ -3425,6 +3458,193 @@ mod tests {
             NOW,
         );
         assert!(done.is_ok());
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    // ---- the per-day ledger ----
+
+    fn day_of(s: &Setup, day: u64) -> (u128, u128) {
+        let d = s.responses.ledger().day(day);
+        (d.issued, d.redeemed)
+    }
+
+    #[test]
+    fn a_finished_redemption_is_counted_once_under_each_notes_own_day() {
+        let mut s = setup("ledger");
+        let a = s.held(4 * ONE, service(), PAST);
+        let b = s.held(2 * ONE, service(), PAST2);
+        let (request, _, _) = build_with(
+            &[&a, &b],
+            &[(2 * ONE, service(), PAST), (2 * ONE, service(), PAST2)],
+            &[],
+            MEMO,
+            &service_keypair(),
+            None,
+        );
+        assert_eq!(day_of(&s, PAST), (0, 0));
+        s.run(&request).unwrap();
+        // burned under their own days; the fee and the payout are not reissued,
+        // and the decline outputs wait for a decline
+        assert_eq!(day_of(&s, PAST), (0, u128::from(4 * ONE)));
+        assert_eq!(day_of(&s, PAST2), (0, u128::from(2 * ONE)));
+        // a retry, and a retry after a restart, count nothing more
+        s.run(&request).unwrap();
+        s.responses = Responses::open(&s.dir.join("esp").join("responses.json")).unwrap();
+        s.run(&request).unwrap();
+        assert_eq!(day_of(&s, PAST), (0, u128::from(4 * ONE)));
+        assert_eq!(day_of(&s, PAST2), (0, u128::from(2 * ONE)));
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn rejected_notes_burned_for_the_fee_and_their_refunds_are_counted_under_their_days() {
+        let mut s = setup("ledger-refund");
+        let b = s.held(4 * ONE, service(), FUTURE);
+        let c = s.held(2 * ONE, other(), PAST);
+        let (request, _, _) = build_with(
+            &[&b, &c],
+            &[],
+            &[(2 * ONE, service(), FUTURE), (ONE, other(), PAST)],
+            MEMO,
+            &service_keypair(),
+            None,
+        );
+        s.run(&request).unwrap();
+        assert!(s.is_spent(&b) && s.is_spent(&c));
+        assert_eq!(
+            day_of(&s, FUTURE),
+            (u128::from(2 * ONE), u128::from(4 * ONE))
+        );
+        assert_eq!(day_of(&s, PAST), (u128::from(ONE), u128::from(2 * ONE)));
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_note_left_unburned_by_the_decision_is_not_counted() {
+        let mut s = setup("ledger-unburned");
+        let a = s.held(4 * ONE, service(), PAST);
+        // immature: accepted nothing, and the accepted notes cover the fee
+        // (there is no shortfall to take from it), so it is left alone
+        let b = s.held(2 * ONE, service(), FUTURE);
+        let (request, _, _) = build_with(&[&a, &b], &[], &[], MEMO, &service_keypair(), None);
+        s.run(&request).unwrap();
+        assert!(!s.is_spent(&b));
+        assert_eq!(day_of(&s, FUTURE), (0, 0));
+        assert_eq!(day_of(&s, PAST), (0, u128::from(4 * ONE)));
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_decline_is_counted_under_the_decline_outputs_days_and_survives_a_restart() {
+        let mut s = setup("ledger-decline");
+        let a = s.held(4 * ONE, service(), PAST);
+        let b = s.held(2 * ONE, service(), PAST2);
+        let (request, _, _) = build_with(
+            &[&a, &b],
+            &[(2 * ONE, service(), PAST), (2 * ONE, service(), PAST2)],
+            &[],
+            MEMO,
+            &service_keypair(),
+            None,
+        );
+        s.run(&request).unwrap();
+        let id = request_hash(&request);
+        decline(
+            &s.logic,
+            &s.master,
+            &mut s.responses,
+            &s.queue_path,
+            &id,
+            "terms",
+            NOW + 60,
+        )
+        .unwrap();
+        assert_eq!(day_of(&s, PAST), (u128::from(2 * ONE), u128::from(4 * ONE)));
+        assert_eq!(
+            day_of(&s, PAST2),
+            (u128::from(2 * ONE), u128::from(2 * ONE))
+        );
+        assert!(s.responses.ledger().decline_counted(&id));
+        let reopened = Responses::open(&s.dir.join("esp").join("responses.json")).unwrap();
+        assert_eq!(reopened.ledger(), s.responses.ledger());
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_decline_run_again_after_it_was_counted_and_not_marked_counts_nothing_twice() {
+        use crate::ledger::Movements;
+        let mut s = setup("ledger-decline-crash");
+        let a = s.held(4 * ONE, service(), PAST);
+        let (request, _, _) = build_with(
+            &[&a],
+            &[(2 * ONE, service(), PAST), (ONE, service(), PAST)],
+            &[],
+            MEMO,
+            &service_keypair(),
+            None,
+        );
+        s.run(&request).unwrap();
+        let id = request_hash(&request);
+        // The crash: the ledger took the decline, the queue entry was not marked.
+        let mut m = Movements::new();
+        m.issue(PAST, u128::from(3 * ONE));
+        assert!(s.responses.count_decline(&id, &m).unwrap());
+        s.responses = Responses::open(&s.dir.join("esp").join("responses.json")).unwrap();
+        assert!(s.responses.ledger().decline_counted(&id));
+        // The decline is run again, and finishes.
+        decline(
+            &s.logic,
+            &s.master,
+            &mut s.responses,
+            &s.queue_path,
+            &id,
+            "terms",
+            NOW + 60,
+        )
+        .unwrap();
+        assert_eq!(s.queue().get(&id).unwrap().status, Status::Declined);
+        assert_eq!(day_of(&s, PAST), (u128::from(3 * ONE), u128::from(4 * ONE)));
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_decline_counts_nothing() {
+        let mut s = setup("ledger-decline-refused");
+        let a = s.held(4 * ONE, service(), PAST);
+        let (request, _, _) = build_with(
+            &[&a],
+            &[(2 * ONE, service(), PAST)],
+            &[],
+            MEMO,
+            &service_keypair(),
+            None,
+        );
+        s.run(&request).unwrap();
+        let id = request_hash(&request);
+        let refused = decline_with(
+            &s.logic,
+            &s.master,
+            &mut s.responses,
+            &s.queue_path,
+            &id,
+            "a reason that is far too long",
+            5,
+            NOW,
+        );
+        assert!(matches!(refused, Err(DeclineError::Refused(_))));
+        assert!(!s.responses.ledger().decline_counted(&id));
+        assert_eq!(day_of(&s, PAST), (0, u128::from(4 * ONE)));
+        let unknown = decline(
+            &s.logic,
+            &s.master,
+            &mut s.responses,
+            &s.queue_path,
+            "no-such-entry",
+            "terms",
+            NOW,
+        );
+        assert!(matches!(unknown, Err(DeclineError::Refused(_))));
+        assert!(!s.responses.ledger().decline_counted("no-such-entry"));
         fs::remove_dir_all(&s.dir).unwrap();
     }
 }
