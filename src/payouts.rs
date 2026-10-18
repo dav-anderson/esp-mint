@@ -15,8 +15,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use secp256k1::XOnlyPublicKey;
 use serde::Serialize;
+use sp_wire::ServiceDid;
 
 use crate::queue::{Entry, Paid, Payment, Queue, QueueError, Status, date, dec, usd};
 
@@ -31,7 +31,7 @@ pub struct MemoLine {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Group {
-    /// The service's DID public key (x-only), hex.
+    /// The service's ID: its 33-byte AIR DID, 66 hex characters.
     pub service: String,
     #[serde(with = "dec")]
     pub owed_esp: u128,
@@ -51,12 +51,9 @@ pub struct Group {
 
 /// Sum the open entries per service, services in key order.
 pub fn report(queue: &Queue) -> Result<Vec<Group>, QueueError> {
-    let mut by_service: BTreeMap<[u8; 32], Vec<&Entry>> = BTreeMap::new();
+    let mut by_service: BTreeMap<ServiceDid, Vec<&Entry>> = BTreeMap::new();
     for entry in queue.entries().filter(|e| e.status == Status::Open) {
-        by_service
-            .entry(entry.service.serialize())
-            .or_default()
-            .push(entry);
+        by_service.entry(entry.service).or_default().push(entry);
     }
     let mut groups = Vec::new();
     for (service, mut list) in by_service {
@@ -90,7 +87,7 @@ pub fn report(queue: &Queue) -> Result<Vec<Group>, QueueError> {
             })
             .collect();
         groups.push(Group {
-            service: hex::encode(service),
+            service: service.to_hex(),
             owed_esp: owed,
             owed_usd: usd(owed),
             entries: list.len(),
@@ -174,10 +171,10 @@ pub fn run_payouts(queue_path: &Path, args: &[String]) -> Result<String, String>
     }
 }
 
-pub fn parse_service(text: &str) -> Result<XOnlyPublicKey, String> {
-    let bytes = hex::decode(text.trim()).map_err(|_| "the service must be hex".to_string())?;
-    XOnlyPublicKey::from_slice(&bytes)
-        .map_err(|_| "the service must be a 32 byte x-only key (64 hex characters)".to_string())
+/// A service as typed on the command line: its 33-byte DID in hex. A 32-byte
+/// x-only key (the form before wire version 3) is refused, and the message says so.
+pub fn parse_service(text: &str) -> Result<ServiceDid, String> {
+    ServiceDid::parse(text).map_err(|e| e.to_string())
 }
 
 /// `esp-mint pay <service> <ref> <entry id>... [--mixed-memos]`.
@@ -217,18 +214,18 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-    const OTHER_X: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    const G_DID: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const OTHER_DID: &str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
     /// 2026-10-09 00:00:00 UTC.
     const DAY1: u64 = 20_735 * 86_400;
     const DAY: u64 = 86_400;
 
-    fn xyz() -> XOnlyPublicKey {
-        parse_service(G_X).unwrap()
+    fn xyz() -> ServiceDid {
+        parse_service(G_DID).unwrap()
     }
 
-    fn abc() -> XOnlyPublicKey {
-        parse_service(OTHER_X).unwrap()
+    fn abc() -> ServiceDid {
+        parse_service(OTHER_DID).unwrap()
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -250,7 +247,7 @@ mod tests {
     }
 
     fn pay_args<'a>(
-        service: XOnlyPublicKey,
+        service: ServiceDid,
         payment_ref: &'a str,
         entry_ids: &'a [String],
         now_unix: u64,
@@ -295,7 +292,7 @@ mod tests {
 
         let groups = report(&q).unwrap();
         assert_eq!(groups.len(), 2);
-        let g = groups.iter().find(|g| g.service == G_X).unwrap();
+        let g = groups.iter().find(|g| g.service == G_DID).unwrap();
         assert_eq!(g.owed_esp, 15 * ESP_PER_USD);
         assert_eq!(g.owed_usd, "15.000000000000");
         assert_eq!(g.entries, 2);
@@ -309,7 +306,7 @@ mod tests {
         assert_eq!(g.memos.len(), 1);
         assert_eq!(g.memos[0].memo, "btc:bc1qxyz");
         assert!(!g.memo_mismatch);
-        let other = groups.iter().find(|g| g.service == OTHER_X).unwrap();
+        let other = groups.iter().find(|g| g.service == OTHER_DID).unwrap();
         assert_eq!((other.owed_esp, other.entries), (7 * ESP_PER_USD, 1));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -352,7 +349,7 @@ mod tests {
         let q = Queue::open(&path).unwrap();
         let groups = report(&q).unwrap();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].service, G_X);
+        assert_eq!(groups[0].service, G_DID);
         assert_eq!(groups[0].owed_esp, 4 * ESP_PER_USD);
         assert_eq!(groups[0].entry_ids, ids(&["open"]));
         assert_eq!(
@@ -492,7 +489,7 @@ mod tests {
         let before = fs::read_to_string(&path).unwrap();
 
         // every refusal changes nothing
-        let refused: Vec<(&str, Vec<String>, XOnlyPublicKey)> = vec![
+        let refused: Vec<(&str, Vec<String>, ServiceDid)> = vec![
             ("r", ids(&[]), xyz()),
             ("", ids(&["e1"]), xyz()),
             ("r", ids(&["e1", "missing"]), xyz()),
@@ -556,7 +553,7 @@ mod tests {
         .unwrap();
 
         let text = run_payouts(&path, &[]).unwrap();
-        assert!(text.contains(&format!("service {G_X}")));
+        assert!(text.contains(&format!("service {G_DID}")));
         assert!(text.contains("owed     15.000000000000 USD (15000000000000 ESP)"));
         let json: serde_json::Value =
             serde_json::from_str(&run_payouts(&path, &["--json".to_string()]).unwrap()).unwrap();
@@ -565,9 +562,13 @@ mod tests {
         assert!(run_payouts(&path, &["--nope".to_string()]).is_err());
 
         let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(run_pay(&path, &args(&[G_X, "ref"]), DAY1).is_err());
+        assert!(run_pay(&path, &args(&[G_DID, "ref"]), DAY1).is_err());
         assert!(run_pay(&path, &args(&["zz", "ref", "e1"]), DAY1).is_err());
-        let done = run_pay(&path, &args(&[G_X, "wire-1", "e1", "e2"]), DAY1).unwrap();
+        // The 32-byte x-only form of wire version 2 is refused, with a message that says so.
+        let old_form = &G_DID[2..];
+        let refused = run_pay(&path, &args(&[old_form, "ref", "e1"]), DAY1).unwrap_err();
+        assert!(refused.contains("x-only"), "{refused}");
+        let done = run_pay(&path, &args(&[G_DID, "wire-1", "e1", "e2"]), DAY1).unwrap();
         assert!(done.contains("marked 2 entries completed"));
         assert!(done.contains("15.000000000000 USD") && done.contains("wire-1"));
         assert_eq!(

@@ -224,9 +224,8 @@ mod tests {
     #[test]
     fn the_rule_is_the_one_the_mint_applies_to_a_note() {
         use crate::terms::Terms;
-        let key = secp256k1::XOnlyPublicKey::from_slice(
-            &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-                .unwrap(),
+        let key = sp_wire::ServiceDid::parse(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
         )
         .unwrap();
         for day in [0u64, 1, 20_000, 21_100] {

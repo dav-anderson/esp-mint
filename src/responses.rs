@@ -495,9 +495,8 @@ mod tests {
     fn done(day: u64) -> Entry {
         Entry::Done(ExchangeResponse {
             keyset: String::new(),
-            service: secp256k1::XOnlyPublicKey::from_slice(
-                &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-                    .unwrap(),
+            service: sp_wire::ServiceDid::parse(
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
             )
             .unwrap(),
             redeemable_after_day: day,

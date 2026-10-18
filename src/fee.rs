@@ -11,8 +11,8 @@
 //! |---|---|---|
 //! | one input (a note and its spend signature) | 146 | keyset 8, amount 8, nonce 33, note signature 33, spend signature 64 |
 //! | one output | 41 | amount 8, blind nonce 33 |
-//! | exchange, fixed part | 48 | service 32, output keyset 8, input count 4, output count 4 |
-//! | transfer, fixed part | 120 | service 32, redeemable-after day 8, output keyset 8, input count 4, output count 4, service signature 64 |
+//! | exchange, fixed part | 49 | service 33, output keyset 8, input count 4, output count 4 |
+//! | transfer, fixed part | 121 | service 33, redeemable-after day 8, output keyset 8, input count 4, output count 4, service signature 64 |
 //!
 //! The fee is `rate × size`, in ESP units, at the rate in force when the request
 //! is accepted. It is paid on top of the exact amount: the notes must be worth
@@ -23,12 +23,12 @@
 pub const INPUT_BYTES: u64 = 146;
 /// One output: amount 8, blind nonce 33.
 pub const OUTPUT_BYTES: u64 = 41;
-/// An exchange without its notes and outputs: service 32, output keyset 8 and
+/// An exchange without its notes and outputs: service 33, output keyset 8 and
 /// two counts of 4.
-pub const EXCHANGE_FIXED_BYTES: u64 = 48;
-/// A transfer without its notes and outputs: service 32, day 8, output keyset 8,
+pub const EXCHANGE_FIXED_BYTES: u64 = 49;
+/// A transfer without its notes and outputs: service 33, day 8, output keyset 8,
 /// two counts of 4, service signature 64.
-pub const TRANSFER_FIXED_BYTES: u64 = 120;
+pub const TRANSFER_FIXED_BYTES: u64 = 121;
 
 fn size(fixed: u64, inputs: usize, outputs: usize) -> u64 {
     fixed
@@ -65,10 +65,10 @@ mod tests {
 
     #[test]
     fn sizes_follow_the_fixed_widths() {
-        assert_eq!(exchange_size(0, 0), 48);
-        assert_eq!(exchange_size(1, 1), 48 + 146 + 41);
-        assert_eq!(transfer_size(0, 0), 120);
-        assert_eq!(transfer_size(3, 5), 120 + 3 * 146 + 5 * 41);
+        assert_eq!(exchange_size(0, 0), 49);
+        assert_eq!(exchange_size(1, 1), 49 + 146 + 41);
+        assert_eq!(transfer_size(0, 0), 121);
+        assert_eq!(transfer_size(3, 5), 121 + 3 * 146 + 5 * 41);
     }
 
     #[test]

@@ -955,9 +955,8 @@ mod tests {
     }
 
     fn done(day: u64) -> Entry {
-        let service = secp256k1::XOnlyPublicKey::from_slice(
-            &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-                .unwrap(),
+        let service = sp_wire::ServiceDid::parse(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
         )
         .unwrap();
         Entry::Done(sp_wire::esp::exchange::ExchangeResponse {

@@ -10,7 +10,7 @@ ESP does not use one key per denomination. Every combination of amount and terms
 key = SHA-256("esp-mint/key/v1" || master || amount || service || redeemable_after_day || counter)
 ```
 
-- `master` is 32 bytes, `amount` and `redeemable_after_day` are 8 bytes big-endian, `service` is 32 bytes, and `counter` is one byte starting at 0.
+- `master` is 32 bytes, `amount` and `redeemable_after_day` are 8 bytes big-endian, `service` is 33 bytes (the service's AIR DID, as in the terms), and `counter` is one byte starting at 0.
 - If the hash is not a valid secp256k1 secret key, the counter goes up by one and the hash is taken again. This has a negligible chance of happening.
 - The tests include known answers computed with an independent Python implementation.
 - The mint returns the matching public key with each signature, because the wallet needs it to unblind.
@@ -34,7 +34,7 @@ The master secret is a file of 64 hex characters, `master_secret.hex`, with `060
 
 ## The exchange
 
-1. The wallet sends PSP notes and blinded outputs to the ESP mint, along with the service ID it wants. It does not send a date. Every output amount must be a power of two (see "ESP amounts are powers of two"), and a request holds at most 1000 notes and 1000 outputs. The smallest exchange is 1 PSP ($0.10, 10^11 ESP) by default (`exchange.min_psp`).
+1. The wallet sends PSP notes and blinded outputs to the ESP mint, along with the service ID it wants (the service's AIR DID: its 33-byte compressed public key, 66 hex characters). It does not send a date. Every output amount must be a power of two (see "ESP amounts are powers of two"), and a request holds at most 1000 notes and 1000 outputs. The smallest exchange is 1 PSP ($0.10, 10^11 ESP) by default (`exchange.min_psp`).
 2. The PSP notes, times 10^11, must equal the total of the ESP outputs exactly, or the request is refused before anything is burned. See "Exact amounts and the minimum". The mint charges no exchange fee. The request is an AIR message, and its cost is paid in AIR currency and charged by AIR messaging, not by this mint.
 3. The mint checks everything it can before it burns: no other unfinished request holds any of the PSP notes or output blind nonces (see "Reservation" below), the output blind nonces are unused, the PSP notes are unspent at the PSP (`/burns`), and every note's spend signature verifies over the memo below. The spend signatures are public to check, and they cover the memo, so only the holder of the notes can authorize this request.
 4. The ESP mint calls the PSP's `/melt` with the notes. The memo is the hex of `SHA-256("esp-mint/exchange/v1" || service || each output's amount and blind nonce)`, and the wallet's spend signatures cover that memo. The burn is bound to this one request. The PSP keeps the memo of every burn (see "Burn memos" below). The mint checks that the PSP burned exactly the amount it expected.
@@ -85,7 +85,7 @@ The exchange calls the PSP twice (a look at the notes, then the burn) and a PSP 
 
 **What this does not change.** The lock is still taken for every phase that reads or writes the mint, so everything the mint writes is still written by one request at a time. The checks, their order and their answers are the same. The one new answer is `409 in_progress`; the code is `server::IN_PROGRESS` and is not in `sp-wire` yet.
 
-**Wallet.** `ecash-wallet exchange --service <x-only hex> --psp N` builds this request, sends it to `/exchange` and unblinds the reply into ESP notes (see the ecash-wallet README). The wallet picks PSP notes worth at least N and asks for all of their value, so the request is always exact: N PSP of ESP, plus any difference as extra ESP notes under the same terms (change). It saves the request, the blinding factors and the new spend keys before sending, so after a timeout `exchange --resume <id>` sends the same request again and gets the stored response. A `400` means nothing was burned and the wallet frees its PSP notes. Each ESP note is stored with its spend key, its amount and its terms (service and redeemable-after day).
+**Wallet.** `ecash-wallet exchange --service <DID hex> --psp N` builds this request, sends it to `/exchange` and unblinds the reply into ESP notes (see the ecash-wallet README). The wallet picks PSP notes worth at least N and asks for all of their value, so the request is always exact: N PSP of ESP, plus any difference as extra ESP notes under the same terms (change). It saves the request, the blinding factors and the new spend keys before sending, so after a timeout `exchange --resume <id>` sends the same request again and gets the stored response. A `400` means nothing was burned and the wallet frees its PSP notes. Each ESP note is stored with its spend key, its amount and its terms (service and redeemable-after day).
 
 ## Wire format and versions
 
@@ -93,12 +93,14 @@ The request and response bodies, the terms, the canonical redeem encoding, the r
 
 `GET /health` returns `wire_version`, the crate's `WIRE_VERSION`. **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves.
 
+**Wire version 3: the service ID is the 33-byte DID.** Before it, a service was named by its 32-byte x-only key. Now every service in the terms, the exchange, transfer, rollover and redeem requests, the queue and the payout report is the full DID, `sp_wire::ServiceDid` (66 hex characters in JSON and on the command line). What this changes in the mint: the terms are 41 bytes, so **every key the mint derives is different** (the terms are an input of the key derivation, `src/keys.rs`) and a note issued under version 2 does not verify; the transfer and redeem digests and request hashes cover 33-byte services; the redeem encoding is version 3 and its sizes are 120 / 187 / 82; the canonical sizes of an exchange and a transfer (`src/fee.rs`) are one byte larger (49 and 121 fixed); and `queue.json` and `responses.json` written before it do not load, since they hold x-only services. There is no migration and no dual format (nothing was live). A signature is still BIP340, made and checked against the x-only half of the DID (`ServiceDid::x_only`), which is never used as an ID. The parity byte is part of the ID: `02<x>` and `03<x>` are two services that share one x-only key, and a note or request naming one is `WrongService` for a request signed as the other.
+
 ## Transfer to the service
 
 An app that pays a service with ESP hands the service the notes, and with them each note's spend secret. The app cannot spend those notes itself, because transfer and redeem both need the service's signature. The risk is that the same note is presented twice, to the same service or to different ones, so a note the service was handed may already have been used. When it accepts ESP notes, the service asks the ESP mint to swap them for fresh notes that only the service controls, with the same terms. A note can be swapped only once, so a second presentation fails. This also covers the design doc's step of checking that the points have not been spent, so there is no separate verify call.
 
-- **Request.** `POST /transfer` takes the service (x-only), the redeemable-after day, the ESP inputs, the blinded outputs the service chose, and the service's signature. One request covers one set of terms, and a request holds at most 1000 inputs and 1000 outputs.
-- **Digest.** `SHA-256("esp-mint/transfer/v1" || service || redeemable_after_day || input count || each input's amount and nonce || output count || each output's amount and blind nonce)`. The terms are 40 bytes (the service, then the day, big-endian). Every input is signed over the digest by the note's own nonce key, which the service now holds, and the service signs it with its key (Schnorr, x-only, the key named in the terms). The spend signatures are not part of the digest.
+- **Request.** `POST /transfer` takes the service (its 33-byte DID), the redeemable-after day, the ESP inputs, the blinded outputs the service chose, and the service's signature. One request covers one set of terms, and a request holds at most 1000 inputs and 1000 outputs.
+- **Digest.** `SHA-256("esp-mint/transfer/v1" || service || redeemable_after_day || input count || each input's amount and nonce || output count || each output's amount and blind nonce)`. The terms are 41 bytes (the service's DID, then the day, big-endian). Every input is signed over the digest by the note's own nonce key, which the service now holds, and the service signs it with its key (Schnorr, checked against the x-only half of the DID named in the terms). The spend signatures are not part of the digest.
 - **Only the named service.** The service signature is checked first. Each input is then checked against the key the mint derives for its amount and for the request's terms, so a note named for another service, or for another day, does not verify (`BadNote`). The outputs are signed under the same terms, so the new notes name the same service and the same day. An app cannot move ESP to another service or to a peer: nothing it can sign changes whose key must sign the request.
 - **Exact.** The inputs and the outputs must have the same total, summed in `u128`, or the request is refused before anything is burned, with an error that says whether it is over or short and by how much. Zero amounts, amounts that are not a power of two (inputs and outputs both), repeated inputs and repeated output blind nonces are refused. There is no minimum.
 - **No fee.** The request is an AIR message, and the AIR send fee covers it. The mint charges nothing.
@@ -123,7 +125,7 @@ The pending entry also keeps other requests away, as the exchange's does (see "R
 
 `POST /redeem` on the public listener; the payout queue and the operator's routes are on the loopback admin listener.
 
-Only the owner of a service's DID key may redeem ESP for that service. The service ID in a note's terms is that DID public key (x-only). Holders cannot cash out at the mint: they spend or transfer their notes to the service (see "Transfer to the service"), and the service redeems.
+Only the owner of a service's DID key may redeem ESP for that service. The service ID in a note's terms is that DID, the full 33-byte compressed key (the parity byte is part of the ID; the x-only half is only what a signature is checked against). Holders cannot cash out at the mint: they spend or transfer their notes to the service (see "Transfer to the service"), and the service redeems.
 
 ### The request and its encoding
 
@@ -131,24 +133,24 @@ The body of `POST /redeem` is one binary encoding, not JSON, so that its length 
 
 | Field | Bytes | What it is |
 |---|---|---|
-| version | 1 | `2`. Version 1 (no keysets) is refused with a message saying so; any other value is refused. |
-| service | 32 | The service's x-only DID key. |
+| version | 1 | `3`. Version 1 (no keysets) and version 2 (services named by their 32-byte x-only key) are refused with a message saying so; any other value is refused. |
+| service | 33 | The service's AIR DID (compressed key). |
 | output keyset | 8 | The keyset the decline and refund outputs ask to be signed by. |
 | input count | 4 | |
-| each input | **186** | claimed service 32, claimed redeemable-after day 8, keyset 8 (the set that signed the note), amount 8, note nonce 33, note signature 33, spend signature 64 |
+| each input | **187** | claimed service 33, claimed redeemable-after day 8, keyset 8 (the set that signed the note), amount 8, note nonce 33, note signature 33, spend signature 64 |
 | memo length | 2 | At most `redeem.max_memo_bytes` (256), not empty. |
 | memo | 0 to 256 | The payout destination, UTF-8. |
 | decline output count | 4 | |
-| each decline output | **81** | service 32, redeemable-after day 8, amount 8, blind nonce 33 |
+| each decline output | **82** | service 33, redeemable-after day 8, amount 8, blind nonce 33 |
 | refund output count | 4 | |
-| each refund output | **81** | same shape |
+| each refund output | **82** | same shape |
 | service signature | 64 | Schnorr, by the service's DID key. |
 
-So the **size** is `119 + 186 × notes + memo bytes + 81 × (decline outputs + refund outputs)`. Every field is fixed size except the memo (at most 256 bytes) and, on the operator's decline, the reason (at most 1024 bytes, UTF-8). There are no other free-form fields. Decoding is strict: the length must match exactly, keys must be valid points, counts are checked against the bytes that remain before anything is allocated, and an unknown version, a trailing byte or a bad memo is refused as `malformed_request`.
+So the **size** is `120 + 187 × notes + memo bytes + 82 × (decline outputs + refund outputs)`. Every field is fixed size except the memo (at most 256 bytes) and, on the operator's decline, the reason (at most 1024 bytes, UTF-8). There are no other free-form fields. Decoding is strict: the length must match exactly, keys must be valid points, counts are checked against the bytes that remain before anything is allocated, and an unknown version, a trailing byte or a bad memo is refused as `malformed_request`.
 
 - **Each input is tagged** with the service and the redeemable-after day it claims. The mint checks the note against the key it derives for that amount and that tag. A tag naming another service is `WrongService`; a tag that does not match the note is `BadProof`. The tags are part of the request hash.
 - **Digest and hash.** The digest every signature covers is `SHA-256("esp-mint/redeem/v2" || the encoding without the spend signatures and the service signature)`. Each input is signed over it by the note's own nonce key, and the service signs it with its DID key. The request hash, which is the key everything is stored under, is `SHA-256("esp-mint/redeem-request/v2" || the whole encoding)`.
-- **Measured sizes.** One input is 186 bytes and one output is 81 (the keysets add 8 bytes per input and 8 for the output keyset). With one output per note that is 267 bytes a note, so the briefing's example of 10,000 users with about 22 power-of-two notes each (220,000 notes) is about 58.7 MB (56.0 MiB), under the 64 MiB (67,108,864 byte) ceiling. If the service asks for one decline output per date rather than per note, which is what the wallet does by default, the inputs dominate: 220,000 × 186 is about 40.9 MB. The ceiling would fit about 360,800 notes with a 40-byte memo and no outputs. The estimate of 50 to 60 MB is therefore right for one output per note and high for the usual one output per date. In practice small payments happen in FSP, so a redemption carries a few large notes per user, far fewer than 22.
+- **Measured sizes.** One input is 187 bytes and one output is 82 (the keysets add 8 bytes per input and 8 for the output keyset; each service is its 33-byte DID). With one output per note that is 269 bytes a note, so the briefing's example of 10,000 users with about 22 power-of-two notes each (220,000 notes) is about 59.2 MB (56.4 MiB), under the 64 MiB (67,108,864 byte) ceiling. If the service asks for one decline output per date rather than per note, which is what the wallet does by default, the inputs dominate: 220,000 × 187 is about 41.1 MB. The ceiling would fit about 358,800 notes with a 40-byte memo and no outputs. The estimate of 50 to 60 MB is therefore right for one output per note and high for the usual one output per date. In practice small payments happen in FSP, so a redemption carries a few large notes per user, far fewer than 22.
 
 ### The fee
 
@@ -156,8 +158,8 @@ So the **size** is `119 + 186 × notes + memo bytes + 81 × (decline outputs + r
 
 | Request | Size | Fee at 10^6 units a byte |
 |---|---|---|
-| 5 notes, 1 decline output, 40-byte memo | 119 + 930 + 40 + 81 = 1,170 bytes | 1,170,000,000 |
-| 1 note, no outputs, 40-byte memo | 345 bytes | 345,000,000 |
+| 5 notes, 1 decline output, 40-byte memo | 120 + 935 + 40 + 82 = 1,177 bytes | 1,177,000,000 |
+| 1 note, no outputs, 40-byte memo | 347 bytes | 347,000,000 |
 | a 64 MiB request (the ceiling) | 67,108,864 bytes | 67,108,864,000,000 |
 
 **Why it is per byte.** If a fee is set, it is charged per byte because what a request costs the mint grows with its size, while a typical request of a few notes is about a kilobyte. With the default of 0 a request of any size pays nothing, so the ceiling on one request (`redeem.max_request_bytes`) and the limits on outputs are what bound it.
@@ -221,7 +223,7 @@ Redemption entries are paid by hand (see [DESIGN.md](DESIGN.md), "Redemption"). 
 
 **The report.** `esp-mint payouts` prints it as text and `esp-mint payouts --json` as JSON. For each service with open entries it shows:
 
-- the service ID (its DID public key, x-only hex);
+- the service ID (its 33-byte DID, 66 hex characters);
 - the total owed in ESP and in USD at 10^12 ESP per $1 (exact, 12 decimal places), summed in `u128`;
 - the number of entries, and the dates of the oldest and newest;
 - the entry IDs, oldest first;
@@ -260,7 +262,7 @@ After the size, every route checks in the same order, cheapest first, and nothin
 
 Both default to 0: there is no mint fee, and behavior is as it was. They are 0 because those requests are AIR messages whose cost the AIR charges, and a mint fee on top would charge twice. The setting is there so the operator can set one without a code change. If `exchange.fee_per_byte` or `transfer.fee_per_byte` is set above 0:
 
-- The fee is `rate × canonical size`, in ESP units, where the canonical size depends only on how many notes and outputs the request has: **exchange** `48 + 146 × PSP notes + 41 × outputs` bytes; **transfer** `120 + 146 × notes + 41 × outputs` bytes (a note is its keyset 8, amount 8, nonce 33, note signature 33, spend signature 64; an output is amount 8, blind nonce 33; the fixed parts are the service, the output keyset, the counts, and for a transfer the day and the service signature). The size does not depend on the JSON, so the wallet knows the fee before it picks its output amounts.
+- The fee is `rate × canonical size`, in ESP units, where the canonical size depends only on how many notes and outputs the request has: **exchange** `49 + 146 × PSP notes + 41 × outputs` bytes; **transfer** `121 + 146 × notes + 41 × outputs` bytes (a note is its keyset 8, amount 8, nonce 33, note signature 33, spend signature 64; an output is amount 8, blind nonce 33; the fixed parts are the service, the output keyset, the counts, and for a transfer the day and the service signature). The size does not depend on the JSON, so the wallet knows the fee before it picks its output amounts.
 - It is paid in ESP on top of the exact amount: the notes must be worth the outputs **plus** the fee, and the request is still checked as exact against that total. An exchange of 1 PSP at 1000 ESP units a byte, one note and one output (235 bytes), has a fee of 235,000 ESP units, so its output is 10^11 − 235,000. The fee comes out of what the wallet asks for, so the wallet never needs a second note to pay it.
 - A request that is not exact against that total is refused before anything is burned, with `code: "not_exact"` and the `fee_esp`, `size_bytes`, `fee_per_byte`, `paid_esp`, `outputs_esp` and `required_esp` the wallet needs to rebuild it.
 - `GET /fees` returns the rates, ceilings, limits and size formulas now in force for all three routes, so a wallet reads them rather than assuming.
@@ -386,9 +388,9 @@ The mint needs no delete, no rollback of a write, and no ordering between two di
 
 ## Storage policy (setting only)
 
-`storage.mint_state` (`ESP_STORAGE_MINT_STATE`) names the AIR services that will keep this mint's state: an ordered list of service IDs, index 0 the primary and the rest secondaries in promotion order. A service ID is a 32-byte x-only key in hex (64 characters); a 33-byte DID key is accepted and reduced to it. In the environment the IDs are comma-separated; in `esp-mint.toml` the value is an array of strings or one string. One entry is valid (that service holds the state and the mint keeps a local backup copy); empty, the default, means local only; at most 8, no duplicates, no empty entry. The parser and checks are `sp_wire::storage` (sp-wire), shared by all three mints and the wallet, so a list means the same thing everywhere.
+`storage.mint_state` (`ESP_STORAGE_MINT_STATE`) names the AIR services that will keep this mint's state: an ordered list of service IDs, index 0 the primary and the rest secondaries in promotion order. A service ID is the service's AIR DID: a 33-byte compressed key in hex (66 characters, starting `02` or `03`). The 32-byte x-only form is refused with a message that says to use the DID. In the environment the IDs are comma-separated; in `esp-mint.toml` the value is an array of strings or one string. One entry is valid (that service holds the state and the mint keeps a local backup copy); empty, the default, means local only; at most 8, no duplicates, no empty entry. The parser and checks are `sp_wire::storage` (sp-wire), shared by all three mints and the wallet, so a list means the same thing everywhere.
 
-This is configuration and validation only. **Nothing reads or writes the AIR yet:** the state is still in local files, whatever the list says. The mint logs the list at startup like any setting (it is a restart setting: `SIGHUP` keeps the running list and says a change needs a restart, because only the mint itself will change its list, when it promotes a secondary). What the list will do, and what the mint's storage layer must then provide (eight numbered requirements: 1 a spend is written to the primary and at least one secondary before the mint answers, batched; 2 a local backup copy with one service; 3 only the mint promotes a secondary and updates its config; 4 writes carry a sequence number, so a returning primary is overwritten from the working copy; 5 the wallet file carries a version and is merged; 6 networks stay apart; 7 the mint's own local copy is the last fallback, fsynced and capped; 8 a request's finishing entry and its ledger movements are one atomic write, which only esp-mint's per-day ledger needs), is that list: it is the whole set, and nothing else is promised. That replication belongs in mint-core's storage layer and is a candidate for AIR upstream. If the primary and every secondary are unreachable, the mint's own local copy becomes the primary, as the last entry in the storage order: every spend is fsynced before the mint answers, unreplicated spends are queued and replicated in order to the first service that comes back (which becomes primary again), the number of unreplicated spends is capped by an operator setting (count and/or time) with spends refused at the cap, and `/health` reports a degraded state throughout. None of this is built, and the cap settings do not exist yet.
+This is configuration and validation only. **Nothing reads or writes the AIR yet:** the state is still in local files, whatever the list says. The mint logs the list at startup like any setting (it is a restart setting: `SIGHUP` keeps the running list and says a change needs a restart, because only the mint itself will change its list, when it promotes a secondary). What the list will do, and what the mint's storage layer must then provide (eight numbered requirements: 1 a spend is written to the primary and at least one secondary before the mint answers, batched; 2 a local backup copy with one service; 3 only the mint promotes a secondary and updates its config; 4 writes carry a sequence number, so a returning primary is overwritten from the working copy; 5 the wallet file carries a version and is merged; 6 networks stay apart; 7 the mint's own local copy is the primary, fsynced, with external services as backup only and no cap; 8 a request's finishing entry and its ledger movements are one atomic write, which only esp-mint's per-day ledger needs), is that list: it is the whole set, and nothing else is promised. That replication belongs in mint-core's storage layer and is a candidate for AIR upstream. The mint's own local copy is the primary and every listed service is a backup (decided 2026-10-17): every spend is fsynced before the mint answers and replicated to the backups while they are reachable; while every backup is unreachable, unreplicated spends are queued and copied out in order to the first backup that returns. There is no cap: the mint carries on with no limit and never refuses or holds spends for replication, and `/health` only reports a degraded state while backups are behind. None of this is built.
 
 ## Running as a service
 

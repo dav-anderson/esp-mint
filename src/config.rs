@@ -289,9 +289,9 @@ pub const SPECS: &[Spec] = &[
         key: "storage.mint_state",
         env: "ESP_STORAGE_MINT_STATE",
         default: "",
-        units: "service IDs",
+        units: "service DIDs (66 hex characters)",
         reload: false,
-        what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is a 32-byte x-only key in hex (64 characters); a 33-byte DID key is reduced to it. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
+        what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is the service's AIR DID, a 33-byte compressed key in hex (66 characters, starting 02 or 03); the old 32-byte x-only form is refused. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
     },
 ];
 
@@ -916,8 +916,8 @@ mod tests {
 
     #[test]
     fn the_storage_policy_comes_from_the_file_and_the_environment() {
-        const A: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-        const B: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        const A: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        const B: &str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
         let dir = scratch("storage");
         let first = load(&dir, &no_env).unwrap();
         assert!(first.config.storage_mint_state.is_local_only());
@@ -938,10 +938,8 @@ mod tests {
             format!("{A},{B}")
         );
 
-        // The environment wins over the file. One entry is valid, and a DID key
-        // is reduced to its service.
-        let did = format!("02{A}");
-        let l = load(&dir, &env_of(&[("ESP_STORAGE_MINT_STATE", did.as_str())])).unwrap();
+        // The environment wins over the file. One entry is valid.
+        let l = load(&dir, &env_of(&[("ESP_STORAGE_MINT_STATE", A)])).unwrap();
         assert_eq!(l.config.storage_mint_state.to_config_string(), A);
         assert!(l.config.storage_mint_state.secondaries().is_empty());
         assert_eq!(
@@ -974,6 +972,10 @@ mod tests {
         assert!(p.iter().any(|x| x.contains("entry 2")), "{p:?}");
         let p = load(&dir, &env_of(&[("ESP_STORAGE_MINT_STATE", "not-a-key")])).unwrap_err();
         assert!(p.iter().any(|x| x.contains("must be hex")), "{p:?}");
+        // The 32-byte x-only form of wire version 2 is refused, and says why.
+        let old_form = &A[2..];
+        let p = load(&dir, &env_of(&[("ESP_STORAGE_MINT_STATE", old_form)])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("x-only")), "{p:?}");
         fs::write(dir.join(FILE_NAME), "[storage]\nmint_state = [1]\n").unwrap();
         let p = load(&dir, &no_env).unwrap_err();
         assert!(p.iter().any(|x| x.contains("list of strings")), "{p:?}");

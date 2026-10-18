@@ -33,7 +33,8 @@ use mint_types::{
     Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, gen_denominations, melt_sighash,
 };
 use rand::rngs::OsRng;
-use secp256k1::{Keypair, SECP256K1, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1};
+use sp_wire::ServiceDid;
 use tokio::runtime::Runtime;
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -53,8 +54,8 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-fn service() -> XOnlyPublicKey {
-    XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
+fn service() -> ServiceDid {
+    ServiceDid::parse(&format!("02{G_X}")).unwrap()
 }
 
 fn serve(rt: &Runtime, app: Router) -> String {

@@ -78,9 +78,10 @@ use mint_core::MintLogic;
 #[cfg(test)]
 use mint_types::MintOutput;
 use mint_types::{MintInput, MintOutputError};
-use secp256k1::{SECP256K1, XOnlyPublicKey};
+use secp256k1::SECP256K1;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sp_wire::ServiceDid;
 
 use crate::keys::MasterSecret;
 use crate::ledger::Movements;
@@ -392,21 +393,16 @@ fn internal<E: ToString>(e: E) -> RedeemError {
 
 /// Amounts by service and day, in a stable order.
 #[derive(Default)]
-struct ByTerms(BTreeMap<([u8; 32], u64), (XOnlyPublicKey, u128)>);
+struct ByTerms(BTreeMap<(ServiceDid, u64), (ServiceDid, u128)>);
 
 impl ByTerms {
-    fn add(&mut self, service: XOnlyPublicKey, day: u64, units: u128) {
-        let slot = self
-            .0
-            .entry((service.serialize(), day))
-            .or_insert((service, 0));
+    fn add(&mut self, service: ServiceDid, day: u64, units: u128) {
+        let slot = self.0.entry((service, day)).or_insert((service, 0));
         slot.1 += units;
     }
 
-    fn get(&self, service: &XOnlyPublicKey, day: u64) -> u128 {
-        self.0
-            .get(&(service.serialize(), day))
-            .map_or(0, |slot| slot.1)
+    fn get(&self, service: &ServiceDid, day: u64) -> u128 {
+        self.0.get(&(*service, day)).map_or(0, |slot| slot.1)
     }
 
     fn total(&self) -> u128 {
@@ -758,7 +754,11 @@ pub fn redeem_gens(
 
     // Only the service may ask. Checked before anything else touches the mint.
     SECP256K1
-        .verify_schnorr(&request.service_signature, &digest, &request.service)
+        .verify_schnorr(
+            &request.service_signature,
+            &digest,
+            &request.service.x_only(),
+        )
         .map_err(|_| RedeemRejection::BadServiceSignature)?;
 
     let recovering = stored_plan.is_some();
@@ -1181,11 +1181,12 @@ mod tests {
         .unwrap()
     }
 
-    fn service() -> XOnlyPublicKey {
-        XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
+    /// The DID of `service_keypair()`: `02` and the x coordinate `G_X`.
+    fn service() -> ServiceDid {
+        ServiceDid::parse(&format!("02{G_X}")).unwrap()
     }
 
-    /// The key whose x-only public key is `G_X`: secret key 1.
+    /// The key whose public key is the DID `02` + `G_X`: secret key 1.
     fn service_keypair() -> Keypair {
         let mut bytes = [0u8; 32];
         bytes[31] = 1;
@@ -1199,8 +1200,8 @@ mod tests {
         Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&bytes).unwrap())
     }
 
-    fn other() -> XOnlyPublicKey {
-        other_keypair().x_only_public_key().0
+    fn other() -> ServiceDid {
+        ServiceDid::from(other_keypair().public_key())
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -1256,7 +1257,7 @@ mod tests {
         note: Note,
         key: Keypair,
         units: u64,
-        service: XOnlyPublicKey,
+        service: ServiceDid,
         day: u64,
     }
 
@@ -1265,17 +1266,17 @@ mod tests {
         nonce: Nonce,
         blinding_key: SecretKey,
         amount: u64,
-        service: XOnlyPublicKey,
+        service: ServiceDid,
         day: u64,
     }
 
     /// (units, service, day)
-    type Out = (u64, XOnlyPublicKey, u64);
+    type Out = (u64, ServiceDid, u64);
 
     /// Split `total` into exactly `n` outputs that are powers of two, under the
     /// same terms: the bits of `total`, then the largest output halved until
     /// there are `n`. Needs `popcount(total) <= n <= total`.
-    fn split_out_into(total: u64, n: usize, service: XOnlyPublicKey, day: u64) -> Vec<Out> {
+    fn split_out_into(total: u64, n: usize, service: ServiceDid, day: u64) -> Vec<Out> {
         let mut outs = split_out(total, service, day);
         while outs.len() < n {
             let i = outs.iter().position(|o| o.0 > 1).unwrap();
@@ -1305,7 +1306,7 @@ mod tests {
 
     /// A total split into powers of two, the way the wallet does: one output for
     /// each bit set, largest first, all under the same terms.
-    fn split_out(total: u64, service: XOnlyPublicKey, day: u64) -> Vec<Out> {
+    fn split_out(total: u64, service: ServiceDid, day: u64) -> Vec<Out> {
         (0..64)
             .rev()
             .map(|bit| 1u64 << bit)
@@ -1324,7 +1325,7 @@ mod tests {
 
     impl Setup {
         /// A note the mint has issued under these terms.
-        fn held(&self, units: u64, service: XOnlyPublicKey, day: u64) -> Held {
+        fn held(&self, units: u64, service: ServiceDid, day: u64) -> Held {
             let terms = Terms {
                 service,
                 redeemable_after_day: day,
@@ -1548,10 +1549,10 @@ mod tests {
         build_with(ins, decline, refund, MEMO, &service_keypair(), None).0
     }
 
-    /// 207 bytes, so that a request of one note and no outputs is 512 bytes.
-    const MEMO: &str = "btc:bc1qpayhere-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-    /// 126 bytes, so that a request of one note and one output is 512 bytes.
-    const SHORT_MEMO: &str = "btc:bc1qpayhere-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    /// 205 bytes, so that a request of one note and no outputs is 512 bytes.
+    const MEMO: &str = "btc:bc1qpayhere-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    /// 123 bytes, so that a request of one note and one output is 512 bytes.
+    const SHORT_MEMO: &str = "btc:bc1qpayhere-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 
     fn rejection(result: Result<RedeemResponse, RedeemError>) -> RedeemRejection {
         match result {
@@ -1561,7 +1562,7 @@ mod tests {
     }
 
     /// The same note, claimed under other terms.
-    fn claiming(h: &Held, service: XOnlyPublicKey, day: u64) -> Held {
+    fn claiming(h: &Held, service: ServiceDid, day: u64) -> Held {
         Held {
             service,
             day,
@@ -2605,8 +2606,8 @@ mod tests {
             &[(ONE, other(), PAST2), (1, service(), PAST)],
         );
         let bytes = request.encode();
-        // 119 + 186 * 2 + the memo + 81 * 3
-        assert_eq!(bytes.len(), 119 + 372 + MEMO.len() + 243);
+        // 120 + 187 * 2 + the memo + 82 * 3
+        assert_eq!(bytes.len(), 120 + 374 + MEMO.len() + 246);
         assert_eq!(request.encoded_len(), bytes.len() as u64);
         assert_eq!(encoded_len(2, MEMO.len(), 1, 2), bytes.len() as u64);
         assert_eq!(bytes[0], FORMAT_VERSION);
@@ -2624,22 +2625,22 @@ mod tests {
 
     #[test]
     fn one_input_and_one_output_have_the_sizes_the_readme_gives() {
-        assert_eq!(INPUT_BYTES, 186);
-        assert_eq!(OUTPUT_BYTES, 81);
-        assert_eq!(FIXED_BYTES, 119);
+        assert_eq!(INPUT_BYTES, 187);
+        assert_eq!(OUTPUT_BYTES, 82);
+        assert_eq!(FIXED_BYTES, 120);
         // an empty memo is not allowed, but the arithmetic still holds
-        assert_eq!(encoded_len(0, 0, 0, 0), 119);
-        assert_eq!(encoded_len(1, 0, 0, 0), 305);
-        assert_eq!(encoded_len(0, 0, 1, 0), 200);
+        assert_eq!(encoded_len(0, 0, 0, 0), 120);
+        assert_eq!(encoded_len(1, 0, 0, 0), 307);
+        assert_eq!(encoded_len(0, 0, 1, 0), 202);
         // 220,000 notes with one output each: about 59 MB
         assert_eq!(
             encoded_len(220_000, 40, 220_000, 0),
-            119 + 220_000 * 267 + 40
+            120 + 220_000 * 269 + 40
         );
         assert!(encoded_len(220_000, 40, 220_000, 0) < DEFAULT_MAX_REQUEST_BYTES as u64);
-        // and the ceiling is a little over 377,000 notes with none coming back
+        // and the ceiling is about 358,000 notes with none coming back
         let most = (DEFAULT_MAX_REQUEST_BYTES as u64 - FIXED_BYTES - 40) / INPUT_BYTES;
-        assert_eq!(most, 360_799);
+        assert_eq!(most, 358870);
     }
 
     #[test]
@@ -2650,8 +2651,8 @@ mod tests {
         assert_eq!(fee_for(1000, EXAMPLE_RATE), 1_000_000_000);
         // a typical request: five notes, one decline output, a 40 byte memo
         let typical = encoded_len(5, 40, 1, 0);
-        assert_eq!(typical, 119 + 930 + 40 + 81);
-        assert_eq!(fee_for(typical, EXAMPLE_RATE), 1_170_000_000);
+        assert_eq!(typical, 120 + 935 + 40 + 82);
+        assert_eq!(fee_for(typical, EXAMPLE_RATE), 1_177_000_000);
         // a request at the ceiling
         let ceiling = DEFAULT_MAX_REQUEST_BYTES as u64;
         assert_eq!(ceiling, 67_108_864);
@@ -2674,13 +2675,13 @@ mod tests {
         assert_eq!(r.size_bytes, small.encode().len() as u64);
         assert_eq!(r.fee_esp, RATE * u128::from(r.size_bytes));
         assert_eq!(r.owed_esp, u128::from(4 * ONE) - r.fee_esp);
-        // a second note in the request costs 186 bytes more
+        // a second note in the request costs 187 bytes more
         let mut other_setup = setup("fee-from-size-2");
         let c = other_setup.held(4 * ONE, service(), PAST);
         let d = other_setup.held(4 * ONE, service(), PAST);
         let r2 = other_setup.run(&build(&[&c, &d], &[], &[])).unwrap();
-        assert_eq!(r2.size_bytes, r.size_bytes + 186);
-        assert_eq!(r2.fee_esp, r.fee_esp + RATE * 186);
+        assert_eq!(r2.size_bytes, r.size_bytes + 187);
+        assert_eq!(r2.fee_esp, r.fee_esp + RATE * 187);
         // the memo is in the size
         let e = other_setup.held(4 * ONE, service(), PAST);
         let longer = format!("{MEMO}-and-a-bit-more");
@@ -2712,25 +2713,28 @@ mod tests {
         assert!(decode(&longer).unwrap_err().contains("after its end"));
         // another version
         let mut v = bytes.clone();
-        v[0] = 3;
+        v[0] = 4;
         assert!(decode(&v).unwrap_err().contains("version"));
         // version 1, which names no keysets
         v[0] = 1;
         assert!(decode(&v).unwrap_err().contains("no keysets"));
-        // a service key that is not a point
+        // version 2, which names each service by its x-only key
+        v[0] = 2;
+        assert!(decode(&v).unwrap_err().contains("x-only"));
+        // a service ID that is not a point
         let mut bad_key = bytes.clone();
-        bad_key[1..33].copy_from_slice(&[0xff; 32]);
+        bad_key[1..34].copy_from_slice(&[0xff; 33]);
         assert!(decode(&bad_key).is_err());
         // a nonce that is not a point
         let mut bad_nonce = bytes.clone();
-        bad_nonce[101..134].copy_from_slice(&[0u8; 33]);
+        bad_nonce[103..136].copy_from_slice(&[0u8; 33]);
         assert!(decode(&bad_nonce).is_err());
         // a count that is larger than the body, with nothing allocated for it
         let mut huge = bytes.clone();
-        huge[41..45].copy_from_slice(&u32::MAX.to_be_bytes());
+        huge[42..46].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(decode(&huge).unwrap_err().contains("counts more"));
         // a memo longer than the limit
-        let memo_at = 45 + 186;
+        let memo_at = 46 + 187;
         let mut long = bytes.clone();
         long[memo_at..memo_at + 2]
             .copy_from_slice(&((DEFAULT_MAX_MEMO_BYTES + 1) as u16).to_be_bytes());

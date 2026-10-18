@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use secp256k1::PublicKey;
-use secp256k1::XOnlyPublicKey;
 use serde::{Deserialize, Serialize};
+use sp_wire::ServiceDid;
 
 // The wire types and constants live in sp-wire; they are re-exported so the
 // paths are unchanged.
@@ -114,8 +114,8 @@ impl From<io::Error> for QueueError {
 pub struct Entry {
     /// The redemption request hash.
     pub id: String,
-    /// The service's DID public key (x-only).
-    pub service: XOnlyPublicKey,
+    /// The service's ID: its 33-byte AIR DID, 66 hex characters.
+    pub service: ServiceDid,
     /// ESP owed: the accepted total minus the fee.
     #[serde(with = "dec")]
     pub owed_esp: u128,
@@ -155,7 +155,7 @@ impl Entry {
     /// A new open entry.
     pub fn open(
         id: &str,
-        service: XOnlyPublicKey,
+        service: ServiceDid,
         owed_esp: u128,
         memo: &str,
         created_unix: u64,
@@ -201,7 +201,7 @@ impl Entry {
 
 /// Entries to mark paid.
 pub struct Payment<'a> {
-    pub service: XOnlyPublicKey,
+    pub service: ServiceDid,
     /// One reference for the whole payment (a txid, a wire number).
     pub payment_ref: &'a str,
     /// The exact entries that were paid, as listed in the report the operator
@@ -214,7 +214,7 @@ pub struct Payment<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Paid {
-    pub service: XOnlyPublicKey,
+    pub service: ServiceDid,
     pub payment_ref: String,
     pub entries: usize,
     #[serde(with = "dec")]
@@ -447,8 +447,8 @@ mod tests {
 
     const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
-    fn service() -> XOnlyPublicKey {
-        XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
+    fn service() -> ServiceDid {
+        ServiceDid::parse(&format!("02{G_X}")).unwrap()
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -566,7 +566,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                r#"{{"a":{{"id":"a","service":"{G_X}","owed_esp":"5","memo":"m","created_unix":1,"status":"open"}}}}"#
+                r#"{{"a":{{"id":"a","service":"02{G_X}","owed_esp":"5","memo":"m","created_unix":1,"status":"open"}}}}"#
             ),
         )
         .unwrap();

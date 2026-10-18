@@ -70,7 +70,7 @@ use mint_types::MintOutput;
 use mint_types::{Amount, MintInput, MintOutputError, Nonce, melt_sighash};
 use secp256k1::SECP256K1;
 #[cfg(test)]
-use secp256k1::XOnlyPublicKey;
+use sp_wire::ServiceDid;
 
 use crate::fee;
 use crate::keys::MasterSecret;
@@ -976,8 +976,8 @@ mod tests {
     const NOW: u64 = 1_791_571_184;
     const ONE_PSP: u64 = 100_000_000_000;
 
-    fn service() -> XOnlyPublicKey {
-        XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
+    fn service() -> ServiceDid {
+        ServiceDid::parse(&format!("02{G_X}")).unwrap()
     }
 
     fn scratch(name: &str) -> PathBuf {

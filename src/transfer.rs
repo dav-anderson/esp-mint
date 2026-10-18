@@ -9,7 +9,7 @@
 //! The rules:
 //!
 //! - **Only the named service.** The request is signed with the service's key,
-//!   the x-only key that is the service ID in every note's terms. The mint checks
+//!   the key whose DID is the service ID in every note's terms. The mint checks
 //!   each input against the key it derives for that amount and for the terms
 //!   (that service, that day). A note named for another service, or for another
 //!   day, does not verify. The outputs are signed under the same terms, so the
@@ -56,9 +56,9 @@ use mint_types::MintOutputError;
 use mint_types::{MintInput, MintOutput};
 use secp256k1::SECP256K1;
 #[cfg(test)]
-use secp256k1::XOnlyPublicKey;
-#[cfg(test)]
 use secp256k1::schnorr::Signature;
+#[cfg(test)]
+use sp_wire::ServiceDid;
 
 use crate::exchange::MAX_ITEMS;
 use crate::fee;
@@ -444,7 +444,11 @@ pub fn transfer_gens(
     // Only the service the notes name may ask. This is checked before anything
     // else that touches the mint.
     SECP256K1
-        .verify_schnorr(&request.service_signature, &digest, &request.service)
+        .verify_schnorr(
+            &request.service_signature,
+            &digest,
+            &request.service.x_only(),
+        )
         .map_err(|_| TransferRejection::BadServiceSignature)?;
 
     let terms = Terms {
@@ -663,11 +667,12 @@ mod tests {
     /// A note size to test with: a power of two, about 0.7 PSP.
     const ONE_PSP: u64 = 1 << 36;
 
-    fn service() -> XOnlyPublicKey {
-        XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
+    /// The DID of `service_keypair()`: `02` and the x coordinate `G_X`.
+    fn service() -> ServiceDid {
+        ServiceDid::parse(&format!("02{G_X}")).unwrap()
     }
 
-    /// The key whose x-only public key is `G_X`: secret key 1.
+    /// The key whose public key is the DID `02` + `G_X`: secret key 1.
     fn service_keypair() -> Keypair {
         let mut bytes = [0u8; 32];
         bytes[31] = 1;
@@ -734,7 +739,7 @@ mod tests {
 
         /// An ESP note the mint has issued under these terms, and the key that
         /// spends it.
-        fn esp_note(&self, units: u64, service: XOnlyPublicKey, day: u64) -> (Note, Keypair) {
+        fn esp_note(&self, units: u64, service: ServiceDid, day: u64) -> (Note, Keypair) {
             let terms = Terms {
                 service,
                 redeemable_after_day: day,
@@ -788,7 +793,7 @@ mod tests {
     fn build_with(
         notes: &[(Note, &Keypair, u64)],
         out_amounts: &[u64],
-        request_service: XOnlyPublicKey,
+        request_service: ServiceDid,
         day: u64,
         spend_signer: Option<&Keypair>,
         service_signer: &Keypair,
@@ -941,8 +946,10 @@ mod tests {
 
     #[test]
     fn the_test_service_key_is_the_generator() {
-        assert_eq!(service_keypair().x_only_public_key().0, service());
-        assert_ne!(other_keypair().x_only_public_key().0, service());
+        assert_eq!(ServiceDid::from(service_keypair().public_key()), service());
+        assert_ne!(ServiceDid::from(other_keypair().public_key()), service());
+        // what a signature is checked against is the DID's x-only key
+        assert_eq!(service().x_only(), service_keypair().x_only_public_key().0);
     }
 
     #[test]
@@ -1275,7 +1282,7 @@ mod tests {
     #[test]
     fn a_note_named_for_another_service_or_day_cannot_be_transferred() {
         let mut s = setup("wrong-terms");
-        let other = other_keypair().x_only_public_key().0;
+        let other = ServiceDid::from(other_keypair().public_key());
         let (foreign, kf) = s.esp_note(ONE_PSP, other, DAY);
         let (late, kl) = s.esp_note(ONE_PSP, service(), DAY + 1);
 
@@ -1316,7 +1323,7 @@ mod tests {
         // terms, where these notes do not verify. A request that names the right
         // service gets outputs signed under its terms and no others.
         let mut s = setup("no-redirect");
-        let other = other_keypair().x_only_public_key().0;
+        let other = ServiceDid::from(other_keypair().public_key());
         let (a, ka) = s.esp_note(ONE_PSP, service(), DAY);
         let (request, _) = build_with(
             &[(a, &ka, ONE_PSP)],
@@ -1678,7 +1685,7 @@ mod tests {
             &[a.clone(), b.clone()],
             std::slice::from_ref(&out),
         );
-        let other = other_keypair().x_only_public_key().0;
+        let other = ServiceDid::from(other_keypair().public_key());
         assert_ne!(
             base,
             digest(

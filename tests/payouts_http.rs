@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 
 use esp_mint::admin::{self, AdminState};
 use esp_mint::queue::{Entry, Queue};
-use secp256k1::XOnlyPublicKey;
 use serde_json::{Value, json};
+use sp_wire::ServiceDid;
 use tokio::runtime::Runtime;
 
-const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+const G_DID: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 const ONE_USD: u128 = 1_000_000_000_000;
 const DAY1: u64 = 20_735 * 86_400;
 
@@ -30,8 +30,8 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-fn service() -> XOnlyPublicKey {
-    XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
+fn service() -> ServiceDid {
+    ServiceDid::parse(G_DID).unwrap()
 }
 
 fn start(rt: &Runtime, queue_path: &Path, token: Option<&str>) -> String {
@@ -81,7 +81,7 @@ fn the_report_comes_as_json_and_as_plain_text() {
         .unwrap()
         .json()
         .unwrap();
-    assert_eq!(json[0]["service"], G_X);
+    assert_eq!(json[0]["service"], G_DID);
     assert_eq!(json[0]["owed_esp"], "15000000000000");
     assert_eq!(json[0]["owed_usd"], "15.000000000000");
     assert_eq!(json[0]["entries"], 2);
@@ -99,7 +99,7 @@ fn the_report_comes_as_json_and_as_plain_text() {
             .starts_with("text/plain")
     );
     let text = response.text().unwrap();
-    assert!(text.contains(&format!("service {G_X}")));
+    assert!(text.contains(&format!("service {G_DID}")));
     assert!(text.contains("owed     15.000000000000 USD"));
 
     let bad = client
@@ -138,7 +138,7 @@ fn paying_marks_only_the_listed_entries_and_a_refusal_changes_nothing() {
         ))
         .unwrap();
 
-    let refused = pay(json!({"service": G_X, "payment_ref": "w1", "entry_ids": ["e1", "nope"]}));
+    let refused = pay(json!({"service": G_DID, "payment_ref": "w1", "entry_ids": ["e1", "nope"]}));
     assert_eq!(refused.status(), 400);
     assert!(
         refused.json::<Value>().unwrap()["error"]
@@ -149,7 +149,7 @@ fn paying_marks_only_the_listed_entries_and_a_refusal_changes_nothing() {
     let q = Queue::open(&path).unwrap();
     assert!(q.entries().all(|e| e.payment_ref.is_none()));
 
-    let ok = pay(json!({"service": G_X, "payment_ref": "wire-1", "entry_ids": ["e1", "e2"]}));
+    let ok = pay(json!({"service": G_DID, "payment_ref": "wire-1", "entry_ids": ["e1", "e2"]}));
     assert_eq!(ok.status(), 200);
     let paid: Value = ok.json().unwrap();
     assert_eq!(paid["entries"], 2);
@@ -158,12 +158,12 @@ fn paying_marks_only_the_listed_entries_and_a_refusal_changes_nothing() {
 
     let q = Queue::open(&path).unwrap();
     assert_eq!(q.get("e3").unwrap().payment_ref, None);
-    let again = pay(json!({"service": G_X, "payment_ref": "wire-2", "entry_ids": ["e1"]}));
+    let again = pay(json!({"service": G_DID, "payment_ref": "wire-2", "entry_ids": ["e1"]}));
     assert_eq!(again.status(), 400);
 
     let text = client
         .post(format!("{base}/payouts/pay?format=text"))
-        .json(&json!({"service": G_X, "payment_ref": "wire-3", "entry_ids": ["e3"]}))
+        .json(&json!({"service": G_DID, "payment_ref": "wire-3", "entry_ids": ["e3"]}))
         .send()
         .unwrap()
         .text()
@@ -186,7 +186,7 @@ fn a_failed_write_is_a_500_and_leaves_the_entry_open() {
     std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
     let response = client
         .post(format!("{base}/payouts/pay"))
-        .json(&json!({"service": G_X, "payment_ref": "w", "entry_ids": ["e1"]}))
+        .json(&json!({"service": G_DID, "payment_ref": "w", "entry_ids": ["e1"]}))
         .send()
         .unwrap();
     assert_eq!(response.status(), 500);
@@ -227,7 +227,7 @@ fn a_token_is_required_when_one_is_set() {
     assert_eq!(wrong.status(), 401);
     let unauth_pay = client
         .post(format!("{base}/payouts/pay"))
-        .json(&json!({"service": G_X, "payment_ref": "w", "entry_ids": ["e1"]}))
+        .json(&json!({"service": G_DID, "payment_ref": "w", "entry_ids": ["e1"]}))
         .send()
         .unwrap();
     assert_eq!(unauth_pay.status(), 401);

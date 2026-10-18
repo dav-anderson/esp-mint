@@ -82,13 +82,14 @@ pub fn load_or_generate(path: &Path) -> Result<MasterSecret, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secp256k1::XOnlyPublicKey;
+    use sp_wire::ServiceDid;
     use std::path::PathBuf;
 
     const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
-    fn service() -> XOnlyPublicKey {
-        XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
+    /// The DID whose key is the generator: `02` and its x coordinate.
+    fn service() -> ServiceDid {
+        ServiceDid::parse(&format!("02{G_X}")).unwrap()
     }
 
     fn master() -> MasterSecret {
@@ -125,11 +126,11 @@ mod tests {
     fn known_answers_from_an_independent_implementation() {
         assert_eq!(
             key_hex(&master(), 4, &terms()),
-            "31d3707f94e6751cc7b471884a3ba19bd7b6ebaad6f3b4bbc661280f82517d38"
+            "5ff28eeec15916b32e6f28c49c2ff02185955cc01557b5fee0b0401ff16fef42"
         );
         assert_eq!(
             key_hex(&master(), 8, &terms()),
-            "f512eea6e2b67e1d158fd3fa87a8bb118cb260122d9850ca55e1523e3e8cd4b4"
+            "79d12470d22577b2358a1f3e42ef00abe501708dfb115b766a3dab6360dc7edc"
         );
         let later = Terms {
             redeemable_after_day: terms().redeemable_after_day + 1,
@@ -137,7 +138,7 @@ mod tests {
         };
         assert_eq!(
             key_hex(&master(), 4, &later),
-            "1a0ac1fb4b343b5c9239e9ffcb809e505936e0803357aa01ed77a3816781508b"
+            "90186260e583ae776750a5814875f593af007f46d4e7bee8d50fba519c649d6c"
         );
     }
 
@@ -158,14 +159,19 @@ mod tests {
             key_hex(&MasterSecret::from_bytes([0x43; 32]), 4, &terms())
         );
         let other_service = Terms {
-            service: XOnlyPublicKey::from_slice(
-                &hex::decode("c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
-                    .unwrap(),
+            service: ServiceDid::parse(
+                "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
             )
             .unwrap(),
             ..terms()
         };
         assert_ne!(base, key_hex(&master(), 4, &other_service));
+        // The parity byte is part of the service, so it is part of the key.
+        let odd_parity = Terms {
+            service: ServiceDid::parse(&format!("03{G_X}")).unwrap(),
+            ..terms()
+        };
+        assert_ne!(base, key_hex(&master(), 4, &odd_parity));
     }
 
     #[test]

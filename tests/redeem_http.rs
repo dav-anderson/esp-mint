@@ -21,8 +21,9 @@ use esp_mint::terms::Terms;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note};
 use rand::rngs::OsRng;
 use secp256k1::schnorr::Signature;
-use secp256k1::{Keypair, SECP256K1, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, SECP256K1, SecretKey};
 use serde_json::Value;
+use sp_wire::ServiceDid;
 use tokio::runtime::Runtime;
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -48,8 +49,8 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-fn service() -> XOnlyPublicKey {
-    XOnlyPublicKey::from_slice(&hex::decode(G_X).unwrap()).unwrap()
+fn service() -> ServiceDid {
+    ServiceDid::parse(&format!("02{G_X}")).unwrap()
 }
 
 /// The key behind `G_X`: secret key 1.
@@ -157,7 +158,7 @@ fn start_at_rate(rt: &Runtime, dir: &Path, max_bytes: usize, rate: u128) -> Mint
 }
 
 /// A note the mint has issued under these terms, and the key that spends it.
-fn esp_note(mint: &Mint, units: u64, service: XOnlyPublicKey, day: u64) -> (Note, Keypair) {
+fn esp_note(mint: &Mint, units: u64, service: ServiceDid, day: u64) -> (Note, Keypair) {
     let terms = Terms {
         service,
         redeemable_after_day: day,
@@ -564,12 +565,12 @@ fn when_the_accepted_notes_only_cover_the_fee_nothing_is_owed_and_a_retry_says_s
     let rt = Runtime::new().unwrap();
     let dir = scratch("nothing-owed");
     // A fee only a power of two can equal: a rate of 2^20 per byte, and a memo
-    // that makes the request exactly 512 bytes (119 + 186 for one note, and 207
+    // that makes the request exactly 512 bytes (120 + 187 for one note, and 205
     // of memo), so the fee is 2^29 and one note of that size covers it exactly.
     let rate: u128 = 1 << 20;
     let mint = start_at_rate(&rt, &dir, 64 * 1024 * 1024, rate);
-    let memo = format!("{:x<207}", "btc:bc1qpayhere-");
-    assert_eq!(memo.len(), 207);
+    let memo = format!("{:x<205}", "btc:bc1qpayhere-");
+    assert_eq!(memo.len(), 205);
     let fee = redeem::fee_for(redeem::encoded_len(1, memo.len(), 0, 0), rate);
     assert_eq!(fee, 1 << 29);
     let (note, key) = esp_note(&mint, fee as u64, service(), PAST);
@@ -606,7 +607,7 @@ fn a_request_below_the_fee_is_refused_with_the_fee_in_the_body() {
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "below_fee");
     assert_eq!(body["value_esp"], "512");
-    assert_eq!(body["fee_esp"], "320000000");
+    assert_eq!(body["fee_esp"], "322000000");
     // the per-note reasons are in the body, and nothing was burned
     assert_eq!(body["notes"].as_array().unwrap().len(), 1);
     assert_eq!(body["notes"][0]["reason"], serde_json::Value::Null);

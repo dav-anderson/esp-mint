@@ -2,6 +2,19 @@
 
 esp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.6.0 (unreleased)
+
+**Wire version 3: every service ID is the 33-byte AIR DID.** Builds on `sp-wire` 0.5.0 (`WIRE_VERSION` 3) and mint-core 0.1.3. `Cargo.toml` still names `sp-wire` by `tag = "v0.4.0"`: the tag moves to the new release when it is made, and until then the build uses a local `[patch]` (see the README of `sp-wire`). There is no migration and no dual format: a 64-character (x-only) service is refused, with a message that says to use the DID.
+
+- **The service in the terms, the exchange, transfer, rollover and redeem requests, the queue and the payout report is `sp_wire::ServiceDid`** (33 bytes, 66 hex characters in JSON, in `queue.json` and `responses.json`, and in `esp-mint pay <service>` and `POST /payouts/pay`). A signature is still BIP340: it is checked against `ServiceDid::x_only()`, which is never an ID.
+- **Every derived key changes.** The terms are 41 bytes (was 40) and are an input of the key derivation, so a note issued by 0.5.0 does not verify, and the `known_answers` test has new values (computed by an independent model, which first reproduced the old ones). Existing master secrets still load.
+- **Redeem encoding version 3.** The request is `120 + 187 per note + memo + 82 per output` bytes (was `119 / 186 / 81`). A version 2 request is refused with a message that says so.
+- **Canonical sizes for the exchange and transfer fees** are one byte larger, because the request holds a 33-byte service: the fixed part of an exchange is 49 (was 48) and of a transfer 121 (was 120). Fee rates are unchanged and 0 by default.
+- **`queue.json` and `responses.json` from 0.5.0 do not load** (they hold x-only services). Empty or delete them on a mint with no live notes; there is nothing to migrate.
+- `storage.mint_state` takes DIDs, not x-only keys, and no longer reduces a 33-byte key.
+- Tests: fixtures use the DID `02` + the generator's x; the config storage test checks that the x-only form is refused; the payout command and the decode test check their refusal messages; the sizes in the redeem tests follow `sp-wire` 0.5.0 (the two test memos are 205 and 123 bytes so that a request of one note is still exactly 512 bytes).
+- Documentation: README and DESIGN.md say 66 hex characters and the new sizes; DESIGN.md "Wire format and versions" describes version 3.
+
 ## 0.5.0 (2026-10-17)
 
 - **`esp-mint --help` prints plain usage and exits 0**, with every command described (it printed `Error: "usage:\n ..."` as a debug string and exited 1). A missing or unknown command prints the same text on standard error and exits 2. Every error of every command is now printed as `error: ...` in plain text, not as the debug form of the value.

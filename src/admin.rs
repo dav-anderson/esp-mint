@@ -8,7 +8,7 @@
 //! - `GET /payouts`: the open entries summed per service. JSON by default,
 //!   plain text with `?format=text`.
 //! - `POST /payouts/pay`: body
-//!   `{"service": "<x-only hex>", "payment_ref": "...", "entry_ids": ["..."],
+//!   `{"service": "<DID hex, 66 characters>", "payment_ref": "...", "entry_ids": ["..."],
 //!   "mixed_memos": false}`. Marks exactly those entries completed. `200` with
 //!   what was paid, `400` if the request is refused (nothing changed), `500` if
 //!   the queue file could not be written (the entries stay open). Also takes
@@ -39,9 +39,9 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use secp256k1::XOnlyPublicKey;
 use serde::Deserialize;
 use serde_json::json;
+use sp_wire::ServiceDid;
 
 use crate::payouts;
 use crate::queue::{Payment, Queue};
@@ -101,7 +101,7 @@ struct DeclineBody {
 
 #[derive(Deserialize)]
 struct PayBody {
-    service: XOnlyPublicKey,
+    service: ServiceDid,
     payment_ref: String,
     entry_ids: Vec<String>,
     #[serde(default)]

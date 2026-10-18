@@ -1080,9 +1080,9 @@ mod retired_list_tests {
         let (mut r, mut cur) = Rotor::open_at(&d, 1, 1, t).unwrap();
         r.first_issue = Some(t);
         let terms = Terms {
-            service: secp256k1::Keypair::new(SECP256K1, &mut rand::rngs::OsRng)
-                .x_only_public_key()
-                .0,
+            service: sp_wire::ServiceDid::from(
+                secp256k1::Keypair::new(SECP256K1, &mut rand::rngs::OsRng).public_key(),
+            ),
             redeemable_after_day: 1,
         };
         let redeemed = spent_note(&cur, &r.current.master, &terms);

@@ -134,7 +134,7 @@ fn a_reload_changes_the_ceiling_and_the_rates_for_the_next_request_only() {
     assert_eq!(fees["exchange"]["fee_per_byte"], "0");
     assert_eq!(fees["transfer"]["fee_per_byte"], "0");
     assert_eq!(fees["exchange"]["size"]["per_input"], 146);
-    assert_eq!(fees["redeem"]["size"]["per_input"], 186);
+    assert_eq!(fees["redeem"]["size"]["per_input"], 187);
     assert_eq!(fees["exchange"]["max_request_bytes"], CEILING as u64);
     assert_eq!(fees["rollover"]["max_request_bytes"], CEILING as u64);
     assert_eq!(fees["rollover"]["max_items"], 1000);
