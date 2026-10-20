@@ -6,7 +6,9 @@ use std::thread;
 use std::time::Duration;
 
 use esp_mint::admin::{self, AdminState};
+use esp_mint::air_listener;
 use esp_mint::config;
+use esp_mint::did;
 use esp_mint::netdir;
 use esp_mint::payouts;
 use esp_mint::psp_client::HttpPsp;
@@ -64,6 +66,14 @@ fn serve() -> Result<(), Box<dyn Error>> {
     let bind = cfg.bind.clone();
     let psp_url = cfg.psp_url.clone();
     let admin_bind = admin::check_loopback(&cfg.admin_bind)?;
+    // `air.enabled`: answer wallets' requests over AIR too, on a thread of its
+    // own, with the mint's own DID key (made on first use). Read before `cfg`
+    // moves into the settings handle.
+    let air = cfg.air_listener(&data_dir);
+    let did_key = match &air {
+        Some(_) => Some(did::load_or_generate(&data_dir.join(did::KEY_FILENAME))?),
+        None => None,
+    };
     let admin_token = match env::var("ESP_ADMIN_TOKEN") {
         Ok(token) if token.is_empty() => return Err("ESP_ADMIN_TOKEN is set but empty".into()),
         Ok(token) => Some(token),
@@ -106,6 +116,10 @@ fn serve() -> Result<(), Box<dyn Error>> {
         rollovers: Some(Mutex::new(rollovers)),
         in_flight: Default::default(),
     });
+
+    if let (Some(air), Some(did_key)) = (air, did_key) {
+        start_air_listener(air, did_key, Arc::clone(&state))?;
+    }
 
     // A poisoned lock means a thread panicked holding the mint, and every later
     // request would fail. Exit so that a supervisor can start a fresh process.
@@ -180,6 +194,36 @@ fn serve() -> Result<(), Box<dyn Error>> {
         tokio::try_join!(api, admin)?;
         Ok::<(), Box<dyn Error>>(())
     })
+}
+
+/// Start the AIR listener (`air.enabled`) on its own thread. It answers every
+/// wallet-facing request with what the HTTP routes return at that moment
+/// (`server::air_served`). If it fails (the AIR client gave up) it says so and
+/// ends; the HTTP API keeps running, and a restart starts the listener again,
+/// from the stored slot counter.
+fn start_air_listener(
+    air: air_listener::Settings,
+    did: did::SecretKey,
+    state: Arc<EspState>,
+) -> Result<(), Box<dyn Error>> {
+    println!(
+        "esp-mint AIR listener: this mint's DID is {} (wallets use it as air.esp_did)",
+        did::public_key_hex(&did)
+    );
+    thread::Builder::new()
+        .name("air-listener".into())
+        .spawn(move || {
+            let serve: Arc<air_listener::Serve> =
+                Arc::new(move |kind: u8, body: &[u8]| server::air_served(&state, kind, body));
+            match air_listener::run_blocking(&air, &did, &serve) {
+                Ok(()) => eprintln!("AIR listener: stopped"),
+                Err(e) => eprintln!(
+                    "AIR listener failed: {e}\nThe HTTP API keeps running; the listener is off until esp-mint is restarted"
+                ),
+            }
+        })?;
+    println!("AIR listener starting (air.enabled is true)");
+    Ok(())
 }
 
 /// Ask the PSP which network it is on, and ask again every `retry_secs` until it
@@ -259,6 +303,8 @@ esp-mint <command>
 
   serve                 Run the public API and the operator's listener.
   config                Print the settings in use and where each came from.
+  pubkey                Print the mint's DID (66 hex characters), making its
+                        key file on first use. Wallets use it as air.esp_did.
   payouts [--json]      The payout report: what is owed to each service.
   pay <service> <ref> <entry id>... [--mixed-memos]
                         Mark exactly those entries paid, with one payment
@@ -360,6 +406,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("serve") => serve(),
         Some("config") => {
             print!("{}", run_config()?);
+            Ok(())
+        }
+        // Makes the DID key file if there is none, and nothing else.
+        Some("pubkey") => {
+            let dir = net_dir()?;
+            std::fs::create_dir_all(&dir)?;
+            let key = did::load_or_generate(&dir.join(did::KEY_FILENAME))?;
+            println!("{}", did::public_key_hex(&key));
             Ok(())
         }
         // These read and write the queue file only. They never open the mint's

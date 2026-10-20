@@ -248,10 +248,10 @@ pub const SPECS: &[Spec] = &[
     Spec {
         key: "redeem.max_request_bytes",
         env: "ESP_REDEEM_MAX_BYTES",
-        default: "67108864",
+        default: "15728640",
         units: "bytes",
         reload: true,
-        what: "The ceiling on one encoded redemption request (64 MiB). A larger body is refused with 413 before it is parsed: no burn, no fee.",
+        what: "The ceiling on one encoded redemption request (15 MiB: AIR carries at most 16 MiB in one message, so every redemption the mint takes can be sent over AIR; the wallet splits a larger one). A larger body is refused with 413 before it is parsed: no burn, no fee. Above 15 MiB, a request can come over HTTP only.",
     },
     Spec {
         key: "redeem.max_memo_bytes",
@@ -293,6 +293,46 @@ pub const SPECS: &[Spec] = &[
         reload: false,
         what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is the service's AIR DID, a 33-byte compressed key in hex (66 characters, starting 02 or 03); the old 32-byte x-only form is refused. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
     },
+    Spec {
+        key: "air.enabled",
+        env: "ESP_AIR_ENABLED",
+        default: "false",
+        units: "true or false",
+        reload: false,
+        what: "Answer wallets' requests over AIR (`serve` only), beside the HTTP API: mint info, keysets, rotation, fees, rollover, exchange, transfer and redeem (not /audit and not the operator's routes). Off by default: nothing is sent to the AIR unless this is true. When true, air.server and air.host are required. The mint's own DID key (`mint_did_key.json` in the network's data folder, made on first use; `esp-mint pubkey` prints its DID) opens the requests and signs the replies; it is not the PSP's. The reply is what the HTTP route returns. If the AIR client gives up, the listener stops with a clear error and the HTTP API keeps running. See the README, \"The AIR listener\".",
+    },
+    Spec {
+        key: "air.server",
+        env: "ESP_AIR_SERVER",
+        default: "",
+        units: "AIR server name (66 hex characters)",
+        reload: false,
+        what: "The AIR server the listener holds reads on and writes replies to: its identity, a public key in AIR's compressed hex form (66 characters). The listener checks the server's signed challenge against it. Required when air.enabled is true. The PSP and the ESP can use the same AIR server: their DIDs differ, so their mailboxes do. Until the AIR resolves a DID to a server (upstream item 4), this is configuration.",
+    },
+    Spec {
+        key: "air.host",
+        env: "ESP_AIR_HOST",
+        default: "",
+        units: "host or IP, no port",
+        reload: false,
+        what: "Where that AIR server is: a host name or an IP (127.0.0.1 for the SPI's own AIR server). No port: the AIR client always uses 5702 (ws). Required when air.enabled is true.",
+    },
+    Spec {
+        key: "air.held_reads",
+        env: "ESP_AIR_HELD_READS",
+        default: "16",
+        units: "reads",
+        reload: false,
+        what: "How many mailbox slots the listener holds a read on, ahead of the next unfinished one. More lets more wallets be answered at once without waiting for a slot to be reached; each held read costs the AIR server about 2 KB. The AIR server closes the whole session at its 257th held read, so the most accepted is 200. The requests themselves are answered one at a time, in slot order, as the HTTP mint runs one request at a time.",
+    },
+    Spec {
+        key: "air.timeout_secs",
+        env: "ESP_AIR_TIMEOUT_SECS",
+        default: "10",
+        units: "seconds",
+        reload: false,
+        what: "How long the AIR server may take to answer one Create or Read before the listener counts the try as failed (a reply is tried three times).",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +363,14 @@ pub struct Config {
     pub queue_max_payment_ref_bytes: usize,
     /// Which AIR services keep this mint's state (setting only for now).
     pub storage_mint_state: StoragePolicy,
+    /// Answer wallets' requests over AIR (`serve` only).
+    pub air_enabled: bool,
+    /// The AIR server's name (its public key, 66 hex characters).
+    pub air_server: String,
+    /// The AIR server's host or IP, no port.
+    pub air_host: String,
+    pub air_held_reads: u32,
+    pub air_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -353,6 +401,11 @@ impl Default for Config {
             redeem_max_reason_bytes: redeem::DEFAULT_MAX_REASON_BYTES,
             queue_max_payment_ref_bytes: queue::MAX_REF_LEN,
             storage_mint_state: StoragePolicy::default(),
+            air_enabled: false,
+            air_server: String::new(),
+            air_host: String::new(),
+            air_held_reads: 16,
+            air_timeout_secs: 10,
         }
     }
 }
@@ -393,6 +446,11 @@ impl Config {
             "redeem.max_reason_bytes" => self.redeem_max_reason_bytes.to_string(),
             "queue.max_payment_ref_bytes" => self.queue_max_payment_ref_bytes.to_string(),
             "storage.mint_state" => self.storage_mint_state.to_config_string(),
+            "air.enabled" => self.air_enabled.to_string(),
+            "air.server" => self.air_server.clone(),
+            "air.host" => self.air_host.clone(),
+            "air.held_reads" => self.air_held_reads.to_string(),
+            "air.timeout_secs" => self.air_timeout_secs.to_string(),
             _ => return None,
         })
     }
@@ -429,6 +487,19 @@ impl Config {
                 self.storage_mint_state =
                     StoragePolicy::parse(value).map_err(|e| format!("{key} = `{value}`: {e}"))?
             }
+            "air.enabled" => {
+                self.air_enabled = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(format!("{key} = `{other}` must be true or false"));
+                    }
+                }
+            }
+            "air.server" => self.air_server = value.trim().to_string(),
+            "air.host" => self.air_host = value.trim().to_string(),
+            "air.held_reads" => self.air_held_reads = whole(key, value)?,
+            "air.timeout_secs" => self.air_timeout_secs = whole(key, value)?,
             other => return Err(format!("unknown setting `{other}`")),
         }
         Ok(())
@@ -565,6 +636,14 @@ impl Config {
             4096,
             "bytes",
         );
+        range(
+            "air.held_reads",
+            u64::from(self.air_held_reads),
+            1,
+            200,
+            "reads; the AIR server closes the session at its 257th",
+        );
+        range("air.timeout_secs", self.air_timeout_secs, 1, 600, "seconds");
         for (key, value) in [
             ("server.bind", &self.bind),
             ("server.admin_bind", &self.admin_bind),
@@ -588,6 +667,27 @@ impl Config {
                 self.psp_url
             ));
         }
+        if self.air_enabled {
+            if self.air_server.is_empty() {
+                problems.push(
+                    "air.enabled is true but air.server is not set: it is the AIR server's name, a public key of 66 hex characters"
+                        .to_string(),
+                );
+            } else if let Err(e) = sp_wire::seal::parse_public_key(&self.air_server) {
+                problems.push(format!(
+                    "air.server = `{}` is not an AIR server name (a public key of 66 hex characters): {e}",
+                    self.air_server
+                ));
+            }
+            if self.air_host.is_empty() {
+                problems.push(
+                    "air.enabled is true but air.host is not set: it is the AIR server's host name or IP, with no port"
+                        .to_string(),
+                );
+            } else if let Some(why) = sp_wire::air_request::host_problem(&self.air_host) {
+                problems.push(format!("air.host = `{}` {why}", self.air_host));
+            }
+        }
         if problems.is_empty() {
             Ok(())
         } else {
@@ -609,6 +709,20 @@ impl Config {
             max_items: self.transfer_max_items,
             fee_per_byte: u128::from(self.transfer_fee_per_byte),
         }
+    }
+
+    /// The AIR listener's settings, or `None` when `air.enabled` is false.
+    /// `state_dir` is the network's data folder.
+    pub fn air_listener(&self, state_dir: &Path) -> Option<crate::air_listener::Settings> {
+        self.air_enabled.then(|| crate::air_listener::Settings {
+            server: sp_wire::air_request::client::ServerRef {
+                name: self.air_server.clone(),
+                host: self.air_host.clone(),
+            },
+            held_reads: self.air_held_reads,
+            timeout_secs: self.air_timeout_secs,
+            state_dir: state_dir.to_path_buf(),
+        })
     }
 
     pub fn redeem_settings(&self) -> RedeemSettings {
@@ -635,6 +749,11 @@ impl Config {
         self.psp_startup_retry_secs = running.psp_startup_retry_secs;
         self.admin_max_request_bytes = running.admin_max_request_bytes;
         self.storage_mint_state = running.storage_mint_state.clone();
+        self.air_enabled = running.air_enabled;
+        self.air_server = running.air_server.clone();
+        self.air_host = running.air_host.clone();
+        self.air_held_reads = running.air_held_reads;
+        self.air_timeout_secs = running.air_timeout_secs;
         ignored
     }
 }
@@ -716,6 +835,7 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
             match value {
                 toml::Value::Integer(n) => pairs.push((key, n.to_string())),
                 toml::Value::String(s) => pairs.push((key, s.clone())),
+                toml::Value::Boolean(b) if key == "air.enabled" => pairs.push((key, b.to_string())),
                 toml::Value::Array(items) if key.starts_with("storage.") => {
                     let ids: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
                     if ids.len() == items.len() {
@@ -1030,7 +1150,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.maturity_days, 365);
         assert_eq!(c.redeem_fee_per_byte, 0);
-        assert_eq!(c.redeem_max_request_bytes, 64 * 1024 * 1024);
+        assert_eq!(c.redeem_max_request_bytes, 15 * 1024 * 1024);
         assert_eq!(c.redeem_max_memo_bytes, 256);
         assert_eq!(c.redeem_max_reason_bytes, 1024);
         assert_eq!(c.exchange_max_items, 1000);
@@ -1047,7 +1167,78 @@ mod tests {
         assert_eq!(c.transfer_fee_per_byte, 0);
         // every fee defaults to 0
         assert_eq!(c.redeem_settings().fee_per_byte, 0);
+        // AIR is off, with the listener's defaults
+        assert!(!c.air_enabled);
+        assert_eq!((c.air_held_reads, c.air_timeout_secs), (16, 10));
         assert_eq!(c.validate(), Ok(()));
+    }
+
+    #[test]
+    fn the_air_listener_is_off_by_default_and_needs_a_server_and_a_host_when_on() {
+        const SERVER: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let dir = scratch("air");
+        let off = load(&dir, &no_env).unwrap();
+        assert!(!off.config.air_enabled);
+        assert!(off.config.air_listener(&dir).is_none());
+
+        // On without a server and a host: both are named.
+        let p = load(&dir, &env_of(&[("ESP_AIR_ENABLED", "true")])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("air.server")), "{p:?}");
+        assert!(p.iter().any(|x| x.contains("air.host")), "{p:?}");
+
+        // From the file (a real TOML boolean), then the environment on top.
+        fs::write(
+            dir.join(FILE_NAME),
+            format!(
+                "[air]\nenabled = true\nserver = \"{SERVER}\"\nhost = \"127.0.0.1\"\nheld_reads = 8\n"
+            ),
+        )
+        .unwrap();
+        let on = load(&dir, &no_env).unwrap();
+        assert!(on.config.air_enabled);
+        let s = on.config.air_listener(&dir).unwrap();
+        assert_eq!((s.held_reads, s.timeout_secs), (8, 10));
+        assert_eq!(s.server.name, SERVER);
+        assert_eq!(s.server.host, "127.0.0.1");
+        assert_eq!(s.state_dir, dir);
+        assert_eq!(on.sources["air.enabled"], Source::File);
+        let env = load(&dir, &env_of(&[("ESP_AIR_ENABLED", "false")])).unwrap();
+        assert!(env.config.air_listener(&dir).is_none());
+        assert_eq!(env.sources["air.enabled"], Source::Env("ESP_AIR_ENABLED"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_air_mistake_is_refused_naming_the_setting() {
+        const SERVER: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let dir = scratch("air-mistakes");
+        let on = |extra: &[(&'static str, &'static str)]| {
+            let mut pairs = vec![
+                ("ESP_AIR_ENABLED", "true"),
+                ("ESP_AIR_SERVER", SERVER),
+                ("ESP_AIR_HOST", "127.0.0.1"),
+            ];
+            pairs.extend_from_slice(extra);
+            load(&dir, &env_of(&pairs))
+        };
+        assert!(on(&[]).is_ok());
+        for (extra, named) in [
+            (("ESP_AIR_SERVER", "zz"), "air.server"),
+            (("ESP_AIR_HOST", "http://127.0.0.1"), "air.host"),
+            (("ESP_AIR_HOST", "127.0.0.1:5702"), "air.host"),
+            (("ESP_AIR_HELD_READS", "0"), "air.held_reads"),
+            (("ESP_AIR_HELD_READS", "201"), "air.held_reads"),
+            (("ESP_AIR_TIMEOUT_SECS", "0"), "air.timeout_secs"),
+        ] {
+            let p = on(&[extra]).unwrap_err();
+            assert!(
+                p.iter().any(|x| x.contains(named)),
+                "{extra:?} should name {named}: {p:?}"
+            );
+        }
+        let p = load(&dir, &env_of(&[("ESP_AIR_ENABLED", "yes")])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("true or false")), "{p:?}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1064,7 +1255,7 @@ mod tests {
         assert_eq!(c.redeem_max_memo_bytes, 128);
         assert_eq!(c.maturity_days, 30);
         assert_eq!(c.psp_url, "http://10.0.0.5:3000");
-        assert_eq!(c.redeem_max_request_bytes, 64 * 1024 * 1024);
+        assert_eq!(c.redeem_max_request_bytes, 15 * 1024 * 1024);
         assert_eq!(
             loaded.sources.get("redeem.fee_per_byte"),
             Some(&Source::Env("ESP_REDEEM_FEE_PER_BYTE"))
@@ -1316,7 +1507,12 @@ mod tests {
                 "rotation.activation_hours",
                 "rotation.period_hours",
                 "admin.max_request_bytes",
-                "storage.mint_state"
+                "storage.mint_state",
+                "air.enabled",
+                "air.server",
+                "air.host",
+                "air.held_reads",
+                "air.timeout_secs"
             ]
         );
     }

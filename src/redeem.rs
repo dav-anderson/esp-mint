@@ -104,9 +104,22 @@ use sp_wire::keyset::is_keyset_id;
 /// (`redeem.max_reason_bytes`).
 pub const DEFAULT_MAX_REASON_BYTES: usize = 1024;
 
-/// The default ceiling on one encoded request: 64 MiB
-/// (`redeem.max_request_bytes`).
-pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+/// The largest message AIR's server takes (its WebSocket cap is 16 MiB; a client
+/// allows 17 MiB for replies). A request sent over AIR is one message.
+pub const AIR_MESSAGE_CAP: usize = 16 * 1024 * 1024;
+
+/// What is kept below [`AIR_MESSAGE_CAP`] for everything around the request body:
+/// the envelope (71 bytes) and its seal (80), AIR's own framing of a record, and
+/// room to spare.
+pub const AIR_ROOM: usize = 1024 * 1024;
+
+/// The default ceiling on one encoded request: 15 MiB
+/// (`redeem.max_request_bytes`), the AIR message cap less [`AIR_ROOM`], so that
+/// every redemption the mint accepts can be sent over AIR as well as HTTP. A
+/// larger redemption is split by the wallet into several requests, each under the
+/// ceiling (about 84,000 notes with no outputs coming back). An operator who
+/// raises the setting above this can take larger requests over HTTP only.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = AIR_MESSAGE_CAP - AIR_ROOM;
 
 /// The default fee rate, in ESP units per encoded byte
 /// (`redeem.fee_per_byte`): 0, so a redemption costs no fee unless the operator
@@ -2632,15 +2645,24 @@ mod tests {
         assert_eq!(encoded_len(0, 0, 0, 0), 120);
         assert_eq!(encoded_len(1, 0, 0, 0), 307);
         assert_eq!(encoded_len(0, 0, 1, 0), 202);
-        // 220,000 notes with one output each: about 59 MB
+        // 220,000 notes with one output each: about 59 MB, so about four requests
         assert_eq!(
             encoded_len(220_000, 40, 220_000, 0),
             120 + 220_000 * 269 + 40
         );
-        assert!(encoded_len(220_000, 40, 220_000, 0) < DEFAULT_MAX_REQUEST_BYTES as u64);
-        // and the ceiling is about 358,000 notes with none coming back
+        assert!(encoded_len(220_000, 40, 220_000, 0) > DEFAULT_MAX_REQUEST_BYTES as u64);
+        // and the ceiling is about 84,000 notes with none coming back
         let most = (DEFAULT_MAX_REQUEST_BYTES as u64 - FIXED_BYTES - 40) / INPUT_BYTES;
-        assert_eq!(most, 358870);
+        assert_eq!(most, 84109);
+    }
+
+    #[test]
+    fn a_request_at_the_default_ceiling_fits_one_air_message() {
+        // the ceiling is 15 MiB and AIR takes 16 MiB: the request body, the
+        // envelope (71 bytes) and its seal (80) fit with the room to spare
+        assert_eq!(DEFAULT_MAX_REQUEST_BYTES, 15 * 1024 * 1024);
+        assert!(DEFAULT_MAX_REQUEST_BYTES + 71 + 80 + AIR_ROOM / 2 < AIR_MESSAGE_CAP);
+        assert_eq!(DEFAULT_MAX_REQUEST_BYTES + AIR_ROOM, AIR_MESSAGE_CAP);
     }
 
     #[test]
@@ -2655,8 +2677,8 @@ mod tests {
         assert_eq!(fee_for(typical, EXAMPLE_RATE), 1_177_000_000);
         // a request at the ceiling
         let ceiling = DEFAULT_MAX_REQUEST_BYTES as u64;
-        assert_eq!(ceiling, 67_108_864);
-        assert_eq!(fee_for(ceiling, EXAMPLE_RATE), 67_108_864_000_000);
+        assert_eq!(ceiling, 15_728_640);
+        assert_eq!(fee_for(ceiling, EXAMPLE_RATE), 15_728_640_000_000);
         // by default there is no fee, whatever the size
         assert_eq!(DEFAULT_FEE_PER_BYTE, 0);
         assert_eq!(fee_for(typical, DEFAULT_FEE_PER_BYTE), 0);

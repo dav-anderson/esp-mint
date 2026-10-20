@@ -479,34 +479,48 @@ pub fn run_redeem(state: &EspState, body: &[u8], now_unix: u64) -> (StatusCode, 
 
 type Refusal = (StatusCode, Json<Value>);
 
-/// The body of a `413`.
-fn too_large(size: Option<u64>, limit: usize, hint: &str) -> Refusal {
+/// What a `413` says to do, per route (the same text over HTTP and AIR).
+const EXCHANGE_HINT: &str = "Split the exchange into several requests.";
+const TRANSFER_HINT: &str = "Split the transfer into several requests.";
+const ROLLOVER_HINT: &str = "Split the rollover into several requests.";
+const REDEEM_HINT: &str = "Split the redemption into several requests.";
+
+/// The JSON body of a `413` (shared with the AIR listener).
+fn too_large_body(size: Option<u64>, limit: usize, hint: &str) -> Value {
     let said = match size {
         Some(size) => format!("the request is {size} bytes"),
         None => "the request is larger than the ceiling".to_string(),
     };
+    json!({
+        "error": format!(
+            "{said}, and this route accepts at most {limit} bytes. {hint} Nothing was parsed, burned or charged"
+        ),
+        "code": sp_wire::codes::REQUEST_TOO_LARGE,
+        "size_bytes": size,
+        "limit_bytes": limit as u64,
+    })
+}
+
+/// The body of a `413`.
+fn too_large(size: Option<u64>, limit: usize, hint: &str) -> Refusal {
     (
         StatusCode::PAYLOAD_TOO_LARGE,
-        Json(json!({
-            "error": format!(
-                "{said}, and this route accepts at most {limit} bytes. {hint} Nothing was parsed, burned or charged"
-            ),
-            "code": sp_wire::codes::REQUEST_TOO_LARGE,
-            "size_bytes": size,
-            "limit_bytes": limit as u64,
-        })),
+        Json(too_large_body(size, limit, hint)),
     )
+}
+
+/// The JSON body of a `400` for a body that is not a request (shared with the
+/// AIR listener).
+fn malformed_body(why: impl std::fmt::Display) -> Value {
+    json!({
+        "error": format!("not a valid request: {why}"),
+        "code": sp_wire::codes::MALFORMED_REQUEST,
+    })
 }
 
 /// The body of a `400` for a body that is not a request.
 fn malformed(why: impl std::fmt::Display) -> Refusal {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({
-            "error": format!("not a valid request: {why}"),
-            "code": sp_wire::codes::MALFORMED_REQUEST,
-        })),
-    )
+    (StatusCode::BAD_REQUEST, Json(malformed_body(why)))
 }
 
 /// Read a request body, but only up to `limit` bytes. This is the first thing
@@ -553,14 +567,7 @@ async fn redeem_handler(
     // The ceiling comes first. Nothing is parsed, checked or charged for a body
     // over it.
     let limit = state.config.current().redeem_max_request_bytes;
-    let bytes = match read_limited(
-        &headers,
-        body,
-        limit,
-        "Split the redemption into several requests.",
-    )
-    .await
-    {
+    let bytes = match read_limited(&headers, body, limit, REDEEM_HINT).await {
         Ok(bytes) => bytes,
         Err(refusal) => return refusal,
     };
@@ -581,14 +588,7 @@ async fn transfer_handler(
     body: Body,
 ) -> (StatusCode, Json<Value>) {
     let limit = state.config.current().transfer_max_request_bytes;
-    let request: TransferRequest = match read_json(
-        &headers,
-        body,
-        limit,
-        "Split the transfer into several requests.",
-    )
-    .await
-    {
+    let request: TransferRequest = match read_json(&headers, body, limit, TRANSFER_HINT).await {
         Ok(request) => request,
         Err(refusal) => return refusal,
     };
@@ -609,14 +609,7 @@ async fn exchange_handler(
     body: Body,
 ) -> (StatusCode, Json<Value>) {
     let limit = state.config.current().exchange_max_request_bytes;
-    let request: ExchangeRequest = match read_json(
-        &headers,
-        body,
-        limit,
-        "Split the exchange into several requests.",
-    )
-    .await
-    {
+    let request: ExchangeRequest = match read_json(&headers, body, limit, EXCHANGE_HINT).await {
         Ok(request) => request,
         Err(refusal) => return refusal,
     };
@@ -777,56 +770,126 @@ async fn health_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json
 /// `GET /keysets`: the live keyset IDs, `{current, previous}`, on every mint
 /// (rotating or not). ESP keys are derived per amount and terms, so they are
 /// not listed; a reply's `keys` carry them. A wallet reads `current` to name
-/// the keyset its new outputs should be signed by.
-async fn keysets_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<Value>) {
+/// the keyset its new outputs should be signed by. As a status and a body, so
+/// that the AIR listener answers with the same.
+fn keysets_outcome(state: &EspState) -> (StatusCode, Value) {
     let Ok(mut logic) = state.logic.lock() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "the mint lock is poisoned"})),
+            json!({"error": "the mint lock is poisoned"}),
         );
     };
-    match rotor_of(&state, &mut logic) {
+    match rotor_of(state, &mut logic) {
         Ok(Some(r)) => {
             let g = r.gens(&logic);
             (
                 StatusCode::OK,
-                Json(json!({"current": g.current_id, "previous": g.previous_id})),
+                json!({"current": g.current_id, "previous": g.previous_id}),
             )
         }
         Ok(None) => (
             StatusCode::OK,
-            Json(json!({
+            json!({
                 "current": crate::rotation::keyset_id(&state.master),
                 "previous": Value::Null,
-            })),
+            }),
         ),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
     }
 }
 
-/// `GET /rotation`: public and read-only, the same shape as fsp-mint's.
-async fn rotation_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<Value>) {
+async fn keysets_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<Value>) {
+    let (code, body) = keysets_outcome(&state);
+    (code, Json(body))
+}
+
+/// `GET /rotation`: public and read-only, the same shape as fsp-mint's. As a
+/// status and a body, so that the AIR listener answers with the same.
+fn rotation_outcome(state: &EspState) -> (StatusCode, Value) {
     let Ok(mut logic) = state.logic.lock() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "the mint lock is poisoned"})),
+            json!({"error": "the mint lock is poisoned"}),
         );
     };
-    match rotor_of(&state, &mut logic) {
+    match rotor_of(state, &mut logic) {
         Ok(Some(r)) => (
             StatusCode::OK,
-            Json(serde_json::to_value(r.window()).unwrap_or_default()),
+            serde_json::to_value(r.window()).unwrap_or_default(),
         ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "this mint does not rotate its keys"})),
+            json!({"error": "this mint does not rotate its keys"}),
         ),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
     }
 }
 
+async fn rotation_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<Value>) {
+    let (code, body) = rotation_outcome(&state);
+    (code, Json(body))
+}
+
 /// `POST /rollover`: move ESP of the previous (or current) key set to the
-/// current one, same amounts and terms. Stored by request hash.
+/// current one, same amounts and terms. Stored by request hash: the answer is
+/// kept before any note is marked spent, so a resend (over HTTP or AIR) gets the
+/// stored answer and a crash in the middle is finished by the next resend. As a
+/// status and a body, so that the AIR listener answers with the same.
+pub fn rollover_outcome(
+    state: &EspState,
+    req: &crate::rotation::RolloverRequest,
+    max_items: usize,
+) -> (StatusCode, Value) {
+    let (Ok(mut logic), Ok(responses)) = (state.logic.lock(), state.responses.lock()) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "the mint lock is poisoned"}),
+        );
+    };
+    let rot = match rotor_of(state, &mut logic) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                json!({"error": "this mint does not rotate its keys"}),
+            );
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
+    };
+    let Some(Ok(mut store)) = state.rollovers.as_ref().map(|r| r.lock()) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "the rollovers lock is poisoned"}),
+        );
+    };
+    // Notes an unfinished transfer or redemption will burn.
+    let (mut held, _) = responses.redeem_holds("");
+    for (_, p) in responses.pending_transfers() {
+        held.extend(p.inputs.iter().cloned());
+    }
+    let held: std::collections::HashSet<String> = held.into_iter().collect();
+    match crate::rotation::rollover(&rot.gens(&logic), &rot, &mut store, &held, req, max_items) {
+        Ok(a) => (StatusCode::OK, serde_json::to_value(a).unwrap_or_default()),
+        Err(crate::rotation::RolloverError::Refused(e)) => {
+            (StatusCode::BAD_REQUEST, json!({"error": e}))
+        }
+        Err(crate::rotation::RolloverError::Keyset(code, e)) => {
+            (StatusCode::BAD_REQUEST, json!({"error": e, "code": code}))
+        }
+        Err(crate::rotation::RolloverError::Spent(i)) => (
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": format!("input {i}: the note is already spent"),
+                "code": sp_wire::codes::NOTE_SPENT_ELSEWHERE,
+                "spent": [i],
+            }),
+        ),
+        Err(crate::rotation::RolloverError::Internal(e)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e}))
+        }
+    }
+}
+
 async fn rollover_handler(
     State(state): State<Arc<EspState>>,
     headers: HeaderMap,
@@ -837,72 +900,158 @@ async fn rollover_handler(
         &headers,
         body,
         config.rollover_max_request_bytes,
-        "Split the rollover into several requests.",
+        ROLLOVER_HINT,
     )
     .await
     {
         Ok(request) => request,
         Err(refusal) => return refusal,
     };
-    let (Ok(mut logic), Ok(responses)) = (state.logic.lock(), state.responses.lock()) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "the mint lock is poisoned"})),
-        );
-    };
-    let rot = match rotor_of(&state, &mut logic) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "this mint does not rotate its keys"})),
-            );
-        }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
-    };
-    let Some(Ok(mut store)) = state.rollovers.as_ref().map(|r| r.lock()) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "the rollovers lock is poisoned"})),
-        );
-    };
-    // Notes an unfinished transfer or redemption will burn.
-    let (mut held, _) = responses.redeem_holds("");
-    for (_, p) in responses.pending_transfers() {
-        held.extend(p.inputs.iter().cloned());
-    }
-    let held: std::collections::HashSet<String> = held.into_iter().collect();
-    match crate::rotation::rollover(
-        &rot.gens(&logic),
-        &rot,
-        &mut store,
-        &held,
-        &req,
-        config.rollover_max_items,
-    ) {
-        Ok(a) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(a).unwrap_or_default()),
-        ),
-        Err(crate::rotation::RolloverError::Refused(e)) => {
-            (StatusCode::BAD_REQUEST, Json(json!({"error": e})))
-        }
-        Err(crate::rotation::RolloverError::Keyset(code, e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e, "code": code})),
-        ),
-        Err(crate::rotation::RolloverError::Spent(i)) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!("input {i}: the note is already spent"),
-                "code": sp_wire::codes::NOTE_SPENT_ELSEWHERE,
-                "spent": [i],
-            })),
-        ),
-        Err(crate::rotation::RolloverError::Internal(e)) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e})))
+    let (code, body) = rollover_outcome(&state, &req, config.rollover_max_items);
+    (code, Json(body))
+}
+
+// ---- over AIR ---------------------------------------------------------------
+
+/// The signed refusal of a 4xx. A `400` is the route's body as it is. Any other
+/// 4xx (the `404` of a mint that does not rotate, the `409` `in_progress` of an
+/// exchange already being processed, the `413` of a body over its ceiling) has
+/// `http_status` added to the body, so that the wallet can treat it as it treats
+/// that status over HTTP: only a `400` means "refused, nothing was burned", and
+/// the others are an error where the outcome may be unknown and the same request
+/// is sent again.
+fn refused(status: StatusCode, mut body: Value) -> sp_wire::air_request::Served {
+    if status != StatusCode::BAD_REQUEST {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("http_status".into(), json!(status.as_u16()));
         }
     }
+    sp_wire::air_request::Served::Refused(serde_json::to_vec(&body).expect("a JSON value encodes"))
+}
+
+/// What a route's outcome is over AIR: a success is the body, byte for byte
+/// (`serde_json`, the same as axum's `Json`); a 4xx is a signed refusal
+/// ([`refused`]); a 5xx, or a body that cannot be encoded, is "cannot answer
+/// now": nothing of the mint's state is told to the wallet, and a retry is safe,
+/// because what changes state is idempotent by request hash.
+fn served_of(what: &str, (status, body): (StatusCode, Value)) -> sp_wire::air_request::Served {
+    use sp_wire::air_request::Served;
+    if status.is_success() {
+        return match serde_json::to_vec(&body) {
+            Ok(bytes) => Served::Body(bytes),
+            Err(e) => {
+                eprintln!("AIR: {what} could not be encoded: {e}");
+                Served::Unavailable
+            }
+        };
+    }
+    if status.is_client_error() {
+        return refused(status, body);
+    }
+    eprintln!("AIR: {what} cannot be answered now ({status}): {body}");
+    Served::Unavailable
+}
+
+/// A call with a JSON body, over AIR: the same ceiling, the same parse and the
+/// same refusals as the HTTP route of the same name, and the same answer. A body
+/// over `limit` bytes is refused (the `413` JSON, before it is parsed), and one
+/// that does not parse as `Q` is `malformed_request`.
+fn post_served<Q: DeserializeOwned>(
+    what: &str,
+    limit: usize,
+    hint: &str,
+    body: &[u8],
+    call: impl FnOnce(Q) -> (StatusCode, Value),
+) -> sp_wire::air_request::Served {
+    if body.len() > limit {
+        return refused(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            too_large_body(Some(body.len() as u64), limit, hint),
+        );
+    }
+    match serde_json::from_slice::<Q>(body) {
+        Ok(request) => served_of(what, call(request)),
+        Err(e) => refused(StatusCode::BAD_REQUEST, malformed_body(e)),
+    }
+}
+
+/// What `GET /health` reports, as the body of a mint-info reply over AIR:
+/// `ok` while the mint locks are sound and `broken` otherwise (`/health` is
+/// `503` then, with the reason), and the wire version and network.
+pub fn mint_info(state: &EspState) -> sp_wire::air_request::MintInfo {
+    sp_wire::air_request::MintInfo {
+        status: if fatal(state).is_none() {
+            "ok"
+        } else {
+            "broken"
+        }
+        .to_string(),
+        wire_version: sp_wire::WIRE_VERSION,
+        network: state.config.current().network.clone(),
+    }
+}
+
+/// What the AIR listener says to one kind of request: the JSON body the HTTP
+/// route of the same name returns, built by the same code, or a signed "cannot
+/// answer now" where the route would answer 5xx, or a signed refusal where it
+/// would answer 4xx. `None` for a kind this mint does not serve (keys: the ESP
+/// has no `GET /keys`; and anything unknown), which the listener skips.
+///
+/// `body` is the request body (empty for the reads). The ceilings are the same
+/// ones the HTTP routes have, read once at the start of the request, so the same
+/// request is refused in both. Exchange, transfer, redeem and rollover are
+/// idempotent by request hash in the mint, so a resend gets the stored answer.
+pub fn air_served(state: &EspState, kind: u8, body: &[u8]) -> Option<sp_wire::air_request::Served> {
+    use sp_wire::air_request::{
+        KIND_EXCHANGE, KIND_FEES, KIND_KEYSETS, KIND_MINT_INFO, KIND_REDEEM, KIND_ROLLOVER,
+        KIND_ROTATION, KIND_TRANSFER, Served,
+    };
+    let config = state.config.current();
+    Some(match kind {
+        KIND_MINT_INFO => match serde_json::to_vec(&mint_info(state)) {
+            Ok(bytes) => Served::Body(bytes),
+            Err(_) => Served::Unavailable,
+        },
+        KIND_KEYSETS => served_of("keysets", keysets_outcome(state)),
+        KIND_ROTATION => served_of("rotation", rotation_outcome(state)),
+        KIND_FEES => served_of("fees", (StatusCode::OK, fees_body(&config))),
+        KIND_ROLLOVER => post_served(
+            "rollover",
+            config.rollover_max_request_bytes,
+            ROLLOVER_HINT,
+            body,
+            |req: crate::rotation::RolloverRequest| {
+                rollover_outcome(state, &req, config.rollover_max_items)
+            },
+        ),
+        KIND_EXCHANGE => post_served(
+            "exchange",
+            config.exchange_max_request_bytes,
+            EXCHANGE_HINT,
+            body,
+            |req: ExchangeRequest| run_exchange(state, &req, now_secs()),
+        ),
+        KIND_TRANSFER => post_served(
+            "transfer",
+            config.transfer_max_request_bytes,
+            TRANSFER_HINT,
+            body,
+            |req: TransferRequest| run_transfer(state, &req),
+        ),
+        KIND_REDEEM => {
+            // The body is the canonical binary encoding, not JSON.
+            let limit = config.redeem_max_request_bytes;
+            if body.len() > limit {
+                refused(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    too_large_body(Some(body.len() as u64), limit, REDEEM_HINT),
+                )
+            } else {
+                served_of("redeem", run_redeem(state, body, now_secs()))
+            }
+        }
+        _ => return None,
+    })
 }
 
 pub fn router(state: Arc<EspState>) -> Router {
