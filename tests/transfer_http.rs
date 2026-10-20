@@ -1,9 +1,13 @@
-//! The transfer over HTTP, end to end: an ESP server with its own mint, and a
-//! service that signs, sends and unblinds the way the wallet does.
+//! The transfer over AIR, end to end: an ESP mint with its own AIR listener, and
+//! a service that signs, sends and unblinds the way the wallet does.
 //!
 //! A transfer never calls the PSP, so the PSP stand-in here refuses every call.
-//! These are plain tests with their own runtime, because they use the blocking
-//! HTTP client.
+//! The transfer and the keysets go over AIR (see `common`: a refusal is read as
+//! its HTTP status and body); `/audit` and `/health`, which are all that is left
+//! of the HTTP API, are read over HTTP. These are plain tests with their own
+//! runtime, because they use the blocking HTTP client.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -93,7 +97,13 @@ fn ks() -> String {
     KS.with(|k| k.borrow().clone())
 }
 
-fn start_esp(rt: &Runtime, dir: &Path) -> (String, Arc<EspState>) {
+/// One ESP mint: its AIR listener and its HTTP base URL (`/audit`, `/health`).
+struct Esp {
+    base: String,
+    air: common::Air,
+}
+
+fn start_esp(rt: &Runtime, dir: &Path) -> (Esp, Arc<EspState>) {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     KS.with(|k| *k.borrow_mut() = esp_mint::rotation::keyset_id(&master));
     let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
@@ -109,7 +119,9 @@ fn start_esp(rt: &Runtime, dir: &Path) -> (String, Arc<EspState>) {
         rollovers: None,
         in_flight: Default::default(),
     });
-    (serve(rt, server::router(Arc::clone(&state))), state)
+    let base = serve(rt, server::router(Arc::clone(&state)));
+    let air = common::Air::start(&state, &dir.join("air"));
+    (Esp { base, air }, state)
 }
 
 /// An ESP note the mint has issued for `service` and the test day.
@@ -214,20 +226,19 @@ fn request_exact(
     )
 }
 
-fn post_json(base: &str, path: &str, body: &impl serde::Serialize) -> (u16, serde_json::Value) {
-    let response = reqwest::blocking::Client::new()
-        .post(format!("{base}{path}"))
-        .json(body)
-        .send()
-        .unwrap();
-    let code = response.status().as_u16();
-    (code, response.json().unwrap())
+fn post_json(esp: &Esp, path: &str, body: &impl serde::Serialize) -> (u16, serde_json::Value) {
+    esp.air.post_json(path, body)
 }
 
-fn get_json(base: &str, path: &str) -> (u16, serde_json::Value) {
-    let response = reqwest::blocking::get(format!("{base}{path}")).unwrap();
-    let code = response.status().as_u16();
-    (code, response.json().unwrap())
+/// `/audit` and `/health` are read over HTTP; the rest over AIR.
+fn get_json(esp: &Esp, path: &str) -> (u16, serde_json::Value) {
+    if matches!(path, "/audit" | "/health") {
+        let response = reqwest::blocking::get(format!("{}{path}", esp.base)).unwrap();
+        let code = response.status().as_u16();
+        (code, response.json().unwrap())
+    } else {
+        esp.air.get_json(path)
+    }
 }
 
 fn is_spent(state: &EspState, note: &Note) -> bool {
@@ -235,7 +246,7 @@ fn is_spent(state: &EspState, note: &Note) -> bool {
 }
 
 #[test]
-fn a_transfer_over_http_swaps_the_notes_and_the_supply_does_not_change() {
+fn a_transfer_over_air_swaps_the_notes_and_the_supply_does_not_change() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("happy");
     let (esp, state) = start_esp(&rt, &dir);

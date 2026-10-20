@@ -1,12 +1,11 @@
-//! The AIR listener: answers a wallet's requests over AIR, beside the HTTP API.
-//! Off unless `air.enabled` is true. The calls are every wallet-facing one the
-//! HTTP API has: **mint info** (what `GET /health` reports), **keysets** and
-//! **rotation** (`GET /keysets`, `/rotation`), **fees** (`GET /fees`) and the four
-//! that change state, **rollover**, **exchange**, **transfer** and **redeem**
-//! (`POST /rollover`, `/exchange`, `/transfer`, `/redeem`); the reply body is
-//! what the HTTP route returns, built by the same code. `GET /audit` and the
-//! operator's routes are not wallet-facing and stay HTTP only. The HTTP routes
-//! stay, for local use (and until HTTP is removed).
+//! The AIR listener: answers a wallet's requests over AIR. It always runs in
+//! `serve` (AIR is the only way wallets reach this mint; `air.server` and
+//! `air.host` are required). The calls are **mint info** (the status, wire
+//! version and network), **keysets** and **rotation**, **fees**, and the four
+//! that change state, **rollover**, **exchange**, **transfer** and **redeem**;
+//! each reply body is built by `server::air_served` from the call's outcome
+//! function. `GET /audit` and the operator's routes are not wallet-facing; they
+//! stay on HTTP, loopback only.
 //!
 //! The design (REQUEST-DESIGN.md in sandbox-mint, sections 13 to 16) and the wire
 //! (envelopes, addresses, signing) are in `sp_wire::air_request`; this module is
@@ -18,7 +17,7 @@
 //!   it). The DID is the ESP's own (`mint_did_key.json` in the network's data
 //!   folder, not the PSP's), so the PSP and the ESP can share an AIR server
 //!   without their mailboxes meeting. A slot that fills is opened with the DID
-//!   key, answered with what the HTTP route of the request's kind returns now,
+//!   key, answered with what the call of the request's kind returns now,
 //!   signed with the same key, sealed to the wallet's one-off key `R`, and
 //!   `Create`d in the reply cell only the wallet and the mint can compute.
 //! - **Create first, no read-then-write.** The reply cell is write-once, so the
@@ -27,7 +26,7 @@
 //!   cell and two mint processes all end with one reply.
 //! - **A request that changes state is not applied twice.** Exchange, transfer,
 //!   redeem and rollover are idempotent by request hash in the mint itself (it
-//!   stores the answer before it burns, and a resend, over HTTP or AIR, gets
+//!   stores the answer before it burns, and a resend gets
 //!   the stored answer or finishes the interrupted request), so the listener
 //!   needs nothing of its own: a crash between answering and writing the
 //!   counter replays the slot, and the replay is the same request.
@@ -40,23 +39,24 @@
 //! - **Garbage is skipped.** A cell that does not open, is malformed, is of an
 //!   unknown kind or names a key that is not one is logged and skipped, and
 //!   changes no state.
-//! - **A call the mint cannot answer now** (a 5xx from the route: a poisoned
+//! - **A call the mint cannot answer now** (a 5xx outcome: a poisoned
 //!   lock, a failed rotation step, a PSP that could not be reached or refused
 //!   the burn) gets a signed reply with status `unavailable` and no body, so the
 //!   wallet fails at once and says why, instead of waiting out its tries. A
-//!   refusal (a 4xx) is a signed reply with status `refused` and the route's JSON.
+//!   refusal (a 4xx) is a signed reply with status `refused` and the call's JSON.
 //! - **If the AIR client gives up** (the session was refused or killed: more than
 //!   [`LOST_LIMIT`] held reads end within [`LOST_WINDOW_SECS`] seconds, or a
-//!   `Create` fails three times) the listener returns an error and ends. The HTTP
-//!   side keeps running. A restart of esp-mint starts it again from `next`.
+//!   `Create` fails three times) the listener returns an error and ends, and
+//!   `esp-mint serve` exits with status 1, so that the service manager starts it
+//!   again (from `next`): a mint that no wallet can reach is not left running.
 //!
 //! **The one difference from psp-mint: each request is answered on a blocking
 //! thread** (`spawn_blocking`). An exchange calls the PSP with a blocking HTTP
-//! client, which must not run on an async thread, and a redemption reads and
-//! writes files; the HTTP handlers do the same. The requests are still answered
-//! one at a time, in slot order, so a slow exchange (a slow PSP, up to
+//! client (the local call inside the SPI), which must not run on an async
+//! thread, and a redemption reads and writes files. The requests are still
+//! answered one at a time, in slot order, so a slow exchange (a slow PSP, up to
 //! `psp.timeout_secs`) holds up the requests behind it, as a slow request holds
-//! the mint lock over HTTP.
+//! the mint lock.
 //!
 //! Held reads left behind by a stopped listener are never cleaned up by the AIR
 //! server (upstream item 17); with the default of 16 a handful of restarts costs
@@ -247,8 +247,8 @@ pub async fn run(
                 if losses.len() > LOST_LIMIT {
                     return Err(format!(
                         "the AIR session is gone (more than {LOST_LIMIT} held reads ended in \
-                         {LOST_WINDOW_SECS} s). The HTTP API keeps running; restart esp-mint to \
-                         start the listener again, which resumes from slot {next}"
+                         {LOST_WINDOW_SECS} s). esp-mint exits so that it is started again, which resumes \
+                         from slot {next}"
                     ));
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -324,8 +324,7 @@ async fn handle_fill(
 /// Run the listener on the calling thread, with a runtime of its own, until it
 /// fails. For a thread of its own: `serve` starts one so that the HTTP API's
 /// runtime and the listener never share a thread. A panic in `serve` is a failed
-/// answer thread, which ends the listener with an error (the HTTP side keeps
-/// running).
+/// answer thread, which ends the listener with an error.
 pub fn run_blocking(
     settings: &Settings,
     key: &SecretKey,

@@ -1,9 +1,15 @@
-//! The exchange over HTTP, end to end: a PSP built from mint-server's own
-//! handlers, the ESP server calling it through `HttpPsp`, and a wallet that
-//! blinds, signs and unblinds the way a real one does.
+//! The exchange over AIR, end to end: a PSP built from mint-server's own
+//! handlers, the ESP mint calling it through `HttpPsp` (the one HTTP call the ESP
+//! mint makes), its AIR listener, and a wallet that blinds, signs and unblinds
+//! the way a real one does.
 //!
+//! The exchange goes over AIR (see `common`: a refusal is read as its HTTP status
+//! and body, a signed "cannot answer now" as `503`); `/audit` and `/health`,
+//! which are all that is left of the ESP mint's HTTP API, are read over HTTP.
 //! These are plain tests with their own runtime, because the PSP client is
 //! blocking and must not be created or used on an async thread.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -151,19 +157,26 @@ fn preset_ks(dir: &Path) {
     KS.with(|k| *k.borrow_mut() = esp_mint::rotation::keyset_id(&master));
 }
 
-fn start_esp(rt: &Runtime, dir: &Path, psp_url: &str) -> String {
+/// One ESP mint: its HTTP base URL (`/audit`, `/health`) and its AIR listener.
+struct Esp {
+    base: String,
+    air: common::Air,
+}
+
+fn start_esp(rt: &Runtime, dir: &Path, psp_url: &str) -> Esp {
     start_esp_with(rt, dir, psp_url, esp_mint::config::Config::default()).0
 }
 
-/// An ESP server with these settings, and its state. Dropping the state and the
-/// runtime stops the mint and lets go of its data folder, so that the same
-/// folder can be opened again, as after a restart.
+/// An ESP mint with these settings, and its state. Dropping the `Esp`, the state
+/// and the runtime stops the mint and lets go of its data folder, so that the
+/// same folder can be opened again, as after a restart (and gives up the turn on
+/// the AIR server).
 fn start_esp_with(
     rt: &Runtime,
     dir: &Path,
     psp_url: &str,
     config: esp_mint::config::Config,
-) -> (String, Arc<EspState>) {
+) -> (Esp, Arc<EspState>) {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     KS.with(|k| *k.borrow_mut() = esp_mint::rotation::keyset_id(&master));
     let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
@@ -179,7 +192,9 @@ fn start_esp_with(
         rollovers: None,
         in_flight: Default::default(),
     });
-    (serve(rt, server::router(Arc::clone(&state))), state)
+    let base = serve(rt, server::router(Arc::clone(&state)));
+    let air = common::Air::start(&state, &dir.join("air"));
+    (Esp { base, air }, state)
 }
 
 fn psp_note(psp: &AppState, units: u64) -> (Note, Keypair) {
@@ -272,24 +287,20 @@ fn request_exact(
     )
 }
 
-fn post_json(base: &str, path: &str, body: &impl serde::Serialize) -> (u16, serde_json::Value) {
-    let response = reqwest::blocking::Client::new()
-        .post(format!("{base}{path}"))
-        .json(body)
-        .send()
-        .unwrap();
-    let code = response.status().as_u16();
-    (code, response.json().unwrap())
+fn post_json(esp: &Esp, path: &str, body: &impl serde::Serialize) -> (u16, serde_json::Value) {
+    esp.air.post_json(path, body)
 }
 
-fn get_json(base: &str, path: &str) -> (u16, serde_json::Value) {
-    let response = reqwest::blocking::get(format!("{base}{path}")).unwrap();
+/// `/audit` and `/health` are read over HTTP.
+fn get_json(esp: &Esp, path: &str) -> (u16, serde_json::Value) {
+    assert!(matches!(path, "/audit" | "/health"), "{path}");
+    let response = reqwest::blocking::get(format!("{}{path}", esp.base)).unwrap();
     let code = response.status().as_u16();
     (code, response.json().unwrap())
 }
 
 #[test]
-fn an_exchange_over_http_burns_the_psp_and_issues_verifiable_esp() {
+fn an_exchange_over_air_burns_the_psp_and_issues_verifiable_esp() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("happy");
     let (psp_url, psp, _memos) = start_psp(&rt, &dir);
@@ -376,7 +387,7 @@ fn write_pending(dir: &Path, req: &ExchangeRequest) {
 }
 
 #[test]
-fn a_retry_after_this_exchanges_own_burn_is_finished_over_http() {
+fn a_retry_after_this_exchanges_own_burn_is_finished_over_air() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("own-burn");
     let (psp_url, psp, memos) = start_psp(&rt, &dir);
@@ -495,7 +506,7 @@ fn an_underpaid_request_is_a_400_and_the_psp_note_survives() {
 }
 
 #[test]
-fn an_unreachable_psp_is_a_502_and_leaves_nothing_behind() {
+fn an_unreachable_psp_is_a_503_and_leaves_nothing_behind() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("down");
     let (_psp_url, psp, _memos) = start_psp(&rt, &dir);
@@ -505,32 +516,54 @@ fn an_unreachable_psp_is_a_502_and_leaves_nothing_behind() {
     let (note, keypair) = psp_note(&psp, 1);
     let (req, _) = request(note, &keypair, 1, &[ONE_PSP]);
     let (code, body) = post_json(&esp, "/exchange", &req);
-    assert_eq!(code, 502, "{body}");
+    // over AIR a signed "cannot answer now", which the HTTP route called a 502
+    assert_eq!(code, 503, "{body}");
     assert!(!psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
     assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
     rt.shutdown_background();
 }
 
 #[test]
-fn nothing_but_the_documented_routes_exist() {
+fn nothing_but_audit_and_health_is_served_over_http() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("routes");
     let (psp_url, _psp, _memos) = start_psp(&rt, &dir);
     let esp = start_esp(&rt, &dir, &psp_url);
-    for path in ["/admin/issue", "/swap", "/melt"] {
-        let status = reqwest::blocking::Client::new()
-            .post(format!("{esp}{path}"))
+    let client = reqwest::blocking::Client::new();
+    // the calls wallets make go over AIR only, and the PSP's and the operator's
+    // routes are not here either
+    for path in [
+        "/exchange",
+        "/transfer",
+        "/redeem",
+        "/rollover",
+        "/keysets",
+        "/rotation",
+        "/fees",
+        "/keys",
+        "/check-state",
+        "/admin/issue",
+        "/swap",
+        "/melt",
+    ] {
+        let url = format!("{}{path}", esp.base);
+        let post = client
+            .post(&url)
             .json(&serde_json::json!({}))
             .send()
-            .unwrap()
-            .status();
-        assert_eq!(status.as_u16(), 404, "{path}");
+            .unwrap();
+        assert_eq!(post.status().as_u16(), 404, "POST {path}");
+        let get = client.get(&url).send().unwrap();
+        assert_eq!(get.status().as_u16(), 404, "GET {path}");
+    }
+    for path in ["/audit", "/health"] {
+        assert_eq!(get_json(&esp, path).0, 200, "{path}");
     }
     rt.shutdown_background();
 }
 
 /// The split on `/audit`, as (matured, unmatured, unsplit, unfinished).
-fn split_of(esp: &str) -> (u64, u64, u64, u64) {
+fn split_of(esp: &Esp) -> (u64, u64, u64, u64) {
     let (code, audit) = get_json(esp, "/audit");
     assert_eq!(code, 200, "{audit}");
     assert_eq!(
@@ -567,6 +600,7 @@ fn the_audit_splits_the_outstanding_esp_by_maturity_and_keeps_the_split_across_a
     let (code, first_body) = post_json(&esp, "/exchange", &first);
     assert_eq!(code, 200, "{first_body}");
     assert_eq!(split_of(&esp), (2 * ONE_PSP, 0, 0, 0));
+    drop(esp);
     drop(state);
     drop(rt1);
 
@@ -615,6 +649,7 @@ fn the_audit_splits_the_outstanding_esp_by_maturity_and_keeps_the_split_across_a
             "the new notes are not in the ledger, so they are unsplit"
         );
     }
+    drop(esp);
     drop(state);
     drop(rt2);
     rt_psp.shutdown_background();

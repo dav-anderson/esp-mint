@@ -27,14 +27,16 @@ fn load_config(data_dir: &std::path::Path) -> Result<config::Loaded, Box<dyn Err
     })
 }
 
-/// Run the ESP mint's HTTP API.
+/// Run the ESP mint: the AIR listener (the only way wallets reach it), the
+/// loopback HTTP API that is left (`/audit`, `/health`) and the operator's
+/// listener.
 ///
 /// The settings are in `esp-mint.toml` in the data directory (or the file
 /// `ESP_CONFIG` names), each with an environment variable that overrides it.
 /// `esp-mint config` lists them all with the values in use. They are logged at
 /// startup, and a bad value stops the mint with a message that says which. Send
 /// the running mint `SIGHUP` to read them again: everything except the
-/// addresses, the PSP client and the admin body ceiling changes for the next
+/// addresses, the AIR settings, the PSP client and the admin body ceiling changes for the next
 /// request, and those say so and wait for a restart.
 ///
 /// Two things are not settings. `ESP_DATA_DIR` (default `~/.esp-mint`) says where
@@ -55,6 +57,9 @@ fn serve() -> Result<(), Box<dyn Error>> {
         println!("{line}");
     }
     let cfg = loaded.config;
+    // AIR is the only way wallets reach this mint: without its server and host
+    // there is nothing to serve.
+    cfg.require_air()?;
     netdir::refuse_legacy(&base)?;
     let data_dir = netdir::network_dir(&base, &cfg.network);
     std::fs::create_dir_all(&data_dir)?;
@@ -66,14 +71,11 @@ fn serve() -> Result<(), Box<dyn Error>> {
     let bind = cfg.bind.clone();
     let psp_url = cfg.psp_url.clone();
     let admin_bind = admin::check_loopback(&cfg.admin_bind)?;
-    // `air.enabled`: answer wallets' requests over AIR too, on a thread of its
-    // own, with the mint's own DID key (made on first use). Read before `cfg`
-    // moves into the settings handle.
+    // The AIR listener answers wallets' requests on a thread of its own, with
+    // the mint's own DID key (made on first use). Read before `cfg` moves into
+    // the settings handle.
     let air = cfg.air_listener(&data_dir);
-    let did_key = match &air {
-        Some(_) => Some(did::load_or_generate(&data_dir.join(did::KEY_FILENAME))?),
-        None => None,
-    };
+    let did_key = did::load_or_generate(&data_dir.join(did::KEY_FILENAME))?;
     let admin_token = match env::var("ESP_ADMIN_TOKEN") {
         Ok(token) if token.is_empty() => return Err("ESP_ADMIN_TOKEN is set but empty".into()),
         Ok(token) => Some(token),
@@ -117,9 +119,7 @@ fn serve() -> Result<(), Box<dyn Error>> {
         in_flight: Default::default(),
     });
 
-    if let (Some(air), Some(did_key)) = (air, did_key) {
-        start_air_listener(air, did_key, Arc::clone(&state))?;
-    }
+    start_air_listener(air, did_key, Arc::clone(&state))?;
 
     // A poisoned lock means a thread panicked holding the mint, and every later
     // request would fail. Exit so that a supervisor can start a fresh process.
@@ -148,7 +148,9 @@ fn serve() -> Result<(), Box<dyn Error>> {
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         let admin_listener = tokio::net::TcpListener::bind(admin_bind).await?;
-        println!("esp-mint api listening on http://{bind}, burning PSP at {psp_url}");
+        println!(
+            "esp-mint api (/audit, /health) listening on http://{bind}, burning PSP at {psp_url}"
+        );
         println!("esp-mint admin listening on http://{admin_bind}");
 
         // SIGHUP: read the settings again. A bad file changes nothing.
@@ -196,11 +198,11 @@ fn serve() -> Result<(), Box<dyn Error>> {
     })
 }
 
-/// Start the AIR listener (`air.enabled`) on its own thread. It answers every
-/// wallet-facing request with what the HTTP routes return at that moment
-/// (`server::air_served`). If it fails (the AIR client gave up) it says so and
-/// ends; the HTTP API keeps running, and a restart starts the listener again,
-/// from the stored slot counter.
+/// Start the AIR listener on its own thread. It answers every wallet-facing
+/// request (`server::air_served`). If it fails (the AIR client gave up) it says
+/// so and the mint exits with status 1, so that the service manager starts it
+/// again and the listener resumes from the stored slot counter: a mint that no
+/// wallet can reach is not left running.
 fn start_air_listener(
     air: air_listener::Settings,
     did: did::SecretKey,
@@ -217,12 +219,13 @@ fn start_air_listener(
                 Arc::new(move |kind: u8, body: &[u8]| server::air_served(&state, kind, body));
             match air_listener::run_blocking(&air, &did, &serve) {
                 Ok(()) => eprintln!("AIR listener: stopped"),
-                Err(e) => eprintln!(
-                    "AIR listener failed: {e}\nThe HTTP API keeps running; the listener is off until esp-mint is restarted"
-                ),
+                Err(e) => {
+                    eprintln!("AIR listener failed: {e}\nExiting so that a supervisor can restart the process");
+                    std::process::exit(1);
+                }
             }
         })?;
-    println!("AIR listener starting (air.enabled is true)");
+    println!("AIR listener starting");
     Ok(())
 }
 
@@ -301,7 +304,9 @@ fn queue_path(data_dir: &std::path::Path) -> PathBuf {
 const USAGE: &str = "\
 esp-mint <command>
 
-  serve                 Run the public API and the operator's listener.
+  serve                 Run the AIR listener (needs air.server and air.host),
+                        the loopback /audit and /health, and the operator's
+                        listener.
   config                Print the settings in use and where each came from.
   pubkey                Print the mint's DID (66 hex characters), making its
                         key file on first use. Wallets use it as air.esp_did.

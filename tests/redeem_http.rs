@@ -1,10 +1,14 @@
-//! Redemption over HTTP, end to end: an ESP server with its own mint, the
+//! Redemption over AIR, end to end: an ESP mint with its own AIR listener, the
 //! operator's admin listener, and a service that signs and sends the canonical
 //! binary encoding the way the wallet does.
 //!
 //! A redemption never calls the PSP, so the PSP stand-in refuses every call.
-//! These are plain tests with their own runtime, because they use the blocking
-//! HTTP client.
+//! The wallet's calls (redeem, transfer, rollover, keysets, rotation) go over
+//! AIR (see `common`: a refusal is read as its HTTP status and body); the
+//! operator's routes on the admin listener and `/audit` go over HTTP. These are
+//! plain tests with their own runtime, because they use the blocking HTTP client.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -90,10 +94,14 @@ fn serve(rt: &Runtime, app: Router) -> String {
 }
 
 struct Mint {
+    /// The HTTP base URL of the ESP mint (`/audit`, `/health`).
     esp: String,
     admin: String,
     state: Arc<EspState>,
     queue_path: PathBuf,
+    /// The mint's AIR listener. A test that keeps the mint past its last call
+    /// sets this to `None`, which lets the next mint have the AIR server.
+    air: Option<common::Air>,
 }
 
 thread_local! {
@@ -149,11 +157,13 @@ fn start_at_rate(rt: &Runtime, dir: &Path, max_bytes: usize, rate: u128) -> Mint
         esp: Some(Arc::clone(&state)),
     });
     let admin = serve(rt, admin::router(admin_state));
+    let air = Some(common::Air::start(&state, &dir.join("air")));
     Mint {
         esp,
         admin,
         state,
         queue_path,
+        air,
     }
 }
 
@@ -267,17 +277,23 @@ fn request_with_memo(
     )
 }
 
-fn post_bytes(base: &str, bytes: Vec<u8>) -> (u16, Value) {
-    let response = reqwest::blocking::Client::new()
-        .post(format!("{base}/redeem"))
-        .header("content-type", "application/octet-stream")
-        .body(bytes)
-        .send()
-        .unwrap();
-    let code = response.status().as_u16();
-    (code, response.json().unwrap())
+/// A redemption, over AIR.
+fn esp_post_bytes(mint: &Mint, bytes: Vec<u8>) -> (u16, Value) {
+    air(mint).post_bytes("/redeem", &bytes)
 }
 
+/// A JSON call to `path` of the ESP mint, over AIR.
+fn esp_post_json(mint: &Mint, path: &str, body: &Value) -> (u16, Value) {
+    air(mint).post_json(path, body)
+}
+
+fn air(mint: &Mint) -> &common::Air {
+    mint.air
+        .as_ref()
+        .expect("the mint's AIR listener is stopped")
+}
+
+/// A JSON call to an HTTP route (the operator's, on the admin listener).
 fn post_json(base: &str, path: &str, body: &Value) -> (u16, Value) {
     let response = reqwest::blocking::Client::new()
         .post(format!("{base}{path}"))
@@ -299,13 +315,13 @@ fn a_request_over_the_ceiling_is_refused_before_it_is_parsed() {
     let mint = start(&rt, &dir, 1000);
 
     // garbage one byte over the limit: refused for its size, not for its content
-    let (code, body) = post_bytes(&mint.esp, vec![0xff; 1001]);
+    let (code, body) = esp_post_bytes(&mint, vec![0xff; 1001]);
     assert_eq!(code, 413, "{body}");
     assert_eq!(body["code"], "request_too_large");
     assert_eq!(body["limit_bytes"], 1000);
 
     // garbage at the limit is read, and fails to parse
-    let (code, body) = post_bytes(&mint.esp, vec![0xff; 1000]);
+    let (code, body) = esp_post_bytes(&mint, vec![0xff; 1000]);
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "malformed_request");
 
@@ -321,7 +337,7 @@ fn a_request_over_the_ceiling_is_refused_before_it_is_parsed() {
     let (req, _) = request(&notes, &[], &service_keypair());
     let bytes = req.encode();
     assert!(bytes.len() > 1000);
-    let (code, body) = post_bytes(&mint.esp, bytes.clone());
+    let (code, body) = esp_post_bytes(&mint, bytes.clone());
     assert_eq!(code, 413, "{body}");
     assert_eq!(body["code"], "request_too_large");
     assert!(held.iter().all(|(note, _)| !is_spent(&mint, note)));
@@ -339,11 +355,11 @@ fn a_request_that_is_not_the_canonical_encoding_is_a_400() {
     let (req, _) = request(&[(note, &key, 4 * ONE, PAST)], &[], &service_keypair());
     let mut bytes = req.encode();
     bytes.push(0);
-    let (code, body) = post_bytes(&mint.esp, bytes);
+    let (code, body) = esp_post_bytes(&mint, bytes);
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "malformed_request");
     // JSON is not the format
-    let (code, body) = post_json(&mint.esp, "/redeem", &serde_json::json!({}));
+    let (code, body) = esp_post_json(&mint, "/redeem", &serde_json::json!({}));
     assert_eq!(code, 400, "{body}");
     assert!(!is_spent(&mint, &note));
     assert!(nothing_stored(&mint));
@@ -360,7 +376,7 @@ fn an_amount_that_is_not_a_power_of_two_is_a_400_with_no_burn_and_no_fee() {
     let (odd, ko) = esp_note(&mint, ONE + 5, service(), PAST);
 
     let (req, _) = request(&[(odd, &ko, ONE + 5, PAST)], &[], &service_keypair());
-    let (code, body) = post_bytes(&mint.esp, req.encode());
+    let (code, body) = esp_post_bytes(&mint, req.encode());
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "bad_denomination");
     assert_eq!(
@@ -374,7 +390,7 @@ fn an_amount_that_is_not_a_power_of_two_is_a_400_with_no_burn_and_no_fee() {
         &[(ONE, PAST), (ONE + 1, PAST)],
         &service_keypair(),
     );
-    let (code, body) = post_bytes(&mint.esp, req.encode());
+    let (code, body) = esp_post_bytes(&mint, req.encode());
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "bad_denomination");
     assert_eq!(
@@ -394,7 +410,7 @@ fn a_bad_service_signature_is_a_400_with_no_burn_and_no_fee() {
     let mint = start(&rt, &dir, 64 * 1024 * 1024);
     let (note, key) = esp_note(&mint, 4 * ONE, service(), PAST);
     let (req, _) = request(&[(note, &key, 4 * ONE, PAST)], &[], &other_keypair());
-    let (code, body) = post_bytes(&mint.esp, req.encode());
+    let (code, body) = esp_post_bytes(&mint, req.encode());
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "bad_service_signature");
     assert!(!is_spent(&mint, &note));
@@ -412,7 +428,7 @@ fn by_default_a_redemption_costs_no_fee_and_the_whole_amount_is_owed() {
     let mint = start_at_rate(&rt, &dir, 64 * 1024 * 1024, rate);
     let (note, key) = esp_note(&mint, 4 * ONE, service(), PAST);
     let (req, _) = request(&[(note, &key, 4 * ONE, PAST)], &[], &service_keypair());
-    let (code, body) = post_bytes(&mint.esp, req.encode());
+    let (code, body) = esp_post_bytes(&mint, req.encode());
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["fee_esp"], "0");
     assert_eq!(body["owed_esp"], (4 * ONE).to_string());
@@ -437,7 +453,7 @@ fn a_redemption_is_queued_then_declined_and_the_service_collects_the_reissued_no
     let fee = u128::from(bytes.len() as u64) * RATE;
     let id = redeem::request_hash(&req);
 
-    let (code, body) = post_bytes(&mint.esp, bytes.clone());
+    let (code, body) = esp_post_bytes(&mint, bytes.clone());
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["accepted_esp"], (6 * ONE).to_string());
     assert_eq!(body["fee_esp"], fee.to_string());
@@ -452,7 +468,7 @@ fn a_redemption_is_queued_then_declined_and_the_service_collects_the_reissued_no
     assert_eq!(queue.get(&id).unwrap().memo, MEMO);
 
     // the same request again: the same answer, and nothing more is burned or queued
-    let (code, again) = post_bytes(&mint.esp, bytes.clone());
+    let (code, again) = esp_post_bytes(&mint, bytes.clone());
     assert_eq!(code, 200);
     assert_eq!(again, body);
     assert_eq!(Queue::open(&mint.queue_path).unwrap().len(), 1);
@@ -468,7 +484,7 @@ fn a_redemption_is_queued_then_declined_and_the_service_collects_the_reissued_no
     assert_eq!(declined["reissued_esp"], (4 * ONE).to_string());
 
     // the service asks again with the same bytes and is told
-    let (code, after) = post_bytes(&mint.esp, bytes);
+    let (code, after) = esp_post_bytes(&mint, bytes);
     assert_eq!(code, 200, "{after}");
     assert_eq!(after["entry"]["status"], "declined");
     assert_eq!(
@@ -537,9 +553,9 @@ fn a_redemption_split_across_two_requests_makes_two_queue_entries() {
         &service_keypair(),
     );
     let (second, _) = request(&[(c, &kc, 4 * ONE, PAST2)], &[], &service_keypair());
-    let (code, one) = post_bytes(&mint.esp, first.encode());
+    let (code, one) = esp_post_bytes(&mint, first.encode());
     assert_eq!(code, 200, "{one}");
-    let (code, two) = post_bytes(&mint.esp, second.encode());
+    let (code, two) = esp_post_bytes(&mint, second.encode());
     assert_eq!(code, 200, "{two}");
 
     // each request paid its own fee, by its own size
@@ -580,7 +596,7 @@ fn when_the_accepted_notes_only_cover_the_fee_nothing_is_owed_and_a_retry_says_s
         &service_keypair(),
         &memo,
     );
-    let (code, body) = post_bytes(&mint.esp, req.encode());
+    let (code, body) = esp_post_bytes(&mint, req.encode());
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["owed_esp"], "0");
     assert_eq!(body["fee_esp"], fee.to_string());
@@ -590,7 +606,7 @@ fn when_the_accepted_notes_only_cover_the_fee_nothing_is_owed_and_a_retry_says_s
     // no queue entry
     assert!(Queue::open(&mint.queue_path).unwrap().is_empty());
     // a retry returns the stored answer
-    let (code, again) = post_bytes(&mint.esp, req.encode());
+    let (code, again) = esp_post_bytes(&mint, req.encode());
     assert_eq!(code, 200);
     assert_eq!(again, body);
     rt.shutdown_background();
@@ -603,7 +619,7 @@ fn a_request_below_the_fee_is_refused_with_the_fee_in_the_body() {
     let mint = start(&rt, &dir, 64 * 1024 * 1024);
     let (note, key) = esp_note(&mint, 512, service(), PAST);
     let (req, _) = request(&[(note, &key, 512, PAST)], &[], &service_keypair());
-    let (code, body) = post_bytes(&mint.esp, req.encode());
+    let (code, body) = esp_post_bytes(&mint, req.encode());
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "below_fee");
     assert_eq!(body["value_esp"], "512");
@@ -629,7 +645,7 @@ fn decline_outputs_over_the_limit_come_back_with_the_totals_to_rebuild_from() {
         &[(4 * ONE, PAST)],
         &service_keypair(),
     );
-    let (code, body) = post_bytes(&mint.esp, req.encode());
+    let (code, body) = esp_post_bytes(&mint, req.encode());
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "outputs_over_limit");
     assert_eq!(body["list"], "decline_outputs");
@@ -696,11 +712,13 @@ fn start_rotating_with(
             esp: Some(Arc::clone(&state)),
         })),
     );
+    let air = Some(common::Air::start(&state, &dir.join("air")));
     Mint {
         esp,
         admin,
         state,
         queue_path,
+        air,
     }
 }
 
@@ -709,11 +727,18 @@ fn set_clock(mint: &Mint, t: u64) {
     r.clock.store(t, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// `/audit`, over HTTP.
 fn get_json(base: &str, path: &str) -> Value {
+    assert_eq!(path, "/audit");
     reqwest::blocking::get(format!("{base}{path}"))
         .unwrap()
         .json()
         .unwrap()
+}
+
+/// A read of the ESP mint (keysets, rotation), over AIR.
+fn esp_get_json(mint: &Mint, path: &str) -> Value {
+    air(mint).get_json(path).1
 }
 
 fn blinded(units: u64) -> (MintOutput, Keypair, SecretKey) {
@@ -794,7 +819,7 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
         mint.state.master, master0,
         "generation 0 = the existing master secret"
     );
-    let w = get_json(&mint.esp, "/rotation");
+    let w = esp_get_json(&mint, "/rotation");
     assert_eq!(
         (w["first_issue"].clone(), w["current"]["epoch"].clone()),
         (Value::Null, 0.into())
@@ -804,12 +829,12 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
     let b = esp_note(&mint, ONE, service(), PAST);
     let c = esp_note(&mint, ONE, service(), PAST);
     let d = esp_note(&mint, ONE, service(), PAST);
-    let w = get_json(&mint.esp, "/rotation");
+    let w = esp_get_json(&mint, "/rotation");
     assert_eq!(w["first_issue"], T0, "the first issue starts the clock");
     assert_eq!(w["activation"], T0 + 3600);
 
     set_clock(&mint, T0 + 3600);
-    let w = get_json(&mint.esp, "/rotation");
+    let w = esp_get_json(&mint, "/rotation");
     assert_eq!(
         (
             w["active"].clone(),
@@ -831,7 +856,7 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
         &[(ONE, PAST)],
         &service_keypair(),
     );
-    let (code, body) = post_bytes(&mint.esp, req.encode());
+    let (code, body) = esp_post_bytes(&mint, req.encode());
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["notes"][0]["accepted"], true);
     let id = redeem::request_hash(&req);
@@ -862,7 +887,7 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
         outputs,
         service_signature: SECP256K1.sign_schnorr(&dg, &service_keypair()),
     };
-    let (code, body) = post_json(&mint.esp, "/transfer", &serde_json::to_value(&tr).unwrap());
+    let (code, body) = esp_post_json(&mint, "/transfer", &serde_json::to_value(&tr).unwrap());
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["keyset"], id1.as_str());
     let key: secp256k1::PublicKey = serde_json::from_value(body["keys"][0].clone()).unwrap();
@@ -871,7 +896,7 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
     // Rollover by the holder: same amount and terms, current set; a retry gets
     // the stored answer; a split is refused.
     let rq = rollover_req(&c, ONE, ONE);
-    let (code, body) = post_json(&mint.esp, "/rollover", &serde_json::to_value(&rq).unwrap());
+    let (code, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&rq).unwrap());
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["epoch"], 1);
     assert_eq!(body["keyset"], id1.as_str(), "the answer names its signer");
@@ -885,12 +910,12 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
     let key: secp256k1::PublicKey = serde_json::from_value(body["keys"][0].clone()).unwrap();
     assert_eq!(key, current_key(&mint, ONE));
     assert_eq!(
-        post_json(&mint.esp, "/rollover", &serde_json::to_value(&rq).unwrap()),
+        esp_post_json(&mint, "/rollover", &serde_json::to_value(&rq).unwrap()),
         (200, body)
     );
     assert_eq!(
-        post_json(
-            &mint.esp,
+        esp_post_json(
+            &mint,
             "/rollover",
             &serde_json::to_value(rollover_req(&d, ONE, ONE / 2)).unwrap()
         )
@@ -900,7 +925,7 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
 
     // The next rotation deletes generation 0 with its spent list: `d` is lost.
     set_clock(&mint, T0 + 2 * 3600);
-    let w = get_json(&mint.esp, "/rotation");
+    let w = esp_get_json(&mint, "/rotation");
     assert_eq!(
         (
             w["current"]["epoch"].clone(),
@@ -911,8 +936,8 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
     assert!(
         !dir.join("esp").join("master_secret.hex").exists() && !dir.join("esp").join("db").exists()
     );
-    let (code, body) = post_json(
-        &mint.esp,
+    let (code, body) = esp_post_json(
+        &mint,
         "/rollover",
         &serde_json::to_value(rollover_req(&d, ONE, ONE)).unwrap(),
     );
@@ -925,15 +950,15 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
     // same way, and nothing is burned.
     set_keysets(&id0, w["current"]["id"].as_str().unwrap());
     let (late, _) = request(&[(d.0, &d.1, ONE, PAST)], &[], &service_keypair());
-    let (code, body) = post_bytes(&mint.esp, late.encode());
+    let (code, body) = esp_post_bytes(&mint, late.encode());
     assert_eq!(
         code, 400,
         "below the fee once the expired note is out: {body}"
     );
     // An unknown keyset is told apart from a retired one.
     set_keysets(&"ab".repeat(8), w["current"]["id"].as_str().unwrap());
-    let (code, body) = post_json(
-        &mint.esp,
+    let (code, body) = esp_post_json(
+        &mint,
         "/rollover",
         &serde_json::to_value(rollover_req(&d, ONE, ONE)).unwrap(),
     );
@@ -953,9 +978,9 @@ fn an_esp_rollover_interrupted_after_the_burn_is_finished_by_the_retry() {
     let dir = scratch("rot-crash");
     let mint = start_rotating(&rt, &dir);
     let n = esp_note(&mint, ONE, service(), PAST);
-    let _ = get_json(&mint.esp, "/rotation");
+    let _ = esp_get_json(&mint, "/rotation");
     set_clock(&mint, T0 + 3600);
-    let w = get_json(&mint.esp, "/rotation");
+    let w = esp_get_json(&mint, "/rotation");
     set_keysets(
         w["previous"]["id"].as_str().unwrap(),
         w["current"]["id"].as_str().unwrap(),
@@ -982,10 +1007,10 @@ fn an_esp_rollover_interrupted_after_the_burn_is_finished_by_the_retry() {
         *mint.state.rollovers.as_ref().unwrap().lock().unwrap() =
             esp_mint::rotation::Rollovers::open(&data).unwrap();
     }
-    let (code, body) = post_json(&mint.esp, "/rollover", &serde_json::to_value(&rq).unwrap());
+    let (code, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&rq).unwrap());
     assert_eq!(code, 200, "{body}");
     assert_eq!(
-        post_json(&mint.esp, "/rollover", &serde_json::to_value(&rq).unwrap()),
+        esp_post_json(&mint, "/rollover", &serde_json::to_value(&rq).unwrap()),
         (200, body)
     );
 }
@@ -995,7 +1020,7 @@ fn a_decline_after_the_requested_keyset_retires_is_signed_by_the_current_set_and
     let rt = Runtime::new().unwrap();
     let dir = scratch("queue-rule");
     let mint = start_rotating(&rt, &dir);
-    let id0 = get_json(&mint.esp, "/rotation")["current"]["id"]
+    let id0 = esp_get_json(&mint, "/rotation")["current"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1007,18 +1032,18 @@ fn a_decline_after_the_requested_keyset_retires_is_signed_by_the_current_set_and
         &service_keypair(),
     );
     let bytes = req.encode();
-    let (code, body) = post_bytes(&mint.esp, bytes.clone());
+    let (code, body) = esp_post_bytes(&mint, bytes.clone());
     assert_eq!(code, 200, "{body}");
     let id = redeem::request_hash(&req);
 
     // Two rotations: generation 0 is deleted and listed as retired.
     set_clock(&mint, T0 + 3600);
-    let _ = get_json(&mint.esp, "/rotation");
+    let _ = esp_get_json(&mint, "/rotation");
     set_clock(&mint, T0 + 2 * 3600);
-    let w = get_json(&mint.esp, "/rotation");
+    let w = esp_get_json(&mint, "/rotation");
     let current = w["current"]["id"].as_str().unwrap().to_string();
     assert_ne!(current, id0);
-    let ks = get_json(&mint.esp, "/keysets");
+    let ks = esp_get_json(&mint, "/keysets");
     assert_eq!(ks["current"], current.as_str());
     assert_ne!(ks["previous"], id0.as_str());
 
@@ -1037,7 +1062,7 @@ fn a_decline_after_the_requested_keyset_retires_is_signed_by_the_current_set_and
         "{audit}"
     );
     assert_eq!(audit["requests_unfinished"], 0, "{audit}");
-    let (code, after) = post_bytes(&mint.esp, bytes);
+    let (code, after) = esp_post_bytes(&mint, bytes);
     assert_eq!(code, 200, "{after}");
     let sigs = after["entry"]["decline_signatures"].as_array().unwrap();
     assert_eq!(sigs.len(), wanted.len());
@@ -1071,9 +1096,9 @@ fn transfer_req(note: &(Note, Keypair), units: u64) -> esp_mint::transfer::Trans
 
 /// After one rotation: (generation 0's id, the current id).
 fn rotate_once(mint: &Mint) -> (String, String) {
-    let _ = get_json(&mint.esp, "/rotation");
+    let _ = esp_get_json(&mint, "/rotation");
     set_clock(mint, T0 + 3600);
-    let w = get_json(&mint.esp, "/rotation");
+    let w = esp_get_json(&mint, "/rotation");
     (
         w["previous"]["id"].as_str().unwrap().to_string(),
         w["current"]["id"].as_str().unwrap().to_string(),
@@ -1092,15 +1117,15 @@ fn new_outputs_naming_the_previous_set_are_signed_by_it() {
     assert_ne!(id0, id1);
     // Previous-set notes in, outputs asked of the previous set: signed by it.
     set_keysets(&id0, &id0);
-    let (code, body) = post_json(
-        &mint.esp,
+    let (code, body) = esp_post_json(
+        &mint,
         "/transfer",
         &serde_json::to_value(transfer_req(&a, ONE)).unwrap(),
     );
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["keyset"], id0.as_str(), "the set that signed it");
-    let (code, body) = post_json(
-        &mint.esp,
+    let (code, body) = esp_post_json(
+        &mint,
         "/rollover",
         &serde_json::to_value(rollover_req(&b, 2 * ONE, 2 * ONE)).unwrap(),
     );
@@ -1113,7 +1138,7 @@ fn new_outputs_naming_the_previous_set_are_signed_by_it() {
         &[(ONE, PAST)],
         &service_keypair(),
     );
-    let (code, body) = post_bytes(&mint.esp, req.encode());
+    let (code, body) = esp_post_bytes(&mint, req.encode());
     assert_eq!(code, 200, "{body}");
 }
 
@@ -1136,7 +1161,7 @@ fn outputs_naming_a_set_that_is_not_live_are_refused_and_nothing_is_burned() {
             serde_json::to_value(rollover_req(&a, ONE, ONE)).unwrap(),
         ),
     ] {
-        let (code, body) = post_json(&mint.esp, route, &body);
+        let (code, body) = esp_post_json(&mint, route, &body);
         assert_eq!(
             (code, body["code"].as_str()),
             (400, Some("unknown_keyset")),
@@ -1148,7 +1173,7 @@ fn outputs_naming_a_set_that_is_not_live_are_refused_and_nothing_is_burned() {
         &[(ONE, PAST)],
         &service_keypair(),
     );
-    let (code, body) = post_bytes(&mint.esp, req.encode());
+    let (code, body) = esp_post_bytes(&mint, req.encode());
     assert_eq!(
         (code, body["code"].as_str()),
         (400, Some("unknown_keyset")),
@@ -1207,7 +1232,7 @@ fn rollover_after_retirement(
             esp_mint::rotation::Rollovers::open(&data).unwrap();
     }
     set_clock(&mint, T0 + 2 * 3600);
-    let w = get_json(&mint.esp, "/rotation");
+    let w = esp_get_json(&mint, "/rotation");
     assert_eq!(
         w["previous"]["id"].as_str(),
         Some(id1.as_str()),
@@ -1215,13 +1240,13 @@ fn rollover_after_retirement(
     );
     let expected = if later {
         set_clock(&mint, T0 + 3 * 3600);
-        let w = get_json(&mint.esp, "/rotation");
+        let w = esp_get_json(&mint, "/rotation");
         assert_ne!(w["previous"]["id"].as_str(), Some(id1.as_str()), "deleted");
         w["current"]["id"].as_str().unwrap().to_string()
     } else {
         id1.clone()
     };
-    let (code, body) = post_json(&mint.esp, "/rollover", &serde_json::to_value(&rq).unwrap());
+    let (code, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&rq).unwrap());
     rt.shutdown_background();
     (code, body, expected)
 }
@@ -1305,7 +1330,7 @@ fn transfer_after_retirement(
             .unwrap();
     }
     set_clock(&mint, T0 + 2 * 3600);
-    let w = get_json(&mint.esp, "/rotation");
+    let w = esp_get_json(&mint, "/rotation");
     assert_eq!(
         w["previous"]["id"].as_str(),
         Some(id1.as_str()),
@@ -1313,13 +1338,13 @@ fn transfer_after_retirement(
     );
     let expected = if later {
         set_clock(&mint, T0 + 3 * 3600);
-        let w = get_json(&mint.esp, "/rotation");
+        let w = esp_get_json(&mint, "/rotation");
         assert_ne!(w["previous"]["id"].as_str(), Some(id1.as_str()), "deleted");
         w["current"]["id"].as_str().unwrap().to_string()
     } else {
         id1.clone()
     };
-    let (code, body) = post_json(&mint.esp, "/transfer", &serde_json::to_value(&tr).unwrap());
+    let (code, body) = esp_post_json(&mint, "/transfer", &serde_json::to_value(&tr).unwrap());
     rt.shutdown_background();
     (code, body, expected)
 }
@@ -1402,7 +1427,7 @@ fn a_decline_whose_requested_set_is_still_live_is_signed_by_that_set() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("queue-previous");
     let mint = start_rotating(&rt, &dir);
-    let id0 = get_json(&mint.esp, "/rotation")["current"]["id"]
+    let id0 = esp_get_json(&mint, "/rotation")["current"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1413,7 +1438,7 @@ fn a_decline_whose_requested_set_is_still_live_is_signed_by_that_set() {
         &service_keypair(),
     );
     let bytes = req.encode();
-    assert_eq!(post_bytes(&mint.esp, bytes.clone()).0, 200);
+    assert_eq!(esp_post_bytes(&mint, bytes.clone()).0, 200);
     // One rotation: the requested set is previous, still live.
     let (id0b, _id1) = rotate_once(&mint);
     assert_eq!(id0, id0b);
@@ -1423,7 +1448,7 @@ fn a_decline_whose_requested_set_is_still_live_is_signed_by_that_set() {
         &serde_json::json!({"entry_id": redeem::request_hash(&req), "reason": "terms"}),
     );
     assert_eq!(code, 200, "{declined}");
-    let (_, after) = post_bytes(&mint.esp, bytes);
+    let (_, after) = esp_post_bytes(&mint, bytes);
     for sig in after["entry"]["decline_signatures"].as_array().unwrap() {
         assert_eq!(sig["keyset"], id0.as_str(), "signed by the set it named");
         let key: secp256k1::PublicKey = serde_json::from_value(sig["key"].clone()).unwrap();
@@ -1450,8 +1475,8 @@ fn a_note_held_by_a_pending_rollover_cannot_be_taken_by_a_transfer_or_another_ro
     .unwrap();
     *mint.state.rollovers.as_ref().unwrap().lock().unwrap() =
         esp_mint::rotation::Rollovers::open(&data).unwrap();
-    let (code, body) = post_json(
-        &mint.esp,
+    let (code, body) = esp_post_json(
+        &mint,
         "/transfer",
         &serde_json::to_value(transfer_req(&n, ONE)).unwrap(),
     );
@@ -1459,16 +1484,12 @@ fn a_note_held_by_a_pending_rollover_cannot_be_taken_by_a_transfer_or_another_ro
     assert!(body.to_string().contains("held"), "{body}");
     let other = rollover_req(&n, ONE, ONE);
     assert_ne!(other.hash(), rq.hash());
-    let (code, body) = post_json(
-        &mint.esp,
-        "/rollover",
-        &serde_json::to_value(&other).unwrap(),
-    );
+    let (code, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&other).unwrap());
     assert_eq!(code, 400, "{body}");
     assert!(body.to_string().contains("held"), "{body}");
     assert!(!is_spent(&mint, &n.0), "nothing burned");
     // The holder finishes.
-    let (code, body) = post_json(&mint.esp, "/rollover", &serde_json::to_value(&rq).unwrap());
+    let (code, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&rq).unwrap());
     assert_eq!(code, 200, "{body}");
     assert!(is_spent(&mint, &n.0));
     rt.shutdown_background();
@@ -1484,11 +1505,7 @@ fn a_rollover_with_one_spent_input_among_several_burns_none() {
     let c = esp_note(&mint, ONE, service(), PAST);
     // `a` is rolled over first, alone.
     let first = rollover_req(&a, ONE, ONE);
-    let (code, body) = post_json(
-        &mint.esp,
-        "/rollover",
-        &serde_json::to_value(&first).unwrap(),
-    );
+    let (code, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&first).unwrap());
     assert_eq!(code, 200, "{body}");
     // Then three notes, `a` among them: refused whole, and `b` and `c` stay.
     let mut r = esp_mint::rotation::RolloverRequest {
@@ -1510,7 +1527,7 @@ fn a_rollover_with_one_spent_input_among_several_burns_none() {
     for (input, n) in r.inputs.iter_mut().zip([&b, &a, &c]) {
         input.spend_signature = SECP256K1.sign_schnorr(&d, &n.1);
     }
-    let (code, body) = post_json(&mint.esp, "/rollover", &serde_json::to_value(&r).unwrap());
+    let (code, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&r).unwrap());
     assert_eq!(code, 400, "{body}");
     assert!(body.to_string().contains("already spent"), "{body}");
     // the body names the spent input (the second in the request), for the wallet
@@ -1529,7 +1546,7 @@ fn a_rollover_with_one_spent_input_among_several_burns_none() {
 fn redeem_after_retirement(name: &str, burn: bool, flag: bool) -> (u16, Value, Mint, Note) {
     let rt = Runtime::new().unwrap();
     let dir = scratch(name);
-    let mint = start_rotating(&rt, &dir);
+    let mut mint = start_rotating(&rt, &dir);
     let a = esp_note(&mint, 2 * ONE, service(), PAST);
     let b = esp_note(&mint, 2 * ONE, service(), PAST);
     let (id0, id1) = rotate_once(&mint);
@@ -1543,7 +1560,7 @@ fn redeem_after_retirement(name: &str, burn: bool, flag: bool) -> (u16, Value, M
     // The decision: from running the request itself when its note is to be
     // burned, else from a twin request (note b) of the same shape.
     let plan = if burn {
-        let (code, body) = post_bytes(&mint.esp, req.encode());
+        let (code, body) = esp_post_bytes(&mint, req.encode());
         assert_eq!(code, 200, "{body}");
         // The crash came before the queue entry was written.
         std::fs::remove_file(&mint.queue_path).unwrap();
@@ -1557,7 +1574,7 @@ fn redeem_after_retirement(name: &str, burn: bool, flag: bool) -> (u16, Value, M
             &[(ONE, PAST)],
             &service_keypair(),
         );
-        let (code, body) = post_bytes(&mint.esp, twin.encode());
+        let (code, body) = esp_post_bytes(&mint, twin.encode());
         assert_eq!(code, 200, "{body}");
         match mint
             .state
@@ -1591,9 +1608,11 @@ fn redeem_after_retirement(name: &str, burn: bool, flag: bool) -> (u16, Value, M
         .unwrap();
     // The note's set retires (two rotations after it was current).
     set_clock(&mint, T0 + 2 * 3600);
-    let w = get_json(&mint.esp, "/rotation");
+    let w = esp_get_json(&mint, "/rotation");
     assert_ne!(w["previous"]["id"], id0.as_str(), "generation 0 is deleted");
-    let (code, body) = post_bytes(&mint.esp, req.encode());
+    let (code, body) = esp_post_bytes(&mint, req.encode());
+    // the caller reads the mint's files, and starts the next mint
+    mint.air = None;
     rt.shutdown_background();
     (code, body, mint, a.0)
 }
@@ -1677,12 +1696,12 @@ fn a_rollover_over_the_configured_note_count_is_refused_and_nothing_is_burned() 
     let d = rq.digest();
     rq.inputs[0].spend_signature = SECP256K1.sign_schnorr(&d, &a.1);
     rq.inputs[1].spend_signature = SECP256K1.sign_schnorr(&d, &b.1);
-    let (code, body) = post_json(&mint.esp, "/rollover", &serde_json::to_value(&rq).unwrap());
+    let (code, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&rq).unwrap());
     assert_eq!(code, 400, "{body}");
     assert!(body.to_string().contains("1 to 1 notes"), "{body}");
     // the notes are still good: a rollover of one of them goes through
     let one = rollover_req(&a, ONE, ONE);
-    let (code, body) = post_json(&mint.esp, "/rollover", &serde_json::to_value(&one).unwrap());
+    let (code, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&one).unwrap());
     assert_eq!(code, 200, "{body}");
     std::fs::remove_dir_all(&dir).unwrap();
 }

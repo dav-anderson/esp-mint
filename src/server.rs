@@ -1,52 +1,40 @@
-//! The ESP mint's HTTP API.
+//! The ESP mint's requests, and the HTTP API that is left.
 //!
-//! Routes:
+//! **Wallets reach this mint over AIR only.** The calls (mint info, keysets,
+//! rotation, fees, rollover, exchange, transfer and redeem) are answered by the
+//! AIR listener (`air_listener`) with `air_served`, which builds each reply from
+//! one outcome function per call (`run_exchange`, `run_transfer`, `run_redeem`,
+//! `rollover_outcome`, `keysets_outcome`, `rotation_outcome`, `fees_body`,
+//! `mint_info`). There are no HTTP routes for them.
 //!
-//! - `POST /exchange`: PSP notes and blinded outputs in, blind signatures out.
-//!   `200` with the response, `400` if the request is refused, `413` if the body
-//!   is over `exchange.max_request_bytes`, `502` if the PSP could not be reached
-//!   or refused the burn (a retry is safe), `500` for a fault in the mint (a retry
-//!   is safe).
-//! - `POST /transfer`: ESP notes the service holds in, fresh notes only the
-//!   service controls out, with the same service and the same redeemable-after
-//!   day. `200` with the response, `400` if the request is refused (nothing was
-//!   burned), `413` if the body is over `transfer.max_request_bytes`, `500` for a
-//!   fault in the mint (a retry is safe).
-//! - `POST /rollover`: ESP notes of the previous key set moved to the current
-//!   one. `200` with the response, `400` if the request is refused (nothing was
-//!   burned), `413` if the body is over `rollover.max_request_bytes`, `404` if
-//!   the mint does not rotate.
-//! - `POST /redeem`: a service's redemption. The body is the request in its
-//!   canonical binary encoding (`redeem::encode`), not JSON, so that its length
-//!   is the size the fee is charged on. `200` with the answer (which notes were
-//!   accepted and why not, the fee, what is owed, the refunds, and the queue
-//!   entry's status), `400` if the request is refused (nothing was burned; the
-//!   body has a `code`, and for output limits the totals to rebuild from), `413`
-//!   if the body is over `redeem.max_request_bytes`, `500` for a fault in the
-//!   mint (a retry is safe).
-//! - `GET /fees`: the fee rates, size formulas and ceilings now in force, for a
-//!   wallet that builds a request.
+//! What is left on HTTP, on `server.bind` (loopback only):
+//!
 //! - `GET /audit`: issued, redeemed and outstanding ESP units, and the
 //!   outstanding split into `outstanding_matured` (days that have come),
 //!   `outstanding_unmatured` (days ahead) and `outstanding_unsplit` (issued
-//!   before 0.5.0, day unknown), from the per-day ledger (see `ledger`).
-//! - `GET /health`: `200` while the mint locks are sound, `503` otherwise.
+//!   before 0.5.0, day unknown), from the per-day ledger (see `ledger`). For
+//!   the operator.
+//! - `GET /health`: `200` while the mint locks are sound, `503` otherwise. Read
+//!   by `spi` and the health monitor on this machine; wallets get the same
+//!   status in the mint info over AIR.
 //!
-//! Every route that takes a body checks its size first. A body whose
-//! `Content-Length` is over the route's ceiling is refused with `413` without
-//! reading any of it, and one that does not say is read only as far as the
-//! ceiling. Nothing is parsed, checked, burned or charged for a request that is
-//! too large. After that the order is the same on every route, cheapest first:
-//! the shape and field limits, the amounts, the signatures, the mint's database,
-//! the reservations of other unfinished requests, and only then anything that is
-//! written or burned.
+//! The operator's routes (payouts, settle, decline) are on the admin router
+//! (`admin`), on `server.admin_bind`, also loopback only.
+//!
+//! Every call that takes a body checks its size first: a body over the call's
+//! ceiling is refused with the `413` JSON before anything is parsed, checked,
+//! burned or charged for. After that the order is the same on every call,
+//! cheapest first: the shape and field limits, the amounts, the signatures, the
+//! mint's database, the reservations of other unfinished requests, and only then
+//! anything that is written or burned.
 //!
 //! Each request takes the settings once, at its start (`state.config.current()`),
 //! and uses them throughout, so a reload (`SIGHUP`) changes the rates and limits
 //! for requests accepted after it and never for one already running.
 //!
-//! There is no authentication and no TLS. A note authorizes its own spend, so a
-//! caller can only burn notes they hold. Bind to localhost.
+//! There is no authentication and no TLS on HTTP: it is loopback only. A note
+//! authorizes its own spend, so a caller of the AIR listener can only burn notes
+//! they hold.
 //!
 //! The mint and the stored responses are behind two mutexes, taken in that
 //! order and held for the whole request, including the call to the PSP. One
@@ -61,7 +49,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use mint_core::MintLogic;
 use serde::de::DeserializeOwned;
@@ -479,13 +467,13 @@ pub fn run_redeem(state: &EspState, body: &[u8], now_unix: u64) -> (StatusCode, 
 
 type Refusal = (StatusCode, Json<Value>);
 
-/// What a `413` says to do, per route (the same text over HTTP and AIR).
+/// What a `413` says to do, per call.
 const EXCHANGE_HINT: &str = "Split the exchange into several requests.";
 const TRANSFER_HINT: &str = "Split the transfer into several requests.";
 const ROLLOVER_HINT: &str = "Split the rollover into several requests.";
 const REDEEM_HINT: &str = "Split the redemption into several requests.";
 
-/// The JSON body of a `413` (shared with the AIR listener).
+/// The JSON body of a `413`.
 fn too_large_body(size: Option<u64>, limit: usize, hint: &str) -> Value {
     let said = match size {
         Some(size) => format!("the request is {size} bytes"),
@@ -509,8 +497,7 @@ fn too_large(size: Option<u64>, limit: usize, hint: &str) -> Refusal {
     )
 }
 
-/// The JSON body of a `400` for a body that is not a request (shared with the
-/// AIR listener).
+/// The JSON body of a `400` for a body that is not a request.
 fn malformed_body(why: impl std::fmt::Display) -> Value {
     json!({
         "error": format!("not a valid request: {why}"),
@@ -524,9 +511,10 @@ fn malformed(why: impl std::fmt::Display) -> Refusal {
 }
 
 /// Read a request body, but only up to `limit` bytes. This is the first thing
-/// every route does, before anything is parsed: a body that says it is too large
-/// is refused without reading any of it, and one that does not say is read only
-/// as far as the limit.
+/// the operator's routes do (`admin`), before anything is parsed: a body that
+/// says it is too large is refused without reading any of it, and one that does
+/// not say is read only as far as the limit. (The AIR calls check the length of
+/// the body they were handed, in `post_served`.)
 pub(crate) async fn read_limited(
     headers: &HeaderMap,
     body: Body,
@@ -544,84 +532,6 @@ pub(crate) async fn read_limited(
         Ok(bytes) => Ok(bytes),
         Err(e) if e.to_string().contains("length limit") => Err(too_large(None, limit, hint)),
         Err(e) => Err(malformed(format!("the body could not be read: {e}"))),
-    }
-}
-
-/// Read the body of a JSON route under its ceiling and parse it. Unknown fields
-/// are not a problem here: the request types decide that.
-async fn read_json<T: DeserializeOwned>(
-    headers: &HeaderMap,
-    body: Body,
-    limit: usize,
-    hint: &str,
-) -> Result<T, Refusal> {
-    let bytes = read_limited(headers, body, limit, hint).await?;
-    serde_json::from_slice(&bytes).map_err(malformed)
-}
-
-async fn redeem_handler(
-    State(state): State<Arc<EspState>>,
-    headers: HeaderMap,
-    body: Body,
-) -> (StatusCode, Json<Value>) {
-    // The ceiling comes first. Nothing is parsed, checked or charged for a body
-    // over it.
-    let limit = state.config.current().redeem_max_request_bytes;
-    let bytes = match read_limited(&headers, body, limit, REDEEM_HINT).await {
-        Ok(bytes) => bytes,
-        Err(refusal) => return refusal,
-    };
-    // Decoding and checking read files and can take a while for a big request.
-    let joined = tokio::task::spawn_blocking(move || run_redeem(&state, &bytes, now_secs())).await;
-    match joined {
-        Ok((code, body)) => (code, Json(body)),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("redeem task failed: {e}")})),
-        ),
-    }
-}
-
-async fn transfer_handler(
-    State(state): State<Arc<EspState>>,
-    headers: HeaderMap,
-    body: Body,
-) -> (StatusCode, Json<Value>) {
-    let limit = state.config.current().transfer_max_request_bytes;
-    let request: TransferRequest = match read_json(&headers, body, limit, TRANSFER_HINT).await {
-        Ok(request) => request,
-        Err(refusal) => return refusal,
-    };
-    // The work reads and writes files, so it runs on a blocking thread.
-    let joined = tokio::task::spawn_blocking(move || run_transfer(&state, &request)).await;
-    match joined {
-        Ok((code, body)) => (code, Json(body)),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("transfer task failed: {e}")})),
-        ),
-    }
-}
-
-async fn exchange_handler(
-    State(state): State<Arc<EspState>>,
-    headers: HeaderMap,
-    body: Body,
-) -> (StatusCode, Json<Value>) {
-    let limit = state.config.current().exchange_max_request_bytes;
-    let request: ExchangeRequest = match read_json(&headers, body, limit, EXCHANGE_HINT).await {
-        Ok(request) => request,
-        Err(refusal) => return refusal,
-    };
-    // The PSP client is blocking, so the work runs on a blocking thread.
-    let joined =
-        tokio::task::spawn_blocking(move || run_exchange(&state, &request, now_secs())).await;
-    match joined {
-        Ok((code, body)) => (code, Json(body)),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("exchange task failed: {e}")})),
-        ),
     }
 }
 
@@ -667,10 +577,6 @@ pub fn fees_body(config: &config::Config) -> Value {
             },
         },
     })
-}
-
-async fn fees_handler(State(state): State<Arc<EspState>>) -> Json<Value> {
-    Json(fees_body(&state.config.current()))
 }
 
 async fn audit_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<Value>) {
@@ -798,11 +704,6 @@ fn keysets_outcome(state: &EspState) -> (StatusCode, Value) {
     }
 }
 
-async fn keysets_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<Value>) {
-    let (code, body) = keysets_outcome(&state);
-    (code, Json(body))
-}
-
 /// `GET /rotation`: public and read-only, the same shape as fsp-mint's. As a
 /// status and a body, so that the AIR listener answers with the same.
 fn rotation_outcome(state: &EspState) -> (StatusCode, Value) {
@@ -825,16 +726,11 @@ fn rotation_outcome(state: &EspState) -> (StatusCode, Value) {
     }
 }
 
-async fn rotation_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<Value>) {
-    let (code, body) = rotation_outcome(&state);
-    (code, Json(body))
-}
-
-/// `POST /rollover`: move ESP of the previous (or current) key set to the
+/// Rollover: move ESP of the previous (or current) key set to the
 /// current one, same amounts and terms. Stored by request hash: the answer is
-/// kept before any note is marked spent, so a resend (over HTTP or AIR) gets the
+/// kept before any note is marked spent, so a resend gets the
 /// stored answer and a crash in the middle is finished by the next resend. As a
-/// status and a body, so that the AIR listener answers with the same.
+/// status and a body, which the AIR listener turns into the reply.
 pub fn rollover_outcome(
     state: &EspState,
     req: &crate::rotation::RolloverRequest,
@@ -890,34 +786,13 @@ pub fn rollover_outcome(
     }
 }
 
-async fn rollover_handler(
-    State(state): State<Arc<EspState>>,
-    headers: HeaderMap,
-    body: Body,
-) -> (StatusCode, Json<Value>) {
-    let config = state.config.current();
-    let req: crate::rotation::RolloverRequest = match read_json(
-        &headers,
-        body,
-        config.rollover_max_request_bytes,
-        ROLLOVER_HINT,
-    )
-    .await
-    {
-        Ok(request) => request,
-        Err(refusal) => return refusal,
-    };
-    let (code, body) = rollover_outcome(&state, &req, config.rollover_max_items);
-    (code, Json(body))
-}
-
 // ---- over AIR ---------------------------------------------------------------
 
 /// The signed refusal of a 4xx. A `400` is the route's body as it is. Any other
 /// 4xx (the `404` of a mint that does not rotate, the `409` `in_progress` of an
 /// exchange already being processed, the `413` of a body over its ceiling) has
 /// `http_status` added to the body, so that the wallet can treat it as it treats
-/// that status over HTTP: only a `400` means "refused, nothing was burned", and
+/// that status as an HTTP status: only a `400` means "refused, nothing was burned", and
 /// the others are an error where the outcome may be unknown and the same request
 /// is sent again.
 fn refused(status: StatusCode, mut body: Value) -> sp_wire::air_request::Served {
@@ -952,10 +827,9 @@ fn served_of(what: &str, (status, body): (StatusCode, Value)) -> sp_wire::air_re
     Served::Unavailable
 }
 
-/// A call with a JSON body, over AIR: the same ceiling, the same parse and the
-/// same refusals as the HTTP route of the same name, and the same answer. A body
-/// over `limit` bytes is refused (the `413` JSON, before it is parsed), and one
-/// that does not parse as `Q` is `malformed_request`.
+/// A call with a JSON body: the ceiling first, then the parse, then the call. A
+/// body over `limit` bytes is refused (the `413` JSON, before it is parsed), and
+/// one that does not parse as `Q` is `malformed_request`.
 fn post_served<Q: DeserializeOwned>(
     what: &str,
     limit: usize,
@@ -991,15 +865,13 @@ pub fn mint_info(state: &EspState) -> sp_wire::air_request::MintInfo {
     }
 }
 
-/// What the AIR listener says to one kind of request: the JSON body the HTTP
-/// route of the same name returns, built by the same code, or a signed "cannot
-/// answer now" where the route would answer 5xx, or a signed refusal where it
-/// would answer 4xx. `None` for a kind this mint does not serve (keys: the ESP
-/// has no `GET /keys`; and anything unknown), which the listener skips.
+/// What the AIR listener says to one kind of request: the JSON body of the
+/// call, or a signed "cannot answer now" for a 5xx outcome, or a signed refusal
+/// for a 4xx one. `None` for a kind this mint does not serve (keys: the ESP has
+/// no keys call; and anything unknown), which the listener skips.
 ///
-/// `body` is the request body (empty for the reads). The ceilings are the same
-/// ones the HTTP routes have, read once at the start of the request, so the same
-/// request is refused in both. Exchange, transfer, redeem and rollover are
+/// `body` is the request body (empty for the reads). The ceilings are read once
+/// at the start of the request. Exchange, transfer, redeem and rollover are
 /// idempotent by request hash in the mint, so a resend gets the stored answer.
 pub fn air_served(state: &EspState, kind: u8, body: &[u8]) -> Option<sp_wire::air_request::Served> {
     use sp_wire::air_request::{
@@ -1054,15 +926,10 @@ pub fn air_served(state: &EspState, kind: u8, body: &[u8]) -> Option<sp_wire::ai
     })
 }
 
+/// The HTTP API that is left: `/audit` and `/health`, on `server.bind`
+/// (loopback only). Wallets do not use it; they use the AIR listener.
 pub fn router(state: Arc<EspState>) -> Router {
     Router::new()
-        .route("/rotation", get(rotation_handler))
-        .route("/keysets", get(keysets_handler))
-        .route("/rollover", post(rollover_handler))
-        .route("/exchange", post(exchange_handler))
-        .route("/transfer", post(transfer_handler))
-        .route("/redeem", post(redeem_handler))
-        .route("/fees", get(fees_handler))
         .route("/audit", get(audit_handler))
         .route("/health", get(health_handler))
         .with_state(state)

@@ -2,6 +2,17 @@
 
 esp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.7.0 (unreleased)
+
+**Wallets reach this mint over AIR only.** Builds on `sp-wire` with `seal` and `air-client`, as 0.6.0 does.
+
+- **Behaviour change: HTTP is gone for these calls.** `POST /exchange`, `/transfer`, `/redeem` and `/rollover` and `GET /keysets`, `/rotation` and `/fees` are removed; a request for one is a `404`. The same calls are answered by the AIR listener (mint info 1, keysets 3, rotation 4, rollover 5, fees 7, exchange 8, transfer 9, redeem 10), with the same bodies, ceilings, checks and refusals. What is left on `server.bind` is `GET /audit` and `GET /health` (the SPI polls `/health`), and the operator's routes on `server.admin_bind` are unchanged. The handlers, their `Json` and `Bytes` extractors and the per-route layers are deleted; `server::router` is `/audit` and `/health`.
+- **Behaviour change: AIR is required.** `serve` needs `air.server` and `air.host` (`ESP_AIR_SERVER`, `ESP_AIR_HOST`) and names any that is missing; the other commands do not. The AIR listener always runs, and **esp-mint exits with status 1 if the listener fails**, where it used to log and carry on with HTTP only, so that a supervisor restarts it (it resumes from the stored slot counter).
+- **Behaviour change: `air.enabled` and `ESP_AIR_ENABLED` are removed.** A file or an environment that names them is refused with a message that says they are gone. Remove them.
+- **Behaviour change: `server.bind` must be a loopback address**, checked when the settings are read (every command). It was the public API's address; what it serves now is for the operator and the SPI on this machine.
+- `redeem.rs` and `admin.rs` lose the notes that said a ceiling above 15 MiB takes larger requests over HTTP only: it takes requests no wallet can send.
+- Tests: the integration tests now call the mint over AIR on a real `air_server` (`tests/common/mod.rs`); `tests/air_info.rs` no longer compares with the HTTP routes. The `*_http.rs` files keep their names. `hold_http.rs` hands the overlapping calls of its first two tests to the mint in the test process (the AIR listener answers one request at a time, so it cannot overlap them) and runs the PSP timeout over AIR, where the PSP's `502` is a signed "unavailable" (`503` in the helper). A test that nothing but `/audit` and `/health` answers over HTTP replaces the one for the documented routes; new config tests cover the removed settings and the loopback check.
+
 ## 0.6.0, AIR listener (unreleased)
 
 **AIR 3.0.0 (unreleased).** Comments and docs follow sp-wire's move to air 3.0.0 (`ff41c09`) and air_server 1.0.0 (`ec6ac1f`); no code changes. The local AIR checkouts for a build are now on the branch `air3-export-secretkey` (3.0.0 plus the `SecretKey` export), and air_server is at 1.0.0.

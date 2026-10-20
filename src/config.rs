@@ -51,6 +51,15 @@ pub const DEFAULT_SMALL_REQUEST_BYTES: usize = 1024 * 1024;
 /// one output has to fit.
 pub const MIN_SMALL_REQUEST_BYTES: u64 = 4096;
 
+/// Settings that were taken out, with the environment variable each had and what
+/// replaces it. A file or an environment that still names one is refused with this
+/// text, not with "unknown setting".
+pub const REMOVED: &[(&str, &str, &str)] = &[(
+    "air.enabled",
+    "ESP_AIR_ENABLED",
+    "`air.enabled` is gone: the AIR listener always runs, because AIR is the only way wallets reach this mint (there is no HTTP API for them). Remove air.enabled; serve needs air.server and air.host (ESP_AIR_SERVER, ESP_AIR_HOST)",
+)];
+
 /// One setting, as documented.
 pub struct Spec {
     /// `section.name`, as in the file.
@@ -99,7 +108,7 @@ pub const SPECS: &[Spec] = &[
         default: "main",
         units: "network",
         reload: false,
-        what: "The Bitcoin network of the PSP this mint burns at: main, regtest, signet or testnet. At startup the mint asks the PSP (`GET /health`) and refuses to start if the PSP is on another network. Reported in `/health`.",
+        what: "The Bitcoin network of the PSP this mint burns at: main, regtest, signet or testnet. At startup the mint asks the PSP (`GET /health`, a local call inside the SPI) and refuses to start if the PSP is on another network. Reported in mint info (over AIR) and in `/health`.",
     },
     Spec {
         key: "server.bind",
@@ -107,7 +116,7 @@ pub const SPECS: &[Spec] = &[
         default: "127.0.0.1:3100",
         units: "host:port",
         reload: false,
-        what: "The public API's address.",
+        what: "The address of the HTTP API that is left: `/audit` (the operator's report) and `/health` (read by `spi` and the health monitor). Must be a loopback address: wallets reach this mint over AIR only, never over HTTP.",
     },
     Spec {
         key: "server.admin_bind",
@@ -251,7 +260,7 @@ pub const SPECS: &[Spec] = &[
         default: "15728640",
         units: "bytes",
         reload: true,
-        what: "The ceiling on one encoded redemption request (15 MiB: AIR carries at most 16 MiB in one message, so every redemption the mint takes can be sent over AIR; the wallet splits a larger one). A larger body is refused with 413 before it is parsed: no burn, no fee. Above 15 MiB, a request can come over HTTP only.",
+        what: "The ceiling on one encoded redemption request (15 MiB: AIR carries at most 16 MiB in one message, so every redemption the mint takes can be sent over AIR; the wallet splits a larger one). A larger body is refused with 413 before it is parsed: no burn, no fee. A higher value does not let a wallet send a larger request: AIR carries no larger message.",
     },
     Spec {
         key: "redeem.max_memo_bytes",
@@ -294,20 +303,12 @@ pub const SPECS: &[Spec] = &[
         what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is the service's AIR DID, a 33-byte compressed key in hex (66 characters, starting 02 or 03); the old 32-byte x-only form is refused. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
     },
     Spec {
-        key: "air.enabled",
-        env: "ESP_AIR_ENABLED",
-        default: "false",
-        units: "true or false",
-        reload: false,
-        what: "Answer wallets' requests over AIR (`serve` only), beside the HTTP API: mint info, keysets, rotation, fees, rollover, exchange, transfer and redeem (not /audit and not the operator's routes). Off by default: nothing is sent to the AIR unless this is true. When true, air.server and air.host are required. The mint's own DID key (`mint_did_key.json` in the network's data folder, made on first use; `esp-mint pubkey` prints its DID) opens the requests and signs the replies; it is not the PSP's. The reply is what the HTTP route returns. If the AIR client gives up, the listener stops with a clear error and the HTTP API keeps running. See the README, \"The AIR listener\".",
-    },
-    Spec {
         key: "air.server",
         env: "ESP_AIR_SERVER",
         default: "",
         units: "AIR server name (66 hex characters)",
         reload: false,
-        what: "The AIR server the listener holds reads on and writes replies to: its identity, a public key in AIR's compressed hex form (66 characters). The listener checks the server's signed challenge against it. Required when air.enabled is true. The PSP and the ESP can use the same AIR server: their DIDs differ, so their mailboxes do. Until the AIR resolves a DID to a server (upstream item 4), this is configuration.",
+        what: "The AIR server the listener holds reads on and writes replies to: its identity, a public key in AIR's compressed hex form (66 characters). The listener checks the server's signed challenge against it. Required by serve: the AIR listener always runs, because AIR is the only way wallets reach this mint. The PSP and the ESP can use the same AIR server: their DIDs differ, so their mailboxes do. Until the AIR resolves a DID to a server (upstream item 4), this is configuration.",
     },
     Spec {
         key: "air.host",
@@ -315,7 +316,7 @@ pub const SPECS: &[Spec] = &[
         default: "",
         units: "host or IP, no port",
         reload: false,
-        what: "Where that AIR server is: a host name or an IP (127.0.0.1 for the SPI's own AIR server). No port: the AIR client always uses 5702 (ws). Required when air.enabled is true.",
+        what: "Where that AIR server is: a host name or an IP (127.0.0.1 for the SPI's own AIR server). No port: the AIR client always uses 5702 (ws). Required by serve, with air.server.",
     },
     Spec {
         key: "air.held_reads",
@@ -323,7 +324,7 @@ pub const SPECS: &[Spec] = &[
         default: "16",
         units: "reads",
         reload: false,
-        what: "How many mailbox slots the listener holds a read on, ahead of the next unfinished one. More lets more wallets be answered at once without waiting for a slot to be reached; each held read costs the AIR server about 2 KB. The AIR server closes the whole session at its 257th held read, so the most accepted is 200. The requests themselves are answered one at a time, in slot order, as the HTTP mint runs one request at a time.",
+        what: "How many mailbox slots the listener holds a read on, ahead of the next unfinished one. More lets more wallets be answered at once without waiting for a slot to be reached; each held read costs the AIR server about 2 KB. The AIR server closes the whole session at its 257th held read, so the most accepted is 200. The requests themselves are answered one at a time, in slot order, as the mint runs one request at a time.",
     },
     Spec {
         key: "air.timeout_secs",
@@ -363,8 +364,6 @@ pub struct Config {
     pub queue_max_payment_ref_bytes: usize,
     /// Which AIR services keep this mint's state (setting only for now).
     pub storage_mint_state: StoragePolicy,
-    /// Answer wallets' requests over AIR (`serve` only).
-    pub air_enabled: bool,
     /// The AIR server's name (its public key, 66 hex characters).
     pub air_server: String,
     /// The AIR server's host or IP, no port.
@@ -401,7 +400,6 @@ impl Default for Config {
             redeem_max_reason_bytes: redeem::DEFAULT_MAX_REASON_BYTES,
             queue_max_payment_ref_bytes: queue::MAX_REF_LEN,
             storage_mint_state: StoragePolicy::default(),
-            air_enabled: false,
             air_server: String::new(),
             air_host: String::new(),
             air_held_reads: 16,
@@ -446,7 +444,6 @@ impl Config {
             "redeem.max_reason_bytes" => self.redeem_max_reason_bytes.to_string(),
             "queue.max_payment_ref_bytes" => self.queue_max_payment_ref_bytes.to_string(),
             "storage.mint_state" => self.storage_mint_state.to_config_string(),
-            "air.enabled" => self.air_enabled.to_string(),
             "air.server" => self.air_server.clone(),
             "air.host" => self.air_host.clone(),
             "air.held_reads" => self.air_held_reads.to_string(),
@@ -486,15 +483,6 @@ impl Config {
             "storage.mint_state" => {
                 self.storage_mint_state =
                     StoragePolicy::parse(value).map_err(|e| format!("{key} = `{value}`: {e}"))?
-            }
-            "air.enabled" => {
-                self.air_enabled = match value.trim() {
-                    "true" => true,
-                    "false" => false,
-                    other => {
-                        return Err(format!("{key} = `{other}` must be true or false"));
-                    }
-                }
             }
             "air.server" => self.air_server = value.trim().to_string(),
             "air.host" => self.air_host = value.trim().to_string(),
@@ -661,30 +649,32 @@ impl Config {
             )),
             _ => {}
         }
+        match self.bind.parse::<std::net::SocketAddr>() {
+            Ok(addr) if !addr.ip().is_loopback() => problems.push(format!(
+                "server.bind = `{}` is not a loopback address. Wallets reach this mint over AIR only; what is left on this address (/audit and /health) is for the operator and the SPI on this machine",
+                self.bind
+            )),
+            _ => {}
+        }
         if !(self.psp_url.starts_with("http://") || self.psp_url.starts_with("https://")) {
             problems.push(format!(
                 "psp.url = `{}` must start with http:// or https://",
                 self.psp_url
             ));
         }
-        if self.air_enabled {
-            if self.air_server.is_empty() {
-                problems.push(
-                    "air.enabled is true but air.server is not set: it is the AIR server's name, a public key of 66 hex characters"
-                        .to_string(),
-                );
-            } else if let Err(e) = sp_wire::seal::parse_public_key(&self.air_server) {
+        // What is set is checked when the settings load; that both are set is
+        // checked by `serve` (`require_air`), so the other commands do not need
+        // them.
+        if !self.air_server.is_empty() {
+            if let Err(e) = sp_wire::seal::parse_public_key(&self.air_server) {
                 problems.push(format!(
                     "air.server = `{}` is not an AIR server name (a public key of 66 hex characters): {e}",
                     self.air_server
                 ));
             }
-            if self.air_host.is_empty() {
-                problems.push(
-                    "air.enabled is true but air.host is not set: it is the AIR server's host name or IP, with no port"
-                        .to_string(),
-                );
-            } else if let Some(why) = sp_wire::air_request::host_problem(&self.air_host) {
+        }
+        if !self.air_host.is_empty() {
+            if let Some(why) = sp_wire::air_request::host_problem(&self.air_host) {
                 problems.push(format!("air.host = `{}` {why}", self.air_host));
             }
         }
@@ -711,10 +701,32 @@ impl Config {
         }
     }
 
-    /// The AIR listener's settings, or `None` when `air.enabled` is false.
+    /// What `serve` needs: the AIR server and its host, because the AIR
+    /// listener always runs (AIR is the only way wallets reach this mint). The
+    /// error names every one that is not set. The other commands do not need
+    /// them.
+    pub fn require_air(&self) -> Result<(), String> {
+        let mut missing = Vec::new();
+        if self.air_server.is_empty() {
+            missing.push("air.server (ESP_AIR_SERVER)");
+        }
+        if self.air_host.is_empty() {
+            missing.push("air.host (ESP_AIR_HOST)");
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "serve needs the AIR settings, because AIR is the only way wallets reach this mint, and {} {} not set. air.server is the AIR server's name (a public key of 66 hex characters) and air.host where to reach it (a host name or IP, no port)",
+            missing.join(" and "),
+            if missing.len() == 1 { "is" } else { "are" }
+        ))
+    }
+
+    /// The AIR listener's settings (call [`Config::require_air`] first).
     /// `state_dir` is the network's data folder.
-    pub fn air_listener(&self, state_dir: &Path) -> Option<crate::air_listener::Settings> {
-        self.air_enabled.then(|| crate::air_listener::Settings {
+    pub fn air_listener(&self, state_dir: &Path) -> crate::air_listener::Settings {
+        crate::air_listener::Settings {
             server: sp_wire::air_request::client::ServerRef {
                 name: self.air_server.clone(),
                 host: self.air_host.clone(),
@@ -722,7 +734,7 @@ impl Config {
             held_reads: self.air_held_reads,
             timeout_secs: self.air_timeout_secs,
             state_dir: state_dir.to_path_buf(),
-        })
+        }
     }
 
     pub fn redeem_settings(&self) -> RedeemSettings {
@@ -749,7 +761,6 @@ impl Config {
         self.psp_startup_retry_secs = running.psp_startup_retry_secs;
         self.admin_max_request_bytes = running.admin_max_request_bytes;
         self.storage_mint_state = running.storage_mint_state.clone();
-        self.air_enabled = running.air_enabled;
         self.air_server = running.air_server.clone();
         self.air_host = running.air_host.clone();
         self.air_held_reads = running.air_held_reads;
@@ -828,6 +839,10 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
         };
         for (name, value) in body {
             let key = format!("{section}.{name}");
+            if let Some((_, _, why)) = REMOVED.iter().find(|(k, _, _)| *k == key) {
+                problems.push((*why).to_string());
+                continue;
+            }
             if !SPECS.iter().any(|s| s.key == key) {
                 problems.push(format!("unknown setting `{key}`"));
                 continue;
@@ -835,7 +850,6 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
             match value {
                 toml::Value::Integer(n) => pairs.push((key, n.to_string())),
                 toml::Value::String(s) => pairs.push((key, s.clone())),
-                toml::Value::Boolean(b) if key == "air.enabled" => pairs.push((key, b.to_string())),
                 toml::Value::Array(items) if key.starts_with("storage.") => {
                     let ids: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
                     if ids.len() == items.len() {
@@ -894,6 +908,11 @@ pub fn load(data_dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Loa
         Err(e) => problems.push(format!("cannot read config file {}: {e}", path.display())),
     }
 
+    for (_, name, why) in REMOVED {
+        if env(name).is_some_and(|v| !v.is_empty()) {
+            problems.push(format!("environment variable {name}: {why}"));
+        }
+    }
     for spec in SPECS {
         if let Some(value) = env(spec.env) {
             if value.is_empty() {
@@ -1167,44 +1186,91 @@ mod tests {
         assert_eq!(c.transfer_fee_per_byte, 0);
         // every fee defaults to 0
         assert_eq!(c.redeem_settings().fee_per_byte, 0);
-        // AIR is off, with the listener's defaults
-        assert!(!c.air_enabled);
+        // The AIR listener's defaults; the server and the host have none
+        assert!(c.air_server.is_empty() && c.air_host.is_empty());
         assert_eq!((c.air_held_reads, c.air_timeout_secs), (16, 10));
         assert_eq!(c.validate(), Ok(()));
     }
 
     #[test]
-    fn the_air_listener_is_off_by_default_and_needs_a_server_and_a_host_when_on() {
+    fn the_air_listener_always_runs_and_serve_needs_a_server_and_a_host() {
         const SERVER: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let dir = scratch("air");
-        let off = load(&dir, &no_env).unwrap();
-        assert!(!off.config.air_enabled);
-        assert!(off.config.air_listener(&dir).is_none());
+        // The settings load without them (the other commands do not need them),
+        // and serve names both.
+        let bare = load(&dir, &no_env).unwrap();
+        let e = bare.config.require_air().unwrap_err();
+        assert!(
+            e.contains("ESP_AIR_SERVER") && e.contains("ESP_AIR_HOST"),
+            "{e}"
+        );
+        assert!(e.contains("are not set"), "{e}");
+        // One set: only the other is named.
+        let host = load(&dir, &env_of(&[("ESP_AIR_HOST", "127.0.0.1")])).unwrap();
+        let e = host.config.require_air().unwrap_err();
+        assert!(
+            e.contains("ESP_AIR_SERVER") && !e.contains("ESP_AIR_HOST"),
+            "{e}"
+        );
+        assert!(e.contains("is not set"), "{e}");
 
-        // On without a server and a host: both are named.
-        let p = load(&dir, &env_of(&[("ESP_AIR_ENABLED", "true")])).unwrap_err();
-        assert!(p.iter().any(|x| x.contains("air.server")), "{p:?}");
-        assert!(p.iter().any(|x| x.contains("air.host")), "{p:?}");
-
-        // From the file (a real TOML boolean), then the environment on top.
+        // From the file, then the environment on top.
         fs::write(
             dir.join(FILE_NAME),
-            format!(
-                "[air]\nenabled = true\nserver = \"{SERVER}\"\nhost = \"127.0.0.1\"\nheld_reads = 8\n"
-            ),
+            format!("[air]\nserver = \"{SERVER}\"\nhost = \"127.0.0.1\"\nheld_reads = 8\n"),
         )
         .unwrap();
         let on = load(&dir, &no_env).unwrap();
-        assert!(on.config.air_enabled);
-        let s = on.config.air_listener(&dir).unwrap();
+        assert!(on.config.require_air().is_ok());
+        let s = on.config.air_listener(&dir);
         assert_eq!((s.held_reads, s.timeout_secs), (8, 10));
         assert_eq!(s.server.name, SERVER);
         assert_eq!(s.server.host, "127.0.0.1");
         assert_eq!(s.state_dir, dir);
-        assert_eq!(on.sources["air.enabled"], Source::File);
-        let env = load(&dir, &env_of(&[("ESP_AIR_ENABLED", "false")])).unwrap();
-        assert!(env.config.air_listener(&dir).is_none());
-        assert_eq!(env.sources["air.enabled"], Source::Env("ESP_AIR_ENABLED"));
+        assert_eq!(on.sources["air.host"], Source::File);
+        let env = load(&dir, &env_of(&[("ESP_AIR_HOST", "10.0.0.2")])).unwrap();
+        assert_eq!(env.config.air_listener(&dir).server.host, "10.0.0.2");
+        assert_eq!(env.sources["air.host"], Source::Env("ESP_AIR_HOST"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn air_enabled_is_gone_and_says_so_from_the_file_and_the_environment() {
+        let dir = scratch("air-enabled-gone");
+        for text in ["[air]\nenabled = true\n", "[air]\nenabled = false\n"] {
+            fs::write(dir.join(FILE_NAME), text).unwrap();
+            let p = load(&dir, &no_env).unwrap_err();
+            assert!(
+                p.iter()
+                    .any(|x| x.contains("`air.enabled` is gone") && x.contains("air.server")),
+                "{p:?}"
+            );
+            assert!(!p.iter().any(|x| x.contains("unknown setting")), "{p:?}");
+        }
+        fs::remove_file(dir.join(FILE_NAME)).unwrap();
+        let p = load(&dir, &env_of(&[("ESP_AIR_ENABLED", "true")])).unwrap_err();
+        assert!(
+            p.iter().any(
+                |x| x.contains("environment variable ESP_AIR_ENABLED") && x.contains("is gone")
+            ),
+            "{p:?}"
+        );
+        // An empty variable is the same as not set.
+        assert!(load(&dir, &env_of(&[("ESP_AIR_ENABLED", "")])).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn server_bind_must_be_a_loopback_address() {
+        let dir = scratch("bind-loopback");
+        let p = load(&dir, &env_of(&[("ESP_BIND", "0.0.0.0:3100")])).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("server.bind") && x.contains("not a loopback address")),
+            "{p:?}"
+        );
+        assert!(load(&dir, &env_of(&[("ESP_BIND", "127.0.0.1:4100")])).is_ok());
+        assert!(load(&dir, &env_of(&[("ESP_BIND", "[::1]:4100")])).is_ok());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1213,11 +1279,7 @@ mod tests {
         const SERVER: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let dir = scratch("air-mistakes");
         let on = |extra: &[(&'static str, &'static str)]| {
-            let mut pairs = vec![
-                ("ESP_AIR_ENABLED", "true"),
-                ("ESP_AIR_SERVER", SERVER),
-                ("ESP_AIR_HOST", "127.0.0.1"),
-            ];
+            let mut pairs = vec![("ESP_AIR_SERVER", SERVER), ("ESP_AIR_HOST", "127.0.0.1")];
             pairs.extend_from_slice(extra);
             load(&dir, &env_of(&pairs))
         };
@@ -1236,8 +1298,6 @@ mod tests {
                 "{extra:?} should name {named}: {p:?}"
             );
         }
-        let p = load(&dir, &env_of(&[("ESP_AIR_ENABLED", "yes")])).unwrap_err();
-        assert!(p.iter().any(|x| x.contains("true or false")), "{p:?}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1508,7 +1568,6 @@ mod tests {
                 "rotation.period_hours",
                 "admin.max_request_bytes",
                 "storage.mint_state",
-                "air.enabled",
                 "air.server",
                 "air.host",
                 "air.held_reads",

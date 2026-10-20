@@ -1,19 +1,20 @@
-//! The ceilings and the fee settings over HTTP: an over-ceiling body on each
-//! route is refused with 413 before it is parsed, and a reload changes what the
+//! The ceilings and the fee settings over AIR: an over-ceiling body on each
+//! call is refused with 413 before it is parsed, and a reload changes what the
 //! next request sees.
 //!
-//! Plain tests with their own runtime, because they use the blocking HTTP client.
+//! The calls go to esp-mint's own AIR listener on a real `air_server` (see
+//! `common`); a refusal is read as its HTTP status and body.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use axum::Router;
 use esp_mint::config::{self, Config, Handle};
 use esp_mint::exchange::{Burn, Psp};
 use esp_mint::responses::Responses;
-use esp_mint::server::{self, EspState};
+use esp_mint::server::EspState;
 use mint_types::{Amount, MintInput, Nonce};
-use tokio::runtime::Runtime;
 
 const CEILING: usize = 4096;
 
@@ -43,18 +44,7 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-fn serve(rt: &Runtime, app: Router) -> String {
-    let listener = rt
-        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    rt.spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    format!("http://{addr}")
-}
-
-fn start(rt: &Runtime, dir: &Path) -> (String, Arc<EspState>) {
+fn start(dir: &Path) -> (common::Air, Arc<EspState>) {
     let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
     let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
     let cfg = Config {
@@ -76,33 +66,17 @@ fn start(rt: &Runtime, dir: &Path) -> (String, Arc<EspState>) {
         rollovers: None,
         in_flight: Default::default(),
     });
-    (serve(rt, server::router(Arc::clone(&state))), state)
-}
-
-fn post(url: &str, body: Vec<u8>) -> (u16, serde_json::Value) {
-    let response = reqwest::blocking::Client::new()
-        .post(url)
-        .header("content-type", "application/octet-stream")
-        .body(body)
-        .send()
-        .unwrap();
-    let status = response.status().as_u16();
-    let text = response.text().unwrap();
-    (
-        status,
-        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
-    )
+    (common::Air::start(&state, &dir.join("air")), state)
 }
 
 #[test]
 fn a_body_over_the_ceiling_is_refused_before_it_is_parsed_on_every_route() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("ceilings");
-    let (base, state) = start(&rt, &dir);
+    let (air, state) = start(&dir);
     for route in ["exchange", "transfer", "rollover", "redeem"] {
-        let url = format!("{base}/{route}");
+        let url = format!("/{route}");
         // not a request at all, and too big: 413, not 400, so it was never parsed
-        let (status, body) = post(&url, vec![b'x'; CEILING + 1]);
+        let (status, body) = air.post_bytes(&url, &vec![b'x'; CEILING + 1]);
         assert_eq!(status, 413, "{route}");
         assert_eq!(body["code"], "request_too_large", "{route}");
         assert_eq!(body["limit_bytes"], CEILING as u64, "{route}");
@@ -113,24 +87,22 @@ fn a_body_over_the_ceiling_is_refused_before_it_is_parsed_on_every_route() {
                 .contains("Nothing was parsed, burned or charged")
         );
         // the same junk within the ceiling is read and found not to be a request
-        let (status, body) = post(&url, vec![b'x'; CEILING]);
+        let (status, body) = air.post_bytes(&url, &vec![b'x'; CEILING]);
         assert_eq!(status, 400, "{route}");
         assert_eq!(body["code"], "malformed_request", "{route}");
     }
     // nothing was written
     assert!(state.responses.lock().unwrap().is_empty());
+    drop(air);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn a_reload_changes_the_ceiling_and_the_rates_for_the_next_request_only() {
-    let rt = Runtime::new().unwrap();
     let dir = scratch("reload");
-    let (base, state) = start(&rt, &dir);
-    let fees: serde_json::Value = reqwest::blocking::get(format!("{base}/fees"))
-        .unwrap()
-        .json()
-        .unwrap();
+    let (air, state) = start(&dir);
+    let (status, fees) = air.get_json("/fees");
+    assert_eq!(status, 200);
     assert_eq!(fees["exchange"]["fee_per_byte"], "0");
     assert_eq!(fees["transfer"]["fee_per_byte"], "0");
     assert_eq!(fees["exchange"]["size"]["per_input"], 146);
@@ -140,8 +112,7 @@ fn a_reload_changes_the_ceiling_and_the_rates_for_the_next_request_only() {
     assert_eq!(fees["rollover"]["max_items"], 1000);
 
     // a request of 5000 bytes is over the ceiling now ...
-    let url = format!("{base}/exchange");
-    assert_eq!(post(&url, vec![b'x'; 5000]).0, 413);
+    assert_eq!(air.post_bytes("/exchange", &vec![b'x'; 5000]).0, 413);
 
     // ... and after the file changes and the mint reloads, it is not, and the
     // rates in force are the new ones
@@ -153,14 +124,13 @@ fn a_reload_changes_the_ceiling_and_the_rates_for_the_next_request_only() {
     .unwrap();
     let before = state.config.current();
     state.config.reload(&data, &|_: &str| None).unwrap();
-    assert_eq!(post(&url, vec![b'x'; 5000]).0, 400);
-    let fees: serde_json::Value = reqwest::blocking::get(format!("{base}/fees"))
-        .unwrap()
-        .json()
-        .unwrap();
+    assert_eq!(air.post_bytes("/exchange", &vec![b'x'; 5000]).0, 400);
+    let (status, fees) = air.get_json("/fees");
+    assert_eq!(status, 200);
     assert_eq!(fees["exchange"]["fee_per_byte"], "7");
     assert_eq!(fees["transfer"]["fee_per_byte"], "9");
     // the settings a request took before the reload are untouched
     assert_eq!(before.exchange_fee_per_byte, 0);
+    drop(air);
     std::fs::remove_dir_all(&dir).unwrap();
 }

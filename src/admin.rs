@@ -1,7 +1,7 @@
 //! The operator's HTTP routes: the payout report and the settle call.
 //!
 //! These run on their own listener (`ESP_ADMIN_BIND`, default
-//! `127.0.0.1:3101`), never on the public API's port, and the bind address must
+//! `127.0.0.1:3101`), never on `server.bind`'s port, and the bind address must
 //! be a loopback address or the process will not start. If `ESP_ADMIN_TOKEN` is
 //! set, every request must carry `Authorization: Bearer <token>`.
 //!

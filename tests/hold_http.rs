@@ -2,13 +2,23 @@
 //!
 //! A PSP built from mint-server's own handlers, with a `/melt` that can be
 //! made to wait (until the test lets it go) or to answer late, and the ESP
-//! server calling it through `HttpPsp`. These tests check that one exchange
+//! mint calling it through `HttpPsp`. These tests check that one exchange
 //! stuck at the PSP does not stop another, that the same request sent again
 //! while it is stuck is answered "in progress" and processed once, and that a
 //! PSP timeout leaves nothing stuck.
 //!
+//! The AIR listener answers one request at a time, so overlapping calls cannot
+//! be made through it. The first two tests therefore hand the calls to the mint
+//! in this process on threads of their own (`common::served_call`: what the
+//! listener calls, with the same answers), and read `/health` and `/audit` over
+//! HTTP; the PSP timeout, which is one call after another, goes over AIR (see
+//! `common`: a refusal is read as its HTTP status and body, a signed "cannot
+//! answer now" as `503`).
+//!
 //! These are plain tests with their own runtime, because the PSP client is
 //! blocking and must not be created or used on an async thread.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -295,29 +305,26 @@ fn request(note: Note, keypair: &Keypair, units: u64, esp_total: u64) -> Exchang
     }
 }
 
-fn post_json(base: &str, path: &str, body: &impl serde::Serialize) -> (u16, serde_json::Value) {
-    let response = reqwest::blocking::Client::new()
-        .post(format!("{base}{path}"))
-        .json(body)
-        .send()
-        .unwrap();
-    let code = response.status().as_u16();
-    (code, response.json().unwrap())
-}
-
+/// `/audit` and `/health`, read over HTTP.
 fn get_json(base: &str, path: &str) -> (u16, serde_json::Value) {
+    assert!(matches!(path, "/audit" | "/health"), "{path}");
     let response = reqwest::blocking::get(format!("{base}{path}")).unwrap();
     let code = response.status().as_u16();
     (code, response.json().unwrap())
 }
 
+/// The exchange handed to the mint in this process (see the module docs).
+fn exchange_now(state: &EspState, req: &ExchangeRequest) -> (u16, serde_json::Value) {
+    common::served_call(state, "/exchange", &serde_json::to_vec(req).unwrap())
+}
+
 /// Send an exchange on another thread, so the test can go on while it waits.
 fn post_in_background(
-    esp: &str,
+    state: &Arc<EspState>,
     req: &ExchangeRequest,
 ) -> std::thread::JoinHandle<(u16, serde_json::Value)> {
-    let (esp, req) = (esp.to_string(), req.clone());
-    std::thread::spawn(move || post_json(&esp, "/exchange", &req))
+    let (state, req) = (Arc::clone(state), req.clone());
+    std::thread::spawn(move || exchange_now(&state, &req))
 }
 
 fn is_pending(state: &EspState, req: &ExchangeRequest) -> bool {
@@ -342,7 +349,7 @@ fn an_exchange_stuck_at_the_psp_does_not_block_an_unrelated_request() {
     let other = request(b, &kb, 2, 2 * ONE_PSP);
 
     // The first reaches the PSP and waits there.
-    let waiting = post_in_background(&esp, &first);
+    let waiting = post_in_background(&state, &first);
     gate.wait_for_arrivals(1);
     assert!(is_pending(&state, &first));
     assert_eq!(state.in_flight.len(), 1);
@@ -352,8 +359,8 @@ fn an_exchange_stuck_at_the_psp_does_not_block_an_unrelated_request() {
     let started = Instant::now();
     assert_eq!(get_json(&esp, "/health").0, 200);
     assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
-    assert_eq!(get_json(&esp, "/keysets").0, 200);
-    let (code, body) = post_json(&esp, "/exchange", &other);
+    assert_eq!(common::served_call(&state, "/keysets", b"").0, 200);
+    let (code, body) = exchange_now(&state, &other);
     assert_eq!(code, 200, "{body}");
     assert!(
         started.elapsed() < Duration::from_secs(10),
@@ -385,13 +392,13 @@ fn the_same_request_sent_again_while_it_is_in_progress_is_not_processed_twice() 
 
     let (a, ka) = psp_note(&psp, 1);
     let first = request(a, &ka, 1, ONE_PSP);
-    let waiting = post_in_background(&esp, &first);
+    let waiting = post_in_background(&state, &first);
     gate.wait_for_arrivals(1);
 
     // Two more copies while the first waits: each is told it is in progress,
     // and neither reaches the PSP.
     for _ in 0..2 {
-        let (code, body) = post_json(&esp, "/exchange", &first);
+        let (code, body) = exchange_now(&state, &first);
         assert_eq!(code, 409, "{body}");
         assert_eq!(body["code"], "in_progress");
     }
@@ -400,7 +407,7 @@ fn the_same_request_sent_again_while_it_is_in_progress_is_not_processed_twice() 
     // A different request for the same note is held back by the reservation,
     // as before, and does not reach the PSP either.
     let rival = request(a, &ka, 1, ONE_PSP);
-    let (code, body) = post_json(&esp, "/exchange", &rival);
+    let (code, body) = exchange_now(&state, &rival);
     assert_eq!(code, 400, "{body}");
     assert!(body["error"].as_str().unwrap().contains("held by another"));
     assert_eq!(gate.arrived.load(Ordering::SeqCst), 1);
@@ -409,7 +416,7 @@ fn the_same_request_sent_again_while_it_is_in_progress_is_not_processed_twice() 
     let (code, done) = waiting.join().unwrap();
     assert_eq!(code, 200, "{done}");
     // One burn, one issue, and a later copy gets the stored answer.
-    let (code, again) = post_json(&esp, "/exchange", &first);
+    let (code, again) = exchange_now(&state, &first);
     assert_eq!(code, 200);
     assert_eq!(again, done);
     assert_eq!(gate.arrived.load(Ordering::SeqCst), 1);
@@ -426,14 +433,16 @@ fn a_psp_timeout_leaves_nothing_stuck_and_the_retry_finishes() {
     let gate = Gate::new(Hold::Sleep(Duration::from_secs(3)));
     let (psp_url, psp) = start_psp(&rt, &dir, &gate);
     let (esp, state) = start_esp(&rt, &dir, &psp_url, 1);
+    let air = common::Air::start(&state, &dir.join("air"));
 
     let (a, ka) = psp_note(&psp, 1);
     let (b, kb) = psp_note(&psp, 1);
     let first = request(a, &ka, 1, ONE_PSP);
     let other = request(b, &kb, 1, ONE_PSP);
 
-    let (code, body) = post_json(&esp, "/exchange", &first);
-    assert_eq!(code, 502, "{body}");
+    // over AIR a signed "cannot answer now", which the HTTP route called a 502
+    let (code, body) = air.post_json("/exchange", &first);
+    assert_eq!(code, 503, "{body}");
     // Nothing is running, no lock is held, and the request is on file as
     // pending: the burn may have happened, so it is not rolled back, and the
     // retry will find out.
@@ -442,13 +451,13 @@ fn a_psp_timeout_leaves_nothing_stuck_and_the_retry_finishes() {
     assert_eq!(get_json(&esp, "/health").0, 200);
 
     // An unrelated exchange goes through now.
-    let (code, body) = post_json(&esp, "/exchange", &other);
+    let (code, body) = air.post_json("/exchange", &other);
     assert_eq!(code, 200, "{body}");
 
     // The retry, once the PSP has answered or given up, finishes the request
     // whether or not the late burn happened, and burns the note once.
     std::thread::sleep(Duration::from_millis(3500));
-    let (code, body) = post_json(&esp, "/exchange", &first);
+    let (code, body) = air.post_json("/exchange", &first);
     assert_eq!(code, 200, "{body}");
     assert!(psp.logic.lock().unwrap().is_spent(a.nonce).unwrap());
     assert_eq!(get_json(&esp, "/audit").1["issued"], 2 * ONE_PSP);

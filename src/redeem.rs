@@ -30,8 +30,7 @@
 //!   refused, so there are no unknown fields. The size is the length of that
 //!   encoding, so a service can work out the fee before it sends. There is no
 //!   cap on notes, outputs or dates: only the ceiling on the whole encoded
-//!   request, which the HTTP layer enforces before it reads any further (see
-//!   `server`). A large service splits a redemption across several requests;
+//!   request, which `server::air_served` enforces before it parses any further. A large service splits a redemption across several requests;
 //!   each pays its own fee and gets its own queue entry.
 //! - **How the fee is taken.** If A covers the fee, it comes off the payout and
 //!   the rejected notes are not touched. If it does not, all of A goes to the
@@ -115,10 +114,11 @@ pub const AIR_ROOM: usize = 1024 * 1024;
 
 /// The default ceiling on one encoded request: 15 MiB
 /// (`redeem.max_request_bytes`), the AIR message cap less [`AIR_ROOM`], so that
-/// every redemption the mint accepts can be sent over AIR as well as HTTP. A
-/// larger redemption is split by the wallet into several requests, each under the
-/// ceiling (about 84,000 notes with no outputs coming back). An operator who
-/// raises the setting above this can take larger requests over HTTP only.
+/// every redemption the mint accepts can be sent over AIR, the only way a wallet
+/// reaches the mint. A larger redemption is split by the wallet into several
+/// requests, each under the ceiling (about 84,000 notes with no outputs coming
+/// back). Raising the setting above this does not let a wallet send a larger
+/// request: AIR carries no larger message.
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = AIR_MESSAGE_CAP - AIR_ROOM;
 
 /// The default fee rate, in ESP units per encoded byte

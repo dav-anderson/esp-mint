@@ -3,11 +3,10 @@
 //! transfer and redeem requests are answered, signed by the mint's own DID key,
 //! and checked by the same code the wallet runs (`sp_wire::air_request::ask`).
 //! Every call runs against a real ESP mint (with a stand-in PSP for the
-//! exchange) and is compared with what its HTTP routes return. The four that
-//! change state are also resent (the same body, a new request, and a copy over
-//! HTTP: the answer is the stored one and nothing is applied twice), refused,
-//! made to fail, tampered with, and the rollover is run at its full size
-//! (1000 notes).
+//! exchange). The four that change state are also resent (the same body, a new
+//! request, and the same body handed straight to the mint: the answer is the
+//! stored one and nothing is applied twice), refused, made to fail, tampered
+//! with, and the rollover is run at its full size (1000 notes).
 //!
 //! The AIR client always dials port 5702 (upstream item 12), so these tests need
 //! that port free; `local_server::start` says so when it is not. One server
@@ -54,8 +53,8 @@ use sp_wire::air_request::envelope::{
 };
 use sp_wire::air_request::{
     KIND_EXCHANGE, KIND_FEES, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_REDEEM, KIND_ROLLOVER,
-    KIND_ROTATION, KIND_TRANSFER, MintInfo, STATUS_REFUSED, STATUS_UNAVAILABLE, VerifyError,
-    local_server, verify_receipt,
+    KIND_ROTATION, KIND_TRANSFER, MintInfo, STATUS_REFUSED, STATUS_UNAVAILABLE, Served,
+    VerifyError, local_server, verify_receipt,
 };
 use sp_wire::seal::SecretKey as DidKey;
 use sp_wire::{ServiceDid, WIRE_VERSION};
@@ -409,7 +408,8 @@ impl Esp {
         Arc::new(move |kind: u8, body: &[u8]| server::air_served(&state, kind, body))
     }
 
-    /// GET an HTTP route: the status and the bytes of the answer.
+    /// GET an HTTP route (`/audit` and `/health` are all there is): the status
+    /// and the bytes of the answer.
     fn http_get(&self, path: &str) -> (u16, Vec<u8>) {
         self.rt.block_on(async {
             let r = reqwest::get(format!("{}{path}", self.base)).await.unwrap();
@@ -418,23 +418,34 @@ impl Esp {
         })
     }
 
-    /// POST `body` to an HTTP route: the status and the bytes of the answer.
-    fn http_post(&self, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
-        self.rt.block_on(async {
-            let r = reqwest::Client::new()
-                .post(format!("{}{path}", self.base))
-                .header("content-type", "application/octet-stream")
-                .body(body.to_vec())
-                .send()
-                .await
-                .unwrap();
-            let status = r.status().as_u16();
-            (status, r.bytes().await.unwrap().to_vec())
-        })
-    }
-
     fn http_json(&self, path: &str) -> serde_json::Value {
         serde_json::from_slice(&self.http_get(path).1).unwrap()
+    }
+
+    /// What the mint answers to `kind` with `body` when it is called in this
+    /// process, as the listener calls it.
+    fn served(&self, kind: u8, body: &[u8]) -> Option<Served> {
+        server::air_served(&self.state, kind, body)
+    }
+
+    /// The body of an answered call made in this process.
+    fn served_body(&self, kind: u8, body: &[u8]) -> Vec<u8> {
+        match self.served(kind, body) {
+            Some(Served::Body(bytes)) => bytes,
+            Some(Served::Refused(body)) => {
+                panic!(
+                    "expected an answer, got a refusal: {}",
+                    String::from_utf8_lossy(&body)
+                )
+            }
+            Some(Served::Unavailable) => panic!("expected an answer, got 'unavailable'"),
+            None => panic!("expected an answer, the kind is not served"),
+        }
+    }
+
+    /// The same request handed straight to the mint is answered with `want`.
+    fn assert_served(&self, kind: u8, body: &[u8], want: &[u8]) {
+        assert_eq!(self.served_body(kind, body).as_slice(), want);
     }
 
     fn set_clock(&self, t: u64) {
@@ -599,9 +610,10 @@ impl Esp {
     /// of the previous keyset. Returns the notes, the previous and the current keyset.
     fn rotated(&self, n: usize) -> (Vec<(Note, Keypair)>, String, String) {
         let notes: Vec<_> = (0..n).map(|_| self.esp_note(1, service(), PAST)).collect();
-        let _ = self.http_get("/rotation");
+        let _ = self.served_body(KIND_ROTATION, b"");
         self.set_clock(T0 + H);
-        let w = self.http_json("/rotation");
+        let w: serde_json::Value =
+            serde_json::from_slice(&self.served_body(KIND_ROTATION, b"")).unwrap();
         (
             notes,
             w["previous"]["id"].as_str().unwrap().to_string(),
@@ -663,18 +675,10 @@ fn rollover_of(
     request
 }
 
-/// The JSON of a refusal's body, without the `http_status` the AIR refusal of a
-/// non-400 adds.
-fn without_status(v: &Verified) -> serde_json::Value {
-    let mut value: serde_json::Value = serde_json::from_slice(v.body()).unwrap();
-    value.as_object_mut().unwrap().remove("http_status");
-    value
-}
-
 // ---------------------------------------------------------------- the reads
 
 #[test]
-fn mint_info_keysets_rotation_and_fees_are_what_the_http_routes_return() {
+fn mint_info_keysets_rotation_and_fees_are_answered_with_what_the_mint_serves() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("reads");
@@ -698,24 +702,24 @@ fn mint_info_keysets_rotation_and_fees_are_what_the_http_routes_return() {
     // and the receipt verifies from the DID alone
     verify_receipt(&did, &v.receipt).unwrap();
 
-    // The others are the exact bytes of the HTTP routes.
-    for (kind, path) in [
-        (KIND_KEYSETS, "/keysets"),
-        (KIND_ROTATION, "/rotation"),
-        (KIND_FEES, "/fees"),
+    // The others are the exact bytes the mint serves, and JSON.
+    for (kind, name) in [
+        (KIND_KEYSETS, "keysets"),
+        (KIND_ROTATION, "rotation"),
+        (KIND_FEES, "fees"),
     ] {
         let over_air = ask_body(&cfg, kind, b"").unwrap();
-        assert!(!over_air.refused(), "{path}");
-        let (code, http) = esp.http_get(path);
-        assert_eq!(code, 200, "{path}");
-        assert_eq!(over_air.body(), http.as_slice(), "{path}: the same bytes");
+        assert!(!over_air.refused(), "{name}");
+        esp.assert_served(kind, b"", over_air.body());
+        let json: serde_json::Value = over_air.json().unwrap();
+        assert!(json.is_object(), "{name}: a JSON object");
     }
     wait_for_next(&dir, 4);
     listener.stop().unwrap();
 }
 
 #[test]
-fn rotation_of_a_mint_that_does_not_rotate_keeps_its_http_status_and_keys_is_not_served() {
+fn rotation_of_a_mint_that_does_not_rotate_is_a_refusal_that_says_404_and_keys_is_not_served() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("no-rotation");
@@ -723,24 +727,18 @@ fn rotation_of_a_mint_that_does_not_rotate_keeps_its_http_status_and_keys_is_not
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let cfg = config(&server, &did, 10, 3);
 
-    // HTTP answers 404; over AIR it is a signed refusal that says it was a 404,
-    // so that the wallet can treat it as it treats the 404 (not as a refusal of
-    // its notes).
+    // Over AIR it is a signed refusal that says it was a 404, so that the wallet
+    // can treat it as a mint without rotation (not as a refusal of its notes).
     let v = ask_body(&cfg, KIND_ROTATION, b"").unwrap();
     assert!(v.refused());
-    let (code, http) = esp.http_get("/rotation");
-    assert_eq!(code, 404);
     let body: serde_json::Value = serde_json::from_slice(v.body()).unwrap();
     assert_eq!(body["http_status"], 404);
-    assert_eq!(
-        without_status(&v),
-        serde_json::from_slice::<serde_json::Value>(&http).unwrap()
-    );
+    assert!(body["error"].is_string());
 
-    // Keysets answer on a mint that does not rotate, as over HTTP.
+    // Keysets answer on a mint that does not rotate.
     let keysets = ask_body(&cfg, KIND_KEYSETS, b"").unwrap();
     assert!(!keysets.refused());
-    assert_eq!(keysets.body(), esp.http_get("/keysets").1.as_slice());
+    esp.assert_served(KIND_KEYSETS, b"", keysets.body());
 
     // The ESP has no keys route (keys arrive in the replies), so the listener
     // does not answer that kind: the wallet gets no reply.
@@ -760,7 +758,7 @@ fn rotation_of_a_mint_that_does_not_rotate_keeps_its_http_status_and_keys_is_not
 const DAY: u64 = 21_000;
 
 #[test]
-fn an_exchange_over_air_is_what_http_returns_and_a_resent_one_is_not_applied_twice() {
+fn an_exchange_over_air_is_answered_and_a_resent_one_is_not_applied_twice() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("exchange");
@@ -784,10 +782,9 @@ fn an_exchange_over_air_is_what_http_returns_and_a_resent_one_is_not_applied_twi
     assert!(esp.psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
     assert_eq!(esp.audit()["issued"], 4 * ONE_PSP);
 
-    // The same request over HTTP is the stored answer, byte for byte what AIR said.
-    let (code, http) = esp.http_post("/exchange", &body);
-    assert_eq!(code, 200);
-    assert_eq!(http.as_slice(), first.body());
+    // The same request handed straight to the mint is the stored answer, byte for
+    // byte what AIR said.
+    esp.assert_served(KIND_EXCHANGE, &body, first.body());
 
     // The same request over AIR again (a new request id) is answered again, from
     // the stored answer, and nothing is applied twice.
@@ -814,7 +811,7 @@ fn an_exchange_over_air_is_what_http_returns_and_a_resent_one_is_not_applied_twi
 }
 
 #[test]
-fn a_transfer_over_air_is_what_http_returns_and_a_resent_one_is_not_applied_twice() {
+fn a_transfer_over_air_is_answered_and_a_resent_one_is_not_applied_twice() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("transfer");
@@ -843,9 +840,7 @@ fn a_transfer_over_air_is_what_http_returns_and_a_resent_one_is_not_applied_twic
     assert_eq!(esp.audit()["redeemed"], 3 * ONE);
     assert_eq!(esp.audit()["issued"], 6 * ONE);
 
-    let (code, http) = esp.http_post("/transfer", &body);
-    assert_eq!(code, 200);
-    assert_eq!(http.as_slice(), first.body());
+    esp.assert_served(KIND_TRANSFER, &body, first.body());
     let again = ask_body(&cfg, KIND_TRANSFER, &body).unwrap();
     assert_ne!(again.request_id, first.request_id);
     assert_eq!(again.body(), first.body());
@@ -866,7 +861,7 @@ fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_app
 
     let (a, ka) = esp.esp_note(ONE, service(), PAST);
     let req = esp.redemption_of(&[(a, &ka, ONE, PAST)]);
-    // Not JSON: the canonical bytes the HTTP call posts.
+    // Not JSON: the canonical bytes.
     let bytes = req.encode();
     assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_err());
 
@@ -881,9 +876,7 @@ fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_app
     assert!(esp.is_spent(&a));
     assert_eq!(esp.audit()["redeemed"], ONE);
 
-    let (code, http) = esp.http_post("/redeem", &bytes);
-    assert_eq!(code, 200);
-    assert_eq!(http.as_slice(), first.body());
+    esp.assert_served(KIND_REDEEM, &bytes, first.body());
     let again = ask_body(&cfg, KIND_REDEEM, &bytes).unwrap();
     assert_ne!(again.request_id, first.request_id);
     assert_eq!(again.body(), first.body());
@@ -901,7 +894,7 @@ fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_app
 // ---------------------------------------------------------------- rollover
 
 #[test]
-fn a_rollover_over_air_is_what_http_returns_and_a_resent_one_is_not_applied_twice() {
+fn a_rollover_over_air_is_answered_and_a_resent_one_is_not_applied_twice() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("rollover");
@@ -924,28 +917,20 @@ fn a_rollover_over_air_is_what_http_returns_and_a_resent_one_is_not_applied_twic
     assert_eq!(response.keyset, current, "the answer names its signer");
     assert_eq!(response.signatures.len(), 2);
 
-    // The same request over HTTP, and over AIR again: the stored answer.
-    let (code, http) = esp.http_post("/rollover", &body);
-    assert_eq!(code, 200);
-    assert_eq!(http.as_slice(), first.body());
+    // The same request handed straight to the mint, and over AIR again: the stored answer.
+    esp.assert_served(KIND_ROLLOVER, &body, first.body());
     let again = ask_body(&cfg, KIND_ROLLOVER, &body).unwrap();
     assert_ne!(again.request_id, first.request_id);
     assert_eq!(again.body(), first.body());
 
-    // A rollover that changes the amounts is refused, with the HTTP text and no
-    // `http_status` (it is a 400), and it burned nothing.
+    // A rollover that changes the amounts is refused, with no `http_status` (it is
+    // a 400), and it burned nothing.
     let extra = vec![esp.esp_note(1, service(), PAST)];
     let bad = json_bytes(&rollover_of(&extra, &previous, &current, 2));
     let refused = ask_body(&cfg, KIND_ROLLOVER, &bad).unwrap();
     assert!(refused.refused());
-    let (code, http) = esp.http_post("/rollover", &bad);
-    assert_eq!(code, 400);
     let body: serde_json::Value = serde_json::from_slice(refused.body()).unwrap();
     assert!(body.get("http_status").is_none());
-    assert_eq!(
-        body,
-        serde_json::from_slice::<serde_json::Value>(&http).unwrap()
-    );
     assert!(!esp.is_spent(&extra[0].0));
     listener.stop().unwrap();
 }
@@ -981,17 +966,15 @@ fn a_full_rollover_of_a_thousand_notes_goes_over_air() {
     let response: RolloverResponse = first.json().unwrap();
     assert_eq!(response.signatures.len(), 1000);
     assert_eq!(response.keys.len(), 1000);
-    // The same bytes over HTTP, from the stored answer.
-    let (code, http) = esp.http_post("/rollover", &body);
-    assert_eq!(code, 200);
-    assert_eq!(http.as_slice(), first.body());
+    // The same bytes handed straight to the mint, from the stored answer.
+    esp.assert_served(KIND_ROLLOVER, &body, first.body());
     listener.stop().unwrap();
 }
 
 // ---------------------------------------------------------------- refusals
 
 #[test]
-fn a_body_over_its_ceiling_is_refused_before_it_is_parsed_with_the_http_413() {
+fn a_body_over_its_ceiling_is_refused_before_it_is_parsed_with_a_413() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("ceilings");
@@ -1023,13 +1006,6 @@ fn a_body_over_its_ceiling_is_refused_before_it_is_parsed_with_the_http_413() {
         assert_eq!(body["http_status"], 413, "{route}");
         assert_eq!(body["limit_bytes"], 4096, "{route}");
         assert_eq!(body["size_bytes"], 4097, "{route}");
-        let (code, http) = esp.http_post(route, &big);
-        assert_eq!(code, 413, "{route}");
-        assert_eq!(
-            without_status(&v),
-            serde_json::from_slice::<serde_json::Value>(&http).unwrap(),
-            "{route}: the same text as HTTP"
-        );
 
         // At the limit the body is read, and is not a request: a 400.
         let at = vec![b' '; 4096];
@@ -1038,13 +1014,6 @@ fn a_body_over_its_ceiling_is_refused_before_it_is_parsed_with_the_http_413() {
         let body: serde_json::Value = serde_json::from_slice(v.body()).unwrap();
         assert_eq!(body["code"], "malformed_request", "{route}");
         assert!(body.get("http_status").is_none(), "{route}: a 400");
-        let (code, http) = esp.http_post(route, &at);
-        assert_eq!(code, 400, "{route}");
-        assert_eq!(
-            body,
-            serde_json::from_slice::<serde_json::Value>(&http).unwrap(),
-            "{route}"
-        );
     }
 
     // Redemption: the same, on the binary body.
@@ -1056,29 +1025,17 @@ fn a_body_over_its_ceiling_is_refused_before_it_is_parsed_with_the_http_413() {
         (body["code"].as_str(), body["http_status"].as_u64()),
         (Some("request_too_large"), Some(413))
     );
-    let (code, http) = esp.http_post("/redeem", &big);
-    assert_eq!(code, 413);
-    assert_eq!(
-        without_status(&v),
-        serde_json::from_slice::<serde_json::Value>(&http).unwrap()
-    );
     let at = vec![0xffu8; 1000];
     let v = ask_body(&cfg, KIND_REDEEM, &at).unwrap();
     assert!(v.refused());
     let body: serde_json::Value = serde_json::from_slice(v.body()).unwrap();
     assert_eq!(body["code"], "malformed_request");
     assert!(body.get("http_status").is_none());
-    let (code, http) = esp.http_post("/redeem", &at);
-    assert_eq!(code, 400);
-    assert_eq!(
-        body,
-        serde_json::from_slice::<serde_json::Value>(&http).unwrap()
-    );
     listener.stop().unwrap();
 }
 
 #[test]
-fn refusals_are_signed_replies_with_the_http_text_and_the_http_status() {
+fn refusals_are_signed_replies_with_the_text_and_the_status() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("refusals");
@@ -1102,12 +1059,6 @@ fn refusals_are_signed_replies_with_the_http_text_and_the_http_status() {
     assert_eq!(body["code"], "note_spent_elsewhere");
     assert_eq!(body["spent"], serde_json::json!([0]));
     assert!(body.get("http_status").is_none());
-    let (code, http) = esp.http_post("/transfer", &second);
-    assert_eq!(code, 400);
-    assert_eq!(
-        body,
-        serde_json::from_slice::<serde_json::Value>(&http).unwrap()
-    );
 
     // A redemption with a bad service signature: a 400 with its code.
     let (b, kb) = esp.esp_note(ONE, service(), PAST);
@@ -1124,12 +1075,6 @@ fn refusals_are_signed_replies_with_the_http_text_and_the_http_status() {
     let body: serde_json::Value = serde_json::from_slice(v.body()).unwrap();
     assert_eq!(body["code"], "bad_service_signature");
     assert!(!esp.is_spent(&b), "nothing was burned");
-    let (code, http) = esp.http_post("/redeem", &bytes);
-    assert_eq!(code, 400);
-    assert_eq!(
-        body,
-        serde_json::from_slice::<serde_json::Value>(&http).unwrap()
-    );
 
     // The same exchange arriving while it is being processed is a 409
     // `in_progress`: over AIR a signed refusal that says it was a 409, so the
@@ -1145,12 +1090,6 @@ fn refusals_are_signed_replies_with_the_http_text_and_the_http_status() {
     let held: serde_json::Value = serde_json::from_slice(v.body()).unwrap();
     assert_eq!(held["code"], "in_progress");
     assert_eq!(held["http_status"], 409);
-    let (code, http) = esp.http_post("/exchange", &body);
-    assert_eq!(code, 409);
-    assert_eq!(
-        without_status(&v),
-        serde_json::from_slice::<serde_json::Value>(&http).unwrap()
-    );
     assert!(!esp.psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
     drop(claim);
     // Once the place is free the same request goes through.
@@ -1166,7 +1105,7 @@ fn a_psp_that_cannot_be_reached_is_a_signed_unavailable_and_a_retry_is_safe() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("dead-psp");
-    // Nothing listens on port 9: the HTTP route would answer 502.
+    // Nothing listens on port 9: the mint cannot reach its PSP.
     let esp = start_esp_at(&dir, false, Config::default(), Some("http://127.0.0.1:9"));
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let cfg = config(&server, &did, 10, 3);
@@ -1192,8 +1131,10 @@ fn a_psp_that_cannot_be_reached_is_a_signed_unavailable_and_a_retry_is_safe() {
     let receipt = verify_receipt(&did, &plain).unwrap();
     assert_eq!(receipt.status, STATUS_UNAVAILABLE);
     assert!(receipt.body.is_empty());
-    let (code, _) = esp.http_post("/exchange", &body);
-    assert_eq!(code, 502);
+    assert!(matches!(
+        esp.served(KIND_EXCHANGE, &body),
+        Some(Served::Unavailable)
+    ));
     // Nothing was burned or issued, so the wallet may send it again.
     assert!(!esp.psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
     assert_eq!(esp.audit()["issued"], 0);
