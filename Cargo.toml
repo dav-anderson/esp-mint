@@ -32,7 +32,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal
 # [patch."https://github.com/dav-anderson/sp-wire.git"]
 # sp-wire = { path = "../sp-wire" }
 #
-# While sp-wire's AIR pin (2.1.0) has no `SecretKey` export upstream, AIR is taken
+# While sp-wire's AIR pin (3.0.0) has no `SecretKey` export upstream, AIR is taken
 # from a local checkout that has it:
 # [patch."https://github.com/ramp-stack/air"]
 # air = { path = "../air" }

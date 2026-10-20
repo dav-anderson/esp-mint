@@ -4,6 +4,8 @@ esp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. N
 
 ## 0.6.0, AIR listener (unreleased)
 
+**AIR 3.0.0 (unreleased).** Comments and docs follow sp-wire's move to air 3.0.0 (`ff41c09`) and air_server 1.0.0 (`ec6ac1f`); no code changes. The local AIR checkouts for a build are now on the branch `air3-export-secretkey` (3.0.0 plus the `SecretKey` export), and air_server is at 1.0.0.
+
 - **An AIR listener answers a wallet's calls, beside the HTTP server. Off unless `air.enabled` is true.** Mint info, keysets, rotation, fees, rollover, exchange, transfer and redeem (request kinds 1, 3, 4, 7, 5, 8, 9 and 10 of `sp_wire::air_request`), each with a reply signed by the mint's DID key. The body is the body of the HTTP route and is built by the same function (the routes were split into functions that return the status and the JSON, and thin handlers; HTTP behaviour is unchanged), so the two cannot differ, and a test compares the bytes. The request is sealed to the mint's DID, so the notes in an exchange, a transfer, a redemption or a rollover are not visible to the AIR server.
 - **The ESP's own DID.** `mint_did_key.json` in the network's data folder, made on first use when `air.enabled` is true and never replaced if damaged; new module `did`. It is not the PSP's, so both can share one AIR server. New command `esp-mint pubkey` prints the DID (the wallet's `air.esp_did`).
 - **Idempotent.** A resent exchange, transfer, redemption or rollover (over AIR, over HTTP, in another slot, after a replayed slot) is answered from the stored answer and nothing is applied twice; no new mint logic was needed, since each already stores its answer by request hash before it burns.
