@@ -439,6 +439,7 @@ impl Esp {
                 )
             }
             Some(Served::Unavailable) => panic!("expected an answer, got 'unavailable'"),
+            Some(Served::Ignored(why)) => panic!("expected an answer, got no reply: {why}"),
             None => panic!("expected an answer, the kind is not served"),
         }
     }

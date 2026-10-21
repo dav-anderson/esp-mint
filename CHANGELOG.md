@@ -12,6 +12,7 @@ esp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. N
 - **Behaviour change: `server.bind` must be a loopback address**, checked when the settings are read (every command). It was the public API's address; what it serves now is for the operator and the SPI on this machine.
 - `redeem.rs` and `admin.rs` lose the notes that said a ceiling above 15 MiB takes larger requests over HTTP only: it takes requests no wallet can send.
 - Tests: the integration tests now call the mint over AIR on a real `air_server` (`tests/common/mod.rs`); `tests/air_info.rs` no longer compares with the HTTP routes. The `*_http.rs` files keep their names. `hold_http.rs` hands the overlapping calls of its first two tests to the mint in the test process (the AIR listener answers one request at a time, so it cannot overlap them) and runs the PSP timeout over AIR, where the PSP's `502` is a signed "unavailable" (`503` in the helper). A test that nothing but `/audit` and `/health` answers over HTTP replaces the one for the documented routes; new config tests cover the removed settings and the loopback check.
+- Tests: the two test helpers that match what the mint serves (`served_call` in `tests/common/mod.rs` and `served_body` in `tests/air_info.rs`) handle sp-wire's new `Served::Ignored` (a request answered with no reply, which psp-mint's kind 15 uses) by failing the test. esp-mint never returns it. No mint behaviour changes.
 
 ## 0.6.0, AIR listener (unreleased)
 

@@ -156,6 +156,7 @@ pub fn served_call(state: &EspState, route: &str, body: &[u8]) -> (u16, Value) {
         Some(Served::Body(bytes)) => (200, serde_json::from_slice(&bytes).unwrap_or(Value::Null)),
         Some(Served::Refused(bytes)) => refusal(&bytes),
         Some(Served::Unavailable) => (503, Value::Null),
+        Some(Served::Ignored(why)) => panic!("{route}: expected an answer, got no reply: {why}"),
         None => panic!("{route} is not served"),
     }
 }
