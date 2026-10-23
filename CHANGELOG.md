@@ -2,7 +2,7 @@
 
 esp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
-## 0.7.0 (unreleased): the SPI gaps (ROADMAP item 20, items 17 and 18)
+## 0.8.0 (2026-10-23): the SPI gaps (ROADMAP item 20, items 17 and 18)
 
 - **Changed: mint-core v0.2.0 and sp-wire v0.5.1, and no `mint-server`.** mint-core's `server` crate is gone (nothing ran its `mintd`). `MeltRequest` and `MeltResponse`, which `HttpPsp` sends and reads, come from `sp_wire::melt` (the same JSON; sp-wire v0.5.1 is the first with them). The test PSPs take `AppState` from `mint_core::state` (it has no `admin_token` now). Pins: mint-core, mint-types and bdhke `v0.2.0` (from `v0.1.3`), sp-wire `v0.5.1` (from `v0.5.0`). Tests: imports and the `AppState` literal only.
 - **Changed: `esp-mint pay` goes through the running `serve`.** It sends `POST /payouts/pay` to the operator's listener, as `decline` does (`ESP_ADMIN_BIND`, `ESP_ADMIN_TOKEN`; one shared client, `ask_serve` in `main.rs`), and no longer opens the queue file to write it. Before, it wrote `queue.json` without `serve`'s queue lock, which DESIGN.md called a race. Behaviour change: `pay` needs `serve` running; with none it says `could not reach the mint's admin listener at ...` and settles nothing. `payouts::run_pay` is now `payouts::parse_pay` (the arguments only; serve checks the entries).
