@@ -2,6 +2,10 @@
 
 esp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.7.0 (2026-10-22): sp-wire v0.5.0 from GitHub
+
+**Builds from GitHub with no local patch.** `Cargo.toml` names `sp-wire` at tag `v0.5.0` (it named `v0.4.0`, which has no `air-client`), and the committed `Cargo.lock` follows. sp-wire 0.5.0 pins AIR at `eae5133` (3.0.0 plus the `SecretKey` export) and air_server at `v1.0.1`, which takes `air` from crates.io, so `Cargo.toml` adds `[patch.crates-io] air` at that AIR commit; the commented local patches for AIR and air_server are gone, and the README's "Building" says this. No code change. Tests: 278, unchanged.
+
 ## 0.7.0 (unreleased)
 
 **Wallets reach this mint over AIR only.** Builds on `sp-wire` with `seal` and `air-client`, as 0.6.0 does.

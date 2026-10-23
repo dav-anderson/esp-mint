@@ -14,7 +14,7 @@ mint-server = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0
 # The wire types, shared with the other mints and the wallet.
 # `seal` and `air-client` are for the AIR listener (the mint's own DID key, the
 # requests it opens and the replies it signs); see the README, "The AIR listener".
-sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.4.0", features = ["seal", "air-client"] }
+sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.5.0", features = ["seal", "air-client"] }
 secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "rand", "serde"] }
 sha2 = "0.10"
 hex = "0.4.3"
@@ -32,19 +32,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal
 # [patch."https://github.com/dav-anderson/sp-wire.git"]
 # sp-wire = { path = "../sp-wire" }
 #
-# While sp-wire's AIR pin (3.0.0) has no `SecretKey` export upstream, AIR is taken
-# from a local checkout that has it:
-# [patch."https://github.com/ramp-stack/air"]
-# air = { path = "../air" }
-#
-# The AIR listener uses sp-wire's `air-client` feature, which needs air_server.
-# air_server names `air` as `path = "../air"`, so it needs a checkout beside the
-# `air` above, and both patches (the air folder must be the one next to it):
-# [patch."https://github.com/ramp-stack/air_server"]
-# air_server = { path = "../air_server" }
-#
 # [patch."https://github.com/dav-anderson/mint-core.git"]
 # mint-core = { path = "../mint-core-v0.1.3/crates/mint-core" }
 # mint-types = { path = "../mint-core-v0.1.3/crates/mint-types" }
 # bdhke = { path = "../mint-core-v0.1.3/crypto/bdhke" }
 # mint-server = { path = "../mint-core-v0.1.3/server" }
+
+# sp-wire's `air-client` builds air_server 1.0.1, which takes `air` 3.0.0 from
+# crates.io. This points that at the AIR sp-wire pins (3.0.0 plus the `SecretKey`
+# export), or two `air` crates are built and their types do not match. sp-wire has
+# the same block, but a patch applies only in the crate being built.
+[patch.crates-io]
+air = { git = "https://github.com/ramp-stack/air", rev = "eae5133414fca493fa80ab3facf28248df9ad65d" }
