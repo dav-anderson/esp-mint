@@ -3,14 +3,10 @@
 //! This is a placeholder store: one JSON document, rewritten in full on every
 //! change (temporary file, fsync, rename, directory fsync). It holds the entries,
 //! by request hash, and the per-day ledger (`ledger`), so that one atomic write
-//! changes both. A missing file means no entries. An unreadable file is an error
-//! and never an empty store.
-//!
-//! Files written before 0.5.0 are a bare JSON object from request hash to entry.
-//! They are read as they are, with an empty ledger, and the first change writes
-//! the new shape (`{"entries": {...}, "ledger": {...}}`). There is no way back
-//! to the old shape short of restoring a copy of the file: an older version
-//! refuses the new one rather than reading it as entries.
+//! changes both: `{"entries": {...}, "ledger": {...}}`. A missing file means no
+//! entries. An unreadable file is an error and never an empty store. A file in
+//! any other shape, such as the bare map of request hash to entry that 0.4.0 and
+//! earlier wrote, does not open.
 //!
 //! An entry is `pending` from just before the PSP notes are burned until the
 //! ESP signatures are made, and `done` after that. A request that is retried
@@ -73,13 +69,10 @@ pub enum Entry {
     /// An exchange that is validated and authorized, and not yet finished. The
     /// terms are fixed here so that a retry on a later day still issues the same
     /// notes. The lists reserve the PSP notes it burns and the blind nonces it
-    /// signs (hex), against every other request. An entry written before the
-    /// lists existed has them empty and reserves nothing.
+    /// signs (hex), against every other request.
     Pending {
         redeemable_after_day: u64,
-        #[serde(default)]
         inputs: Vec<String>,
-        #[serde(default)]
         outputs: Vec<String>,
     },
     /// A transfer that is validated and authorized, and not yet finished. Some
@@ -109,7 +102,7 @@ pub struct TransferPending {
     pub burned: bool,
 }
 
-/// The file as it is written since 0.5.0.
+/// The file as it is written.
 #[derive(Serialize, Deserialize)]
 struct Stored {
     entries: BTreeMap<String, Entry>,
@@ -121,14 +114,6 @@ struct Stored {
 struct StoredRef<'a> {
     entries: &'a BTreeMap<String, Entry>,
     ledger: &'a Ledger,
-}
-
-/// Tells the two shapes of the file apart without reading the entries: only the
-/// new one has a `ledger` member (a request hash is hex, so it never is one).
-#[derive(Deserialize)]
-struct Probe {
-    #[serde(default)]
-    ledger: Option<serde::de::IgnoredAny>,
 }
 
 pub struct Responses {
@@ -144,16 +129,9 @@ impl Responses {
     pub fn open(path: &Path) -> Result<Self, ResponsesError> {
         let (rows, ledger) = match fs::read(path) {
             Ok(bytes) => {
-                let probe: Probe =
+                let stored: Stored =
                     serde_json::from_slice(&bytes).map_err(ResponsesError::Corrupt)?;
-                if probe.ledger.is_some() {
-                    let stored: Stored =
-                        serde_json::from_slice(&bytes).map_err(ResponsesError::Corrupt)?;
-                    (stored.entries, stored.ledger)
-                } else {
-                    let rows = serde_json::from_slice(&bytes).map_err(ResponsesError::Corrupt)?;
-                    (rows, Ledger::default())
-                }
+                (stored.entries, stored.ledger)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => (BTreeMap::new(), Ledger::default()),
             Err(e) => return Err(e.into()),
@@ -444,23 +422,6 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_entry_written_before_the_reservations_still_reads() {
-        let dir = scratch("old-pending");
-        let path = dir.join("responses.json");
-        fs::write(&path, r#"{"abc":{"pending":{"redeemable_after_day":5}}}"#).unwrap();
-        let store = Responses::open(&path).unwrap();
-        assert_eq!(
-            store.get("abc"),
-            Some(&Entry::Pending {
-                redeemable_after_day: 5,
-                inputs: vec![],
-                outputs: vec![],
-            })
-        );
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn a_damaged_file_is_an_error_and_is_left_alone() {
         let dir = scratch("damaged");
         let path = dir.join("responses.json");
@@ -470,25 +431,6 @@ mod tests {
             Err(ResponsesError::Corrupt(_))
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "not json");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn no_temporary_file_is_left_behind() {
-        let dir = scratch("tmp");
-        let path = dir.join("responses.json");
-        let mut store = Responses::open(&path).unwrap();
-        store
-            .put(
-                "h",
-                Entry::Pending {
-                    redeemable_after_day: 1,
-                    inputs: vec![],
-                    outputs: vec![],
-                },
-            )
-            .unwrap();
-        assert!(!dir.join("responses.json.tmp").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -520,52 +462,6 @@ mod tests {
         let mut m = Movements::new();
         m.issue(day, units);
         m
-    }
-
-    #[test]
-    fn a_file_from_before_the_ledger_reads_with_an_empty_ledger_and_is_upgraded_by_the_next_write()
-    {
-        let dir = scratch("upgrade");
-        let path = dir.join("responses.json");
-        // the old shape: a bare object from request hash to entry
-        fs::write(&path, r#"{"abc":{"pending":{"redeemable_after_day":5}}}"#).unwrap();
-        let mut store = Responses::open(&path).unwrap();
-        assert_eq!(store.len(), 1);
-        assert_eq!(store.ledger(), &Ledger::default());
-        // reading does not rewrite it
-        assert!(!fs::read_to_string(&path).unwrap().contains("ledger"));
-
-        store.finish("abc", done(5), &issued(5, 70)).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"entries\"") && text.contains("\"ledger\""));
-        let again = Responses::open(&path).unwrap();
-        assert_eq!(again.len(), 1);
-        assert_eq!(again.get("abc"), Some(&done(5)));
-        assert_eq!(again.ledger().day(5).issued, 70);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn an_empty_old_file_is_an_empty_store() {
-        let dir = scratch("empty-old");
-        let path = dir.join("responses.json");
-        fs::write(&path, "{}").unwrap();
-        let store = Responses::open(&path).unwrap();
-        assert!(store.is_empty());
-        assert_eq!(store.ledger(), &Ledger::default());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn an_older_version_refuses_the_new_file_rather_than_reading_it_as_entries() {
-        let dir = scratch("downgrade");
-        let path = dir.join("responses.json");
-        let mut store = Responses::open(&path).unwrap();
-        store.finish("abc", done(5), &issued(5, 1)).unwrap();
-        let bytes = fs::read(&path).unwrap();
-        // what 0.4.0 did with the file
-        assert!(serde_json::from_slice::<BTreeMap<String, Entry>>(&bytes).is_err());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -634,22 +530,6 @@ mod tests {
         store.finish("k", done(7), &issued(7, 1)).unwrap();
         assert!(!path.with_extension("json.tmp").exists());
         assert_eq!(Responses::open(&path).unwrap().ledger().day(7).issued, 101);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_write_that_fails_changes_neither_the_entries_nor_the_ledger() {
-        let dir = scratch("failed");
-        // the folder does not exist, so the temporary file can not be made
-        let path = dir.join("missing").join("responses.json");
-        let mut store = Responses::open(&path).unwrap();
-        assert!(store.finish("h", done(7), &issued(7, 100)).is_err());
-        assert!(store.is_empty());
-        assert_eq!(store.ledger(), &Ledger::default());
-        assert!(store.count_decline("e1", &issued(7, 1)).is_err());
-        assert!(!store.ledger().decline_counted("e1"));
-        assert!(store.put("h", pending(7)).is_err());
-        assert!(store.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 

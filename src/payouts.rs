@@ -559,11 +559,20 @@ mod tests {
             serde_json::from_str(&run_payouts(&path, &["--json".to_string()]).unwrap()).unwrap();
         assert_eq!(json[0]["owed_esp"], "15000000000000");
         assert_eq!(json[0]["entries"], 2);
-        assert!(run_payouts(&path, &["--nope".to_string()]).is_err());
+        assert_eq!(
+            run_payouts(&path, &["--nope".to_string()]).unwrap_err(),
+            "unexpected argument `--nope`"
+        );
 
         let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(run_pay(&path, &args(&[G_DID, "ref"]), DAY1).is_err());
-        assert!(run_pay(&path, &args(&["zz", "ref", "e1"]), DAY1).is_err());
+        assert_eq!(
+            run_pay(&path, &args(&[G_DID, "ref"]), DAY1).unwrap_err(),
+            "usage: esp-mint pay <service> <ref> <entry id>... [--mixed-memos]"
+        );
+        assert_eq!(
+            run_pay(&path, &args(&["zz", "ref", "e1"]), DAY1).unwrap_err(),
+            "`zz` is not a service ID: it must be hex"
+        );
         // The 32-byte x-only form of wire version 2 is refused, with a message that says so.
         let old_form = &G_DID[2..];
         let refused = run_pay(&path, &args(&[old_form, "ref", "e1"]), DAY1).unwrap_err();

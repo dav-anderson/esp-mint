@@ -5,7 +5,7 @@
 //! is `completed` (paid, with a payment reference) or `declined` (with the
 //! operator's reason and the signatures on the reissued notes).
 //!
-//! `redeem::redeem` adds entries with `Queue::add`, using the request hash as
+//! `redeem::redeem_gens` adds entries with `Queue::add`, using the request hash as
 //! the entry id, so a retried request finds its entry already there. The payout
 //! report (`payouts.rs`), the settle call and the decline call below work on
 //! whatever is in the file.
@@ -124,30 +124,23 @@ pub struct Entry {
     /// When the redemption was accepted, in unix seconds.
     pub created_unix: u64,
     pub status: Status,
-    #[serde(default)]
     pub payment_ref: Option<String>,
-    #[serde(default)]
     pub completed_unix: Option<u64>,
     /// When the mint declined to pay, in unix seconds.
-    #[serde(default)]
     pub declined_unix: Option<u64>,
     /// Why the mint declined to pay.
-    #[serde(default)]
     pub decline_reason: Option<String>,
     /// The signatures on the notes reissued because of the decline, in the order
     /// of the request's `decline_outputs`.
-    #[serde(default)]
     pub decline_signatures: Vec<SignedOutput>,
     /// The fee rate this redemption was charged at, in ESP units per encoded
-    /// byte: the rate in force when it was accepted. Zero on an entry that was
-    /// queued without one.
-    #[serde(default, with = "dec")]
+    /// byte: the rate in force when it was accepted.
+    #[serde(with = "dec")]
     pub fee_per_byte: u128,
     /// The fee that was charged, in ESP units.
-    #[serde(default, with = "dec")]
+    #[serde(with = "dec")]
     pub fee_esp: u128,
     /// The size of the request the fee was sized by, in bytes.
-    #[serde(default)]
     pub size_bytes: u64,
 }
 
@@ -545,7 +538,10 @@ mod tests {
             queue.decline("nope", "why", vec![], 2),
             Err(QueueError::Unknown(_))
         ));
-        assert!(queue.decline("a", "   ", vec![], 2).is_err());
+        assert!(matches!(
+            queue.decline("a", "   ", vec![], 2),
+            Err(QueueError::Invalid(why)) if why == "a reason for the decline is required"
+        ));
         assert_eq!(queue.get("a").unwrap().status, Status::Open);
         queue.decline("a", "why", vec![], 2).unwrap();
         assert!(matches!(
@@ -560,24 +556,6 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_written_before_declines_existed_still_reads() {
-        let dir = scratch("old-entry");
-        let path = dir.join("queue.json");
-        fs::write(
-            &path,
-            format!(
-                r#"{{"a":{{"id":"a","service":"02{G_X}","owed_esp":"5","memo":"m","created_unix":1,"status":"open"}}}}"#
-            ),
-        )
-        .unwrap();
-        let queue = Queue::open(&path).unwrap();
-        let a = queue.get("a").unwrap();
-        assert_eq!(a.declined_unix, None);
-        assert!(a.decline_signatures.is_empty());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn an_entry_is_queued_once_and_only_when_something_is_owed() {
         let dir = scratch("add");
         let mut queue = Queue::open(&dir.join("queue.json")).unwrap();
@@ -586,8 +564,14 @@ mod tests {
             queue.add(Entry::open("a", service(), 9, "m", 2)),
             Err(QueueError::Duplicate(_))
         ));
-        assert!(queue.add(Entry::open("b", service(), 0, "m", 2)).is_err());
-        assert!(queue.add(Entry::open("", service(), 1, "m", 2)).is_err());
+        assert!(matches!(
+            queue.add(Entry::open("b", service(), 0, "m", 2)),
+            Err(QueueError::Invalid(why)) if why == "nothing is owed, so there is nothing to queue"
+        ));
+        assert!(matches!(
+            queue.add(Entry::open("", service(), 1, "m", 2)),
+            Err(QueueError::Invalid(why)) if why == "an entry needs an id"
+        ));
         assert_eq!(queue.get("a").unwrap().owed_esp, 5);
         assert_eq!(queue.len(), 1);
         fs::remove_dir_all(&dir).unwrap();

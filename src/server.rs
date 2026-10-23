@@ -10,10 +10,9 @@
 //! What is left on HTTP, on `server.bind` (loopback only):
 //!
 //! - `GET /audit`: issued, redeemed and outstanding ESP units, and the
-//!   outstanding split into `outstanding_matured` (days that have come),
-//!   `outstanding_unmatured` (days ahead) and `outstanding_unsplit` (issued
-//!   before 0.5.0, day unknown), from the per-day ledger (see `ledger`). For
-//!   the operator.
+//!   outstanding split into `outstanding_matured` (days that have come) and
+//!   `outstanding_unmatured` (days ahead), from the per-day ledger (see
+//!   `ledger`), with the number of requests still unfinished. For the operator.
 //! - `GET /health`: `200` while the mint locks are sound, `503` otherwise. Read
 //!   by `spi` and the health monitor on this machine; wallets get the same
 //!   status in the mint info over AIR.
@@ -42,7 +41,8 @@
 //! load.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::error::Error;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,13 +77,58 @@ pub struct EspState {
     /// The mint's settings: fee rates, ceilings and limits. A request takes
     /// them once at its start; a reload swaps them for the next request.
     pub config: config::Handle,
-    /// Key rotation: the previous key set and the rollover answers. `None`
-    /// for a mint without rotation (the unit tests). Always locked after the
-    /// mint (and after the responses and the queue, when those are taken).
-    pub rotor: Option<Mutex<crate::rotation::Rotor>>,
-    pub rollovers: Option<Mutex<crate::rotation::Rollovers>>,
+    /// Key rotation: the previous key set and the rollover answers. Every
+    /// mint rotates. Always locked after the mint (and after the responses and
+    /// the queue, when those are taken).
+    pub rotor: Mutex<crate::rotation::Rotor>,
+    pub rollovers: Mutex<crate::rotation::Rollovers>,
     /// The exchanges this process is in the middle of (see [`InFlight`]).
     pub in_flight: InFlight,
+}
+
+/// The queue file in a network's data folder.
+pub fn queue_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("queue.json")
+}
+
+impl EspState {
+    /// The state `esp-mint serve` runs on, opened from the network's data
+    /// folder `data_dir`: the rotor and the mint it opens (generation 0 and any
+    /// later one, from `config`'s `rotation.activation_hours` and
+    /// `rotation.period_hours`), the rollover answers, the stored responses,
+    /// the queue file, and `psp` for the burns of an exchange.
+    ///
+    /// `clock` is the mint's clock in unix seconds, for a rotation that is
+    /// tested without waiting; `0` is the system clock, which is what `serve`
+    /// passes. Every mint rotates, so there is no other way to open one.
+    pub fn open(
+        data_dir: &Path,
+        psp: Box<dyn Psp + Send + Sync>,
+        config: config::Config,
+        clock: u64,
+    ) -> Result<EspState, Box<dyn Error>> {
+        let (rotor, logic) = crate::rotation::Rotor::open_at(
+            data_dir,
+            config.rotation_activation_hours,
+            config.rotation_period_hours,
+            clock,
+        )?;
+        let master = rotor.current.master.clone();
+        let rollovers = crate::rotation::Rollovers::open(data_dir)?;
+        let responses = Responses::open(&data_dir.join(crate::rotation::RESPONSES_FILE))?;
+        Ok(EspState {
+            logic: Mutex::new(logic),
+            master,
+            psp,
+            responses: Mutex::new(responses),
+            queue_path: queue_path(data_dir),
+            queue_lock: Mutex::new(()),
+            config: config::Handle::new(config),
+            rotor: Mutex::new(rotor),
+            rollovers: Mutex::new(rollovers),
+            in_flight: Default::default(),
+        })
+    }
 }
 
 /// The code of the `409` an exchange gets while the same request is already
@@ -149,16 +194,14 @@ impl Drop for Claim<'_> {
 pub fn rotor_of<'a>(
     state: &'a EspState,
     logic: &mut MintLogic,
-) -> Result<Option<std::sync::MutexGuard<'a, crate::rotation::Rotor>>, String> {
-    let Some(r) = &state.rotor else {
-        return Ok(None);
-    };
-    let mut g = r
+) -> Result<std::sync::MutexGuard<'a, crate::rotation::Rotor>, String> {
+    let mut g = state
+        .rotor
         .lock()
         .map_err(|_| "the rotor lock is poisoned".to_string())?;
     g.refresh(logic)
         .map_err(|e| format!("key rotation failed: {e}"))?;
-    Ok(Some(g))
+    Ok(g)
 }
 
 pub fn now_secs() -> u64 {
@@ -241,10 +284,7 @@ fn with_mint<T>(
         ));
     };
     let rot = rotor_of(state, &mut logic).map_err(ExchangeError::Internal)?;
-    let gens = match &rot {
-        Some(r) => r.gens(&logic),
-        None => crate::rotation::Gens::only(&logic, &state.master),
-    };
+    let gens = rot.gens(&logic);
     f(&gens, &mut responses)
 }
 
@@ -337,20 +377,15 @@ pub fn run_transfer(state: &EspState, request: &TransferRequest) -> (StatusCode,
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
     };
-    let gens = match &rot {
-        Some(r) => r.gens(&logic),
-        None => crate::rotation::Gens::only(&logic, &state.master),
-    };
+    let gens = rot.gens(&logic);
     // Notes pending rollovers hold (locked after the rotor, as everywhere).
-    if let Some(r) = &state.rollovers {
-        match r.lock() {
-            Ok(store) => responses.set_external_holds(store.held_nonces("")),
-            Err(_) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({"error": "the rollovers lock is poisoned"}),
-                );
-            }
+    match state.rollovers.lock() {
+        Ok(store) => responses.set_external_holds(store.held_nonces("")),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "the rollovers lock is poisoned"}),
+            );
         }
     }
     match transfer::transfer_gens(&gens, &mut responses, request, &settings) {
@@ -367,9 +402,9 @@ pub fn run_transfer(state: &EspState, request: &TransferRequest) -> (StatusCode,
                 body["code"] = json!(code);
             }
             // The wallet reads these two to stop offering that note.
-            if let TransferRejection::AlreadySpent { index } = &r {
+            if let TransferRejection::AlreadySpent { indexes } = &r {
                 body["code"] = json!(sp_wire::codes::NOTE_SPENT_ELSEWHERE);
-                body["spent"] = json!([index]);
+                body["spent"] = json!(indexes);
             }
             if let TransferRejection::NotExactWithFee {
                 inputs,
@@ -424,20 +459,15 @@ pub fn run_redeem(state: &EspState, body: &[u8], now_unix: u64) -> (StatusCode, 
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
     };
-    let gens = match &rot {
-        Some(r) => r.gens(&logic),
-        None => crate::rotation::Gens::only(&logic, &state.master),
-    };
+    let gens = rot.gens(&logic);
     // Notes pending rollovers hold (locked after the rotor, as everywhere).
-    if let Some(r) = &state.rollovers {
-        match r.lock() {
-            Ok(store) => responses.set_external_holds(store.held_nonces("")),
-            Err(_) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({"error": "the rollovers lock is poisoned"}),
-                );
-            }
+    match state.rollovers.lock() {
+        Ok(store) => responses.set_external_holds(store.held_nonces("")),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "the rollovers lock is poisoned"}),
+            );
         }
     }
     match redeem::redeem_gens(
@@ -592,16 +622,14 @@ async fn audit_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<
     };
     // Every generation: the current, the previous and the deleted ones.
     let totals = logic.audit_totals().and_then(|(mut i, mut d)| {
-        if let Some(r) = &rot {
-            if let Some((_, p)) = &r.previous {
-                let (pi, pd) = p.audit_totals()?;
-                i += pi;
-                d += pd;
-            }
-            let (ri, rd) = r.retired_totals();
-            i += mint_types::Amount::from_units(ri);
-            d += mint_types::Amount::from_units(rd);
+        if let Some((_, p)) = &rot.previous {
+            let (pi, pd) = p.audit_totals()?;
+            i += pi;
+            d += pd;
         }
+        let (ri, rd) = rot.retired_totals();
+        i += mint_types::Amount::from_units(ri);
+        d += mint_types::Amount::from_units(rd);
         Ok((i, d))
     });
     match totals {
@@ -627,17 +655,15 @@ async fn audit_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<
 ///
 /// - `outstanding_matured` / `outstanding_unmatured`: what the ledger knows is
 ///   outstanding under days that have come / days still ahead.
-/// - `outstanding_unsplit`: the rest of `outstanding`, which the ledger can not
-///   place: ESP issued before 0.5.0, whose day was not kept. Zero on a mint that
-///   has run 0.5.0 from its first note. It also moves by what an unfinished
-///   request has burned or signed and the ledger does not count yet (see
-///   `requests_unfinished`), and is never below zero.
 /// - `requests_unfinished`: exchanges, transfers and redemptions not finished.
+///   What one has burned or signed is counted by mint-core at once and by the
+///   ledger when the request finishes, so `outstanding` can be ahead of
+///   matured + unmatured by that much while any are unfinished, and by nothing
+///   when none are.
 /// - `as_of_day`: the day (since the Unix epoch) that "has come" is measured at.
 pub fn audit_body(issued: u64, redeemed: u64, responses: &Responses, now_unix: u64) -> Value {
     let outstanding = issued.saturating_sub(redeemed);
     let split = responses.ledger().split(now_unix);
-    let known = split.matured.saturating_add(split.unmatured);
     let as_units = |v: u128| u64::try_from(v).unwrap_or(u64::MAX);
     json!({
         "issued": issued,
@@ -645,7 +671,6 @@ pub fn audit_body(issued: u64, redeemed: u64, responses: &Responses, now_unix: u
         "outstanding": outstanding,
         "outstanding_matured": as_units(split.matured),
         "outstanding_unmatured": as_units(split.unmatured),
-        "outstanding_unsplit": as_units(u128::from(outstanding).saturating_sub(known)),
         "requests_unfinished": responses.unfinished(),
         "as_of_day": now_unix / crate::terms::SECONDS_PER_DAY,
     })
@@ -686,20 +711,13 @@ fn keysets_outcome(state: &EspState) -> (StatusCode, Value) {
         );
     };
     match rotor_of(state, &mut logic) {
-        Ok(Some(r)) => {
+        Ok(r) => {
             let g = r.gens(&logic);
             (
                 StatusCode::OK,
                 json!({"current": g.current_id, "previous": g.previous_id}),
             )
         }
-        Ok(None) => (
-            StatusCode::OK,
-            json!({
-                "current": crate::rotation::keyset_id(&state.master),
-                "previous": Value::Null,
-            }),
-        ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
     }
 }
@@ -714,13 +732,9 @@ fn rotation_outcome(state: &EspState) -> (StatusCode, Value) {
         );
     };
     match rotor_of(state, &mut logic) {
-        Ok(Some(r)) => (
+        Ok(r) => (
             StatusCode::OK,
             serde_json::to_value(r.window()).unwrap_or_default(),
-        ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            json!({"error": "this mint does not rotate its keys"}),
         ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
     }
@@ -743,16 +757,10 @@ pub fn rollover_outcome(
         );
     };
     let rot = match rotor_of(state, &mut logic) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                json!({"error": "this mint does not rotate its keys"}),
-            );
-        }
+        Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
     };
-    let Some(Ok(mut store)) = state.rollovers.as_ref().map(|r| r.lock()) else {
+    let Ok(mut store) = state.rollovers.lock() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"error": "the rollovers lock is poisoned"}),
@@ -772,12 +780,12 @@ pub fn rollover_outcome(
         Err(crate::rotation::RolloverError::Keyset(code, e)) => {
             (StatusCode::BAD_REQUEST, json!({"error": e, "code": code}))
         }
-        Err(crate::rotation::RolloverError::Spent(i)) => (
+        Err(crate::rotation::RolloverError::Spent(spent)) => (
             StatusCode::BAD_REQUEST,
             json!({
-                "error": format!("input {i}: the note is already spent"),
+                "error": spent_inputs_text(&spent),
                 "code": sp_wire::codes::NOTE_SPENT_ELSEWHERE,
-                "spent": [i],
+                "spent": spent,
             }),
         ),
         Err(crate::rotation::RolloverError::Internal(e)) => {
@@ -786,11 +794,27 @@ pub fn rollover_outcome(
     }
 }
 
+/// The text of a rollover refusal for spent notes, naming every one:
+/// `input 1: the note is already spent`, or `inputs 1, 3: the notes are already
+/// spent`.
+fn spent_inputs_text(spent: &[usize]) -> String {
+    let list = spent
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if spent.len() == 1 {
+        format!("input {list}: the note is already spent")
+    } else {
+        format!("inputs {list}: the notes are already spent")
+    }
+}
+
 // ---- over AIR ---------------------------------------------------------------
 
 /// The signed refusal of a 4xx. A `400` is the route's body as it is. Any other
-/// 4xx (the `404` of a mint that does not rotate, the `409` `in_progress` of an
-/// exchange already being processed, the `413` of a body over its ceiling) has
+/// 4xx (the `409` `in_progress` of an exchange already being processed, the
+/// `413` of a body over its ceiling) has
 /// `http_status` added to the body, so that the wallet can treat it as it treats
 /// that status as an HTTP status: only a `400` means "refused, nothing was burned", and
 /// the others are an error where the outcome may be unknown and the same request
@@ -995,7 +1019,6 @@ mod tests {
         assert_eq!(body["outstanding"], 0);
         assert_eq!(body["outstanding_matured"], 0);
         assert_eq!(body["outstanding_unmatured"], 0);
-        assert_eq!(body["outstanding_unsplit"], 0);
         assert_eq!(body["requests_unfinished"], 0);
         assert_eq!(body["as_of_day"], 10);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1013,14 +1036,12 @@ mod tests {
         assert_eq!(before["outstanding"], 115);
         assert_eq!(before["outstanding_matured"], 0);
         assert_eq!(before["outstanding_unmatured"], 115);
-        assert_eq!(before["outstanding_unsplit"], 0);
 
         // the first second of day 10: what was issued for day 10 has matured
         let day10 = at(10 * DAY);
         assert_eq!(day10["as_of_day"], 10);
         assert_eq!(day10["outstanding_matured"], 75);
         assert_eq!(day10["outstanding_unmatured"], 40);
-        assert_eq!(day10["outstanding_unsplit"], 0);
 
         // and the next day, the rest
         let day11 = at(11 * DAY);
@@ -1031,36 +1052,14 @@ mod tests {
         for now in [9 * DAY, 10 * DAY, 10 * DAY + 5, 11 * DAY, 400 * DAY] {
             let b = at(now);
             let sum = b["outstanding_matured"].as_u64().unwrap()
-                + b["outstanding_unmatured"].as_u64().unwrap()
-                + b["outstanding_unsplit"].as_u64().unwrap();
+                + b["outstanding_unmatured"].as_u64().unwrap();
             assert_eq!(sum, b["outstanding"].as_u64().unwrap());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn esp_issued_before_the_ledger_is_reported_as_unsplit() {
-        let dir = scratch("legacy");
-        // an existing mint upgraded: 500 outstanding, the ledger knows nothing
-        let r = Responses::open(&dir.join("responses.json")).unwrap();
-        let body = audit_body(500, 0, &r, 10 * DAY);
-        assert_eq!(body["outstanding"], 500);
-        assert_eq!(body["outstanding_matured"], 0);
-        assert_eq!(body["outstanding_unmatured"], 0);
-        assert_eq!(body["outstanding_unsplit"], 500);
-
-        // then 115 more is issued under the ledger: only the old part is unsplit
-        let known = known(&scratch("legacy-known"));
-        let body = audit_body(500 + 140, 25, &known, 10 * DAY);
-        assert_eq!(body["outstanding"], 615);
-        assert_eq!(body["outstanding_matured"], 75);
-        assert_eq!(body["outstanding_unmatured"], 40);
-        assert_eq!(body["outstanding_unsplit"], 500);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_request_part_way_through_never_makes_the_unsplit_amount_negative() {
+    fn a_request_part_way_through_is_counted_as_unfinished() {
         let dir = scratch("inflight");
         let mut r = known(&dir);
         r.put("e", pending(12)).unwrap();
@@ -1068,7 +1067,10 @@ mod tests {
         // has not been counted yet, so the counters are below the ledger.
         let body = audit_body(140, 45, &r, 11 * DAY);
         assert_eq!(body["outstanding"], 95);
-        assert_eq!(body["outstanding_unsplit"], 0);
+        // The ledger has not seen the transfer yet, so its split is still the
+        // 115 it knew; the unfinished request is what tells the two apart.
+        assert_eq!(body["outstanding_matured"], 115);
+        assert_eq!(body["outstanding_unmatured"], 0);
         assert_eq!(body["requests_unfinished"], 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

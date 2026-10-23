@@ -39,18 +39,11 @@
 //! is not issued. The redemption fee and the payout come out of burned notes and
 //! are not reissued, so they stay out of `issued`.
 //!
-//! **History before 0.5.0 is not in it.** The responses of earlier versions do
-//! not keep the amounts or the days of what they signed, so the ledger starts
-//! empty on an existing mint and counts from the upgrade on. [`Ledger::split`]
-//! gives the split of what it knows, and `/audit` reports the rest as
-//! `outstanding_unsplit`: what the counters say is outstanding beyond that. It
-//! shrinks as the old notes are redeemed, and is zero on a mint that has run
-//! 0.5.0 from its first note.
-//!
-//! A day is counted only while it is ahead (issued more than redeemed). A day
-//! that is behind means notes from before the ledger were redeemed or reissued
-//! under it; those come out of the unsplit part, so they are not subtracted from
-//! the known part of another day.
+//! **A day that is behind.** A day is counted only while it is ahead (issued
+//! more than redeemed). Every note the mint signs is counted under its day, so
+//! a day is behind only if notes were redeemed that the ledger never saw issued;
+//! such a day counts as nothing, so it is not subtracted from the known part of
+//! another day.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -277,7 +270,7 @@ mod tests {
     #[test]
     fn a_day_that_is_behind_counts_as_nothing_and_takes_nothing_from_another() {
         let mut l = Ledger::default();
-        // Notes from before the ledger were redeemed under day 10.
+        // Notes the ledger never saw issued were redeemed under day 10.
         l.apply(&moves(|m| {
             m.redeem(10, 60).issue(11, 40);
         }));

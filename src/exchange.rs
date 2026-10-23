@@ -330,14 +330,9 @@ fn held_by(request: &ExchangeRequest) -> (Vec<String>, Vec<String>) {
 }
 
 /// The exact rule. `paid` is the PSP notes' value in ESP units and `requested`
-/// is the outputs' total. This helper's smallest exchange is 1 PSP (the config's
-/// `exchange.min_psp` is applied by [`check_exact_min`]), and the two must be
+/// is the outputs' total. The smallest exchange, in ESP units, is `minimum`
+/// (the config's `exchange.min_psp`, 1 PSP by default), and the two must be
 /// equal: the mint keeps no excess and records no credit.
-pub fn check_exact(paid: u128, requested: u128) -> Result<(), Rejection> {
-    check_exact_min(paid, requested, u128::from(ESP_PER_PSP))
-}
-
-/// `check_exact`, with the smallest exchange (in ESP units) set by the config.
 pub fn check_exact_min(paid: u128, requested: u128, minimum: u128) -> Result<(), Rejection> {
     if requested < minimum {
         return Err(Rejection::BelowMinimum { requested, minimum });
@@ -417,50 +412,6 @@ fn check_amounts(
     Ok(())
 }
 
-#[cfg(test)]
-/// Test only: run an exchange with the default settings over one key set
-/// named by the master secret. `now_unix` sets the
-/// redeemable-after day for a new request.
-pub fn exchange(
-    logic: &MintLogic,
-    master: &MasterSecret,
-    psp: &dyn Psp,
-    responses: &mut Responses,
-    now_unix: u64,
-    request: &ExchangeRequest,
-) -> Result<ExchangeResponse, ExchangeError> {
-    exchange_with(
-        logic,
-        master,
-        psp,
-        responses,
-        now_unix,
-        request,
-        &ExchangeSettings::default(),
-    )
-}
-
-/// Test only (the server uses [`exchange_gens`]): run an exchange with the
-/// mint's settings over one key set. A new request takes its
-/// redeemable-after day from `settings.maturity_days` as it is now; the day is
-/// then written into the pending entry, so a retry after the setting has changed
-/// still issues the same notes.
-#[cfg(test)]
-pub fn exchange_with(
-    logic: &MintLogic,
-    master: &MasterSecret,
-    psp: &dyn Psp,
-    responses: &mut Responses,
-    now_unix: u64,
-    request: &ExchangeRequest,
-    settings: &ExchangeSettings,
-) -> Result<ExchangeResponse, ExchangeError> {
-    let id = crate::rotation::keyset_id(master);
-    exchange_signed(
-        logic, master, &id, psp, responses, now_unix, request, settings,
-    )
-}
-
 /// The phases of one exchange, and which of them may hold the mint's lock.
 ///
 /// An exchange talks to the PSP twice (a look at the notes, then the burn), and
@@ -490,8 +441,7 @@ pub fn exchange_with(
 /// to say (it is in-memory state); the server refuses the second while the
 /// first is in the middle of these phases (see `server::InFlight`).
 ///
-/// [`exchange_gens`] runs the five back to back, for tests and for callers with
-/// no lock to let go.
+/// In tests, [`exchange_gens`] runs the five back to back.
 ///
 /// What [`prepare_gens`] found.
 #[derive(Debug)]
@@ -600,9 +550,9 @@ pub fn finish_gens(
     finish(logic, master, &id, responses, request, plan)
 }
 
-/// All five phases, back to back (see the phases above). The server does not
-/// call this: it runs the phases itself, so that its lock is not held while the
-/// PSP is called.
+/// Test only: all five phases, back to back (see the phases above). The server
+/// runs the phases itself, so that its lock is not held while the PSP is called.
+#[cfg(test)]
 pub fn exchange_gens(
     gens: &crate::rotation::Gens,
     psp: &dyn Psp,
@@ -619,29 +569,6 @@ pub fn exchange_gens(
     reserve_gens(gens, responses, request, &plan)?;
     burn_phase(psp, request, &plan)?;
     finish_gens(gens, responses, request, &plan)
-}
-
-/// Test only: the five phases over one key set.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn exchange_signed(
-    logic: &MintLogic,
-    master: &MasterSecret,
-    keyset: &str,
-    psp: &dyn Psp,
-    responses: &mut Responses,
-    now_unix: u64,
-    request: &ExchangeRequest,
-    settings: &ExchangeSettings,
-) -> Result<ExchangeResponse, ExchangeError> {
-    let plan = match prepare(logic, responses, now_unix, request, settings)? {
-        Prepared::Done(response) => return Ok(response),
-        Prepared::Go(plan) => plan,
-    };
-    precheck(psp, &plan)?;
-    reserve(logic, responses, request, &plan)?;
-    burn_phase(psp, request, &plan)?;
-    finish(logic, master, keyset, responses, request, &plan)
 }
 
 /// Phase 1. Everything that can be checked without the PSP, cheapest first:
@@ -1222,7 +1149,7 @@ mod tests {
             service: service(),
             psp_input_keysets: vec!["00".repeat(8); inputs.len()],
             psp_inputs: inputs,
-            keyset: String::new(),
+            keyset: ks(),
             outputs,
         }
     }
@@ -1243,9 +1170,27 @@ mod tests {
         assert!(h(&base) != h(&a) && h(&base) != h(&b) && h(&a) != h(&b));
     }
 
+    thread_local! {
+        /// The keyset of this test's mint (set by `setup`), which requests name.
+        static KS: std::cell::RefCell<String> = std::cell::RefCell::new("00".repeat(8));
+    }
+
+    fn ks() -> String {
+        KS.with(|k| k.borrow().clone())
+    }
+
+    /// The smallest exchange a mint with the default settings takes, in ESP
+    /// units.
+    fn min_exchange() -> u128 {
+        u128::from(ExchangeSettings::default().min_psp) * u128::from(ESP_PER_PSP)
+    }
+
+    /// A rotating ESP mint (the rotor `serve` opens), its stored responses and a
+    /// fake PSP. `logic` is the rotor's current generation.
     struct Setup {
         dir: PathBuf,
         psp: FakePsp,
+        rotor: crate::rotation::Rotor,
         logic: MintLogic,
         master: MasterSecret,
         responses: Responses,
@@ -1254,11 +1199,14 @@ mod tests {
     fn setup(name: &str) -> Setup {
         let dir = scratch(name);
         let psp = FakePsp::new(&dir);
-        let (logic, master) = crate::mint::open(&dir.join("esp")).unwrap();
+        let (rotor, logic) = crate::rotation::Rotor::open_at(&dir.join("esp"), 1, 1, NOW).unwrap();
+        let master = rotor.current.master.clone();
+        KS.with(|k| *k.borrow_mut() = rotor.current.id.clone());
         let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
         Setup {
             dir,
             psp,
+            rotor,
             logic,
             master,
             responses,
@@ -1267,13 +1215,24 @@ mod tests {
 
     impl Setup {
         fn run(&mut self, request: &ExchangeRequest) -> Result<ExchangeResponse, ExchangeError> {
-            exchange(
-                &self.logic,
-                &self.master,
+            self.run_at(NOW, request, &ExchangeSettings::default())
+        }
+
+        /// The whole exchange, as the server runs it, at this time and under
+        /// these settings.
+        fn run_at(
+            &mut self,
+            now_unix: u64,
+            request: &ExchangeRequest,
+            settings: &ExchangeSettings,
+        ) -> Result<ExchangeResponse, ExchangeError> {
+            exchange_gens(
+                &self.rotor.gens(&self.logic),
                 &self.psp,
                 &mut self.responses,
-                NOW,
+                now_unix,
                 request,
+                settings,
             )
         }
 
@@ -1877,19 +1836,13 @@ mod tests {
         let (note, keypair) = s.psp.note(1);
         let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
         s.psp.fail_after_burn.set(true);
-        let _ = s.run(&request);
+        assert!(matches!(s.run(&request), Err(ExchangeError::Psp(_))));
         s.psp.fail_after_burn.set(false);
         // a month later
         let later = NOW + 30 * 86_400;
-        let response = exchange(
-            &s.logic,
-            &s.master,
-            &s.psp,
-            &mut s.responses,
-            later,
-            &request,
-        )
-        .unwrap();
+        let response = s
+            .run_at(later, &request, &ExchangeSettings::default())
+            .unwrap();
         assert_eq!(response.redeemable_after_day, NOW / 86_400 + 365);
         fs::remove_dir_all(&s.dir).unwrap();
     }
@@ -1900,7 +1853,7 @@ mod tests {
         let (note, keypair) = s.psp.note(1);
         let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP / 2, ONE_PSP / 2], None);
         s.psp.fail_after_burn.set(true);
-        let _ = s.run(&request);
+        assert!(matches!(s.run(&request), Err(ExchangeError::Psp(_))));
         // the first output was issued before the stop
         let terms = Terms::new_at(service(), NOW);
         let sk = s.master.key_for(request.outputs[0].amount, &terms);
@@ -1993,15 +1946,7 @@ mod tests {
         let size = fee::exchange_size(1, split(ONE_PSP).len());
         let fee_esp = fee::charge(size, rate);
         let run = |s: &mut Setup, request: &ExchangeRequest, settings: &ExchangeSettings| {
-            exchange_with(
-                &s.logic,
-                &s.master,
-                &s.psp,
-                &mut s.responses,
-                NOW,
-                request,
-                settings,
-            )
+            s.run_at(NOW, request, settings)
         };
         let (note, keypair) = s.psp.note(1);
         // The exact amount with no fee on top is refused under a fee, and says
@@ -2062,11 +2007,11 @@ mod tests {
     #[test]
     fn the_smallest_exchange_is_one_psp() {
         assert_eq!(
-            check_exact(u128::from(ONE_PSP), u128::from(ONE_PSP)),
+            check_exact_min(u128::from(ONE_PSP), u128::from(ONE_PSP), min_exchange()),
             Ok(())
         );
         assert_eq!(
-            check_exact(0, u128::from(ONE_PSP) - 1),
+            check_exact_min(0, u128::from(ONE_PSP) - 1, min_exchange()),
             Err(Rejection::BelowMinimum {
                 requested: u128::from(ONE_PSP) - 1,
                 minimum: u128::from(ONE_PSP),
@@ -2074,7 +2019,7 @@ mod tests {
         );
         // below the minimum is reported as such even when the PSP side is larger
         assert_eq!(
-            check_exact(u128::from(ONE_PSP), 1),
+            check_exact_min(u128::from(ONE_PSP), 1, min_exchange()),
             Err(Rejection::BelowMinimum {
                 requested: 1,
                 minimum: u128::from(ONE_PSP),
@@ -2098,14 +2043,28 @@ mod tests {
     fn exactness_is_checked_in_u128() {
         let one = u128::from(ONE_PSP);
         assert_eq!(
-            check_exact(units::psp_to_esp(u64::MAX), units::psp_to_esp(u64::MAX)),
+            check_exact_min(
+                units::psp_to_esp(u64::MAX),
+                units::psp_to_esp(u64::MAX),
+                min_exchange()
+            ),
             Ok(())
         );
-        assert!(check_exact(units::psp_to_esp(u64::MAX), units::psp_to_esp(u64::MAX) - 1).is_err());
-        let many = units::total(std::iter::repeat_n(u64::MAX, MAX_ITEMS));
-        assert_eq!(check_exact(many, many), Ok(()));
         assert_eq!(
-            check_exact(many + one, many),
+            check_exact_min(
+                units::psp_to_esp(u64::MAX),
+                units::psp_to_esp(u64::MAX) - 1,
+                min_exchange()
+            ),
+            Err(Rejection::NotExact {
+                paid: units::psp_to_esp(u64::MAX),
+                requested: units::psp_to_esp(u64::MAX) - 1
+            })
+        );
+        let many = units::total(std::iter::repeat_n(u64::MAX, MAX_ITEMS));
+        assert_eq!(check_exact_min(many, many, min_exchange()), Ok(()));
+        assert_eq!(
+            check_exact_min(many + one, many, min_exchange()),
             Err(Rejection::NotExact {
                 paid: many + one,
                 requested: many
@@ -2296,10 +2255,17 @@ mod tests {
             }
         );
         // the largest note and the largest sum of notes still compute
-        assert!(check_exact(units::psp_to_esp(u64::MAX), units::psp_to_esp(u64::MAX)).is_ok());
+        assert!(
+            check_exact_min(
+                units::psp_to_esp(u64::MAX),
+                units::psp_to_esp(u64::MAX),
+                min_exchange()
+            )
+            .is_ok()
+        );
         let many = units::total(std::iter::repeat_n(u64::MAX, MAX_ITEMS));
         assert_eq!(many, u128::from(u64::MAX) * MAX_ITEMS as u128);
-        assert!(check_exact(many, many).is_ok());
+        assert!(check_exact_min(many, many, min_exchange()).is_ok());
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
@@ -2340,8 +2306,6 @@ mod tests {
     #[test]
     fn ten_psp_a_dollar_exchange_for_exactly_ten_to_the_twelfth_esp() {
         const ONE_USD_ESP: u64 = 1_000_000_000_000;
-        assert_eq!(units::psp_to_esp(10), u128::from(ONE_USD_ESP));
-        assert_eq!(10 * ONE_PSP, ONE_USD_ESP);
         assert_eq!(ExchangeSettings::default().min_psp, 1);
         let mut s = setup("dollar");
         // 10 PSP for one ESP unit more is not exact, and nothing is burned
@@ -2439,9 +2403,15 @@ mod tests {
     fn a_refused_exchange_counts_nothing() {
         let mut s = setup("ledger-refused");
         let (note, keypair) = s.psp.note(1);
-        // off by one unit: not exact
+        // one unit under the smallest exchange
         let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP - 1], None);
-        assert!(s.run(&request).is_err());
+        assert_eq!(
+            rejection(s.run(&request)),
+            Rejection::BelowMinimum {
+                requested: u128::from(ONE_PSP) - 1,
+                minimum: u128::from(ONE_PSP),
+            }
+        );
         assert_eq!(s.responses.ledger().days().count(), 0);
         fs::remove_dir_all(&s.dir).unwrap();
     }

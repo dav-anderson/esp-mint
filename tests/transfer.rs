@@ -10,11 +10,10 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Router;
 use esp_mint::exchange::{Burn, Psp};
-use esp_mint::responses::Responses;
 use esp_mint::server::{self, EspState};
 use esp_mint::terms::Terms;
 use esp_mint::transfer::{self, TransferRequest, TransferResponse};
@@ -103,22 +102,19 @@ struct Esp {
     air: common::Air,
 }
 
+/// The mint `serve` builds (`EspState::open`) on `dir`, on the system clock and
+/// with the default config, with its AIR listener and its HTTP router.
 fn start_esp(rt: &Runtime, dir: &Path) -> (Esp, Arc<EspState>) {
-    let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
-    KS.with(|k| *k.borrow_mut() = esp_mint::rotation::keyset_id(&master));
-    let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
-    let state = Arc::new(EspState {
-        logic: Mutex::new(logic),
-        master,
-        psp: Box::new(NoPsp),
-        responses: Mutex::new(responses),
-        queue_path: dir.join("esp").join("queue.json"),
-        queue_lock: Mutex::new(()),
-        config: esp_mint::config::Handle::default(),
-        rotor: None,
-        rollovers: None,
-        in_flight: Default::default(),
-    });
+    let state = Arc::new(
+        EspState::open(
+            &dir.join("esp"),
+            Box::new(NoPsp),
+            esp_mint::config::Config::default(),
+            0,
+        )
+        .unwrap(),
+    );
+    KS.with(|k| *k.borrow_mut() = state.rotor.lock().unwrap().current.id.clone());
     let base = serve(rt, server::router(Arc::clone(&state)));
     let air = common::Air::start(&state, &dir.join("air"));
     (Esp { base, air }, state)
@@ -307,11 +303,12 @@ fn a_transfer_over_air_swaps_the_notes_and_the_supply_does_not_change() {
 }
 
 #[test]
-fn an_inexact_transfer_is_a_400_and_the_notes_survive() {
+fn every_transfer_refusal_is_a_400_and_burns_nothing() {
     let rt = Runtime::new().unwrap();
-    let dir = scratch("inexact");
+    let dir = scratch("refusals");
     let (esp, state) = start_esp(&rt, &dir);
 
+    // The outputs are not exactly the inputs.
     let (a, ka) = esp_note(&state, ONE_PSP, service());
     let (req, _) = request(&[(a, &ka, ONE_PSP)], &[ONE_PSP + 1], &service_keypair());
     let (code, body) = post_json(&esp, "/transfer", &req);
@@ -321,19 +318,11 @@ fn an_inexact_transfer_is_a_400_and_the_notes_survive() {
     let audit = get_json(&esp, "/audit").1;
     assert_eq!(audit["issued"], ONE_PSP);
     assert_eq!(audit["redeemed"], 0);
-    rt.shutdown_background();
-}
 
-#[test]
-fn an_amount_that_is_not_a_power_of_two_is_a_400_and_the_notes_survive() {
-    let rt = Runtime::new().unwrap();
-    let dir = scratch("denomination");
-    let (esp, state) = start_esp(&rt, &dir);
-
-    let (a, ka) = esp_note(&state, 2 * ONE_PSP, service());
-    // an output that is not a power of two, though the total is exact
+    // An output that is not a power of two, though the total is exact.
+    let (b, kb) = esp_note(&state, 2 * ONE_PSP, service());
     let (req, _) = request_exact(
-        &[(a, &ka, 2 * ONE_PSP)],
+        &[(b, &kb, 2 * ONE_PSP)],
         &[ONE_PSP + 1, ONE_PSP - 1],
         &service_keypair(),
     );
@@ -344,12 +333,12 @@ fn an_amount_that_is_not_a_power_of_two_is_a_400_and_the_notes_survive() {
         body["error"],
         "output 0: ESP amounts are powers of two. Nothing was burned"
     );
-    assert!(!is_spent(&state, &a));
+    assert!(!is_spent(&state, &b));
 
-    // an incoming note of an odd size is refused the same way
+    // An incoming note of an odd size is refused the same way.
     let odd = ONE_PSP + 5;
-    let (b, kb) = esp_note(&state, odd, service());
-    let (req, _) = request(&[(b, &kb, odd)], &[odd], &service_keypair());
+    let (c, kc) = esp_note(&state, odd, service());
+    let (req, _) = request(&[(c, &kc, odd)], &[odd], &service_keypair());
     let (code, body) = post_json(&esp, "/transfer", &req);
     assert_eq!(code, 400, "{body}");
     assert_eq!(body["code"], "bad_denomination");
@@ -357,31 +346,14 @@ fn an_amount_that_is_not_a_power_of_two_is_a_400_and_the_notes_survive() {
         body["error"],
         "note 0: ESP amounts are powers of two. Nothing was burned"
     );
-    assert!(!is_spent(&state, &b));
+    assert!(!is_spent(&state, &c));
     let audit = get_json(&esp, "/audit").1;
     assert_eq!(audit["redeemed"], 0);
 
-    // the same total split into powers of two goes through
-    let (req, _) = request(
-        &[(a, &ka, 2 * ONE_PSP)],
-        &[ONE_PSP + 1, ONE_PSP - 1],
-        &service_keypair(),
-    );
-    let (code, body) = post_json(&esp, "/transfer", &req);
-    assert_eq!(code, 200, "{body}");
-    assert!(is_spent(&state, &a));
-    rt.shutdown_background();
-}
-
-#[test]
-fn a_request_the_service_did_not_sign_is_a_400() {
-    let rt = Runtime::new().unwrap();
-    let dir = scratch("unsigned");
-    let (esp, state) = start_esp(&rt, &dir);
-
-    let (a, ka) = esp_note(&state, ONE_PSP, service());
-    // the app holds the note's spend key but not the service's key
-    let (req, _) = request(&[(a, &ka, ONE_PSP)], &[ONE_PSP], &other_keypair());
+    // A request the service did not sign: the app holds the note's spend key
+    // but not the service's key.
+    let (d, kd) = esp_note(&state, ONE_PSP, service());
+    let (req, _) = request(&[(d, &kd, ONE_PSP)], &[ONE_PSP], &other_keypair());
     let (code, body) = post_json(&esp, "/transfer", &req);
     assert_eq!(code, 400, "{body}");
     assert!(
@@ -390,30 +362,41 @@ fn a_request_the_service_did_not_sign_is_a_400() {
             .unwrap()
             .contains("service's signature")
     );
-    assert!(!is_spent(&state, &a));
-    rt.shutdown_background();
-}
+    assert!(!is_spent(&state, &d));
 
-#[test]
-fn a_note_cannot_be_transferred_twice() {
-    let rt = Runtime::new().unwrap();
-    let dir = scratch("twice");
-    let (esp, state) = start_esp(&rt, &dir);
+    // The same total as the refused one, split into powers of two, goes through.
+    let (req, _) = request(
+        &[(b, &kb, 2 * ONE_PSP)],
+        &[ONE_PSP + 1, ONE_PSP - 1],
+        &service_keypair(),
+    );
+    let (code, body) = post_json(&esp, "/transfer", &req);
+    assert_eq!(code, 200, "{body}");
+    assert!(is_spent(&state, &b));
 
-    let (a, ka) = esp_note(&state, ONE_PSP, service());
-    let (first, _) = request(&[(a, &ka, ONE_PSP)], &[ONE_PSP], &service_keypair());
+    // A note cannot be transferred twice.
+    let before = get_json(&esp, "/audit").1;
+    let (e, ke) = esp_note(&state, ONE_PSP, service());
+    let (first, _) = request(&[(e, &ke, ONE_PSP)], &[ONE_PSP], &service_keypair());
     assert_eq!(post_json(&esp, "/transfer", &first).0, 200);
-    let (second, _) = request(&[(a, &ka, ONE_PSP)], &[ONE_PSP], &service_keypair());
+    let (second, _) = request(&[(e, &ke, ONE_PSP)], &[ONE_PSP], &service_keypair());
     let (code, body) = post_json(&esp, "/transfer", &second);
     assert_eq!(code, 400, "{body}");
     assert!(body["error"].as_str().unwrap().contains("already spent"));
     // the body names the spent input, for the wallet
     assert_eq!(body["code"], "note_spent_elsewhere");
     assert_eq!(body["spent"], serde_json::json!([0]));
-    // only the first transfer changed the totals
-    let audit = get_json(&esp, "/audit").1;
-    assert_eq!(audit["issued"], 2 * ONE_PSP);
-    assert_eq!(audit["redeemed"], ONE_PSP);
+    // only the first transfer changed the totals: the note came in (ONE_PSP
+    // issued), was burned (ONE_PSP redeemed) and came back (ONE_PSP issued)
+    let after = get_json(&esp, "/audit").1;
+    assert_eq!(
+        after["issued"].as_u64().unwrap(),
+        before["issued"].as_u64().unwrap() + 2 * ONE_PSP
+    );
+    assert_eq!(
+        after["redeemed"].as_u64().unwrap(),
+        before["redeemed"].as_u64().unwrap() + ONE_PSP
+    );
     rt.shutdown_background();
 }
 
@@ -449,6 +432,49 @@ fn one_spent_input_among_several_leaves_the_others_unburned() {
     let audit = get_json(&esp, "/audit").1;
     assert_eq!(audit["issued"], 4 * ONE_PSP);
     assert_eq!(audit["redeemed"], ONE_PSP);
+    rt.shutdown_background();
+}
+
+#[test]
+fn two_spent_inputs_not_at_the_start_are_both_named() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("two-spent");
+    let (esp, state) = start_esp(&rt, &dir);
+
+    let (a, ka) = esp_note(&state, ONE_PSP, service());
+    let (b, kb) = esp_note(&state, ONE_PSP, service());
+    let (c, kc) = esp_note(&state, ONE_PSP, service());
+    let (d, kd) = esp_note(&state, ONE_PSP, service());
+    // `b` and `c` are transferred first, each alone.
+    for (n, k) in [(b, &kb), (c, &kc)] {
+        let (one, _) = request(&[(n, k, ONE_PSP)], &[ONE_PSP], &service_keypair());
+        assert_eq!(post_json(&esp, "/transfer", &one).0, 200);
+    }
+    // Four notes, the second and the third already spent: refused whole, and the
+    // refusal names both, so the wallet drops them in one go.
+    let (all, _) = request(
+        &[
+            (a, &ka, ONE_PSP),
+            (b, &kb, ONE_PSP),
+            (c, &kc, ONE_PSP),
+            (d, &kd, ONE_PSP),
+        ],
+        &[4 * ONE_PSP],
+        &service_keypair(),
+    );
+    let (code, body) = post_json(&esp, "/transfer", &all);
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(body["code"], "note_spent_elsewhere", "{body}");
+    assert_eq!(body["spent"], serde_json::json!([1, 2]), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("notes 1, 2 are already spent"),
+        "{body}"
+    );
+    assert!(!is_spent(&state, &a));
+    assert!(!is_spent(&state, &d));
     rt.shutdown_background();
 }
 
@@ -498,20 +524,22 @@ fn a_transfer_moves_nothing_between_the_parts_of_the_audit_split() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("split");
     let (esp, state) = start_esp(&rt, &dir);
-    // Notes minted straight from the mint are not in the ledger (as the notes of
-    // a mint from before 0.5.0 are not), so all of it is outstanding and unsplit.
+    // The note is signed straight from the mint here; the ledger is told, as an
+    // exchange would have told it, so the parts of the audit add up.
     let (a, ka) = esp_note(&state, 2 * ONE_PSP, service());
+    common::record_issued(&state, day(), 2 * ONE_PSP);
+    // (outstanding, matured + unmatured, unfinished requests): whether the day
+    // has come depends on the date the test runs, so only the sum is fixed.
     let split = |audit: &serde_json::Value| {
         (
             audit["outstanding"].as_u64().unwrap(),
-            audit["outstanding_matured"].as_u64().unwrap(),
-            audit["outstanding_unmatured"].as_u64().unwrap(),
-            audit["outstanding_unsplit"].as_u64().unwrap(),
+            audit["outstanding_matured"].as_u64().unwrap()
+                + audit["outstanding_unmatured"].as_u64().unwrap(),
             audit["requests_unfinished"].as_u64().unwrap(),
         )
     };
     let before = get_json(&esp, "/audit").1;
-    assert_eq!(split(&before), (2 * ONE_PSP, 0, 0, 2 * ONE_PSP, 0));
+    assert_eq!(split(&before), (2 * ONE_PSP, 2 * ONE_PSP, 0));
 
     let (req, _) = request(
         &[(a, &ka, 2 * ONE_PSP)],
@@ -523,14 +551,23 @@ fn a_transfer_moves_nothing_between_the_parts_of_the_audit_split() {
 
     // The transfer is net zero for its day, so the split does not move, and the
     // same request again changes nothing.
+    let after = get_json(&esp, "/audit").1;
+    assert_eq!(split(&after), (2 * ONE_PSP, 2 * ONE_PSP, 0));
     assert_eq!(
-        split(&get_json(&esp, "/audit").1),
-        (2 * ONE_PSP, 0, 0, 2 * ONE_PSP, 0)
+        (
+            after["outstanding_matured"].as_u64().unwrap(),
+            after["outstanding_unmatured"].as_u64().unwrap()
+        ),
+        (
+            before["outstanding_matured"].as_u64().unwrap(),
+            before["outstanding_unmatured"].as_u64().unwrap()
+        ),
+        "the parts did not move"
     );
     assert_eq!(post_json(&esp, "/transfer", &req), (200, body));
     assert_eq!(
         split(&get_json(&esp, "/audit").1),
-        (2 * ONE_PSP, 0, 0, 2 * ONE_PSP, 0)
+        (2 * ONE_PSP, 2 * ONE_PSP, 0)
     );
     rt.shutdown_background();
 }

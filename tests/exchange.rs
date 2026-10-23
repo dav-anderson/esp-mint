@@ -177,21 +177,17 @@ fn start_esp_with(
     psp_url: &str,
     config: esp_mint::config::Config,
 ) -> (Esp, Arc<EspState>) {
-    let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
-    KS.with(|k| *k.borrow_mut() = esp_mint::rotation::keyset_id(&master));
-    let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
-    let state = Arc::new(EspState {
-        logic: Mutex::new(logic),
-        master,
-        psp: Box::new(HttpPsp::new(psp_url).unwrap()),
-        responses: Mutex::new(responses),
-        queue_path: dir.join("esp").join("queue.json"),
-        queue_lock: Mutex::new(()),
-        config: esp_mint::config::Handle::new(config),
-        rotor: None,
-        rollovers: None,
-        in_flight: Default::default(),
-    });
+    // The state `serve` builds, on the system clock, with this PSP and config.
+    let state = Arc::new(
+        EspState::open(
+            &dir.join("esp"),
+            Box::new(HttpPsp::new(psp_url).unwrap()),
+            config,
+            0,
+        )
+        .unwrap(),
+    );
+    KS.with(|k| *k.borrow_mut() = state.rotor.lock().unwrap().current.id.clone());
     let base = serve(rt, server::router(Arc::clone(&state)));
     let air = common::Air::start(&state, &dir.join("air"));
     (Esp { base, air }, state)
@@ -460,7 +456,7 @@ fn a_note_burned_elsewhere_during_a_pending_exchange_is_a_400_and_signs_nothing(
 }
 
 #[test]
-fn an_output_that_is_not_a_power_of_two_is_a_400_and_the_psp_note_survives() {
+fn a_badly_formed_or_underpaid_exchange_is_a_400_and_the_psp_note_survives() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("denomination");
     let (psp_url, psp, _memos) = start_psp(&rt, &dir);
@@ -479,29 +475,21 @@ fn an_output_that_is_not_a_power_of_two_is_a_400_and_the_psp_note_survives() {
     assert!(!psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
     assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
 
-    // the same total split into powers of two goes through
+    // outputs worth more than the PSP note
+    let (under, under_key) = psp_note(&psp, 1);
+    let (req, _) = request(under, &under_key, 1, &[ONE_PSP + 1]);
+    let (code, body) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 400);
+    assert!(body["error"].as_str().unwrap().contains("worth"));
+    assert!(!psp.logic.lock().unwrap().is_spent(under.nonce).unwrap());
+    assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
+
+    // the same total as the first, split into powers of two, goes through
     let (req, _) = request(note, &keypair, 1, &[ONE_PSP]);
     assert!(req.outputs.len() > 1);
     let (code, body) = post_json(&esp, "/exchange", &req);
     assert_eq!(code, 200, "{body}");
     assert_eq!(get_json(&esp, "/audit").1["issued"], ONE_PSP);
-    rt.shutdown_background();
-}
-
-#[test]
-fn an_underpaid_request_is_a_400_and_the_psp_note_survives() {
-    let rt = Runtime::new().unwrap();
-    let dir = scratch("under");
-    let (psp_url, psp, _memos) = start_psp(&rt, &dir);
-    let esp = start_esp(&rt, &dir, &psp_url);
-
-    let (note, keypair) = psp_note(&psp, 1);
-    let (req, _) = request(note, &keypair, 1, &[ONE_PSP + 1]);
-    let (code, body) = post_json(&esp, "/exchange", &req);
-    assert_eq!(code, 400);
-    assert!(body["error"].as_str().unwrap().contains("worth"));
-    assert!(!psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
     rt.shutdown_background();
 }
 
@@ -562,21 +550,19 @@ fn nothing_but_audit_and_health_is_served_over_http() {
     rt.shutdown_background();
 }
 
-/// The split on `/audit`, as (matured, unmatured, unsplit, unfinished).
-fn split_of(esp: &Esp) -> (u64, u64, u64, u64) {
+/// The split on `/audit`, as (matured, unmatured, unfinished).
+fn split_of(esp: &Esp) -> (u64, u64, u64) {
     let (code, audit) = get_json(esp, "/audit");
     assert_eq!(code, 200, "{audit}");
     assert_eq!(
         audit["outstanding_matured"].as_u64().unwrap()
-            + audit["outstanding_unmatured"].as_u64().unwrap()
-            + audit["outstanding_unsplit"].as_u64().unwrap(),
+            + audit["outstanding_unmatured"].as_u64().unwrap(),
         audit["outstanding"].as_u64().unwrap(),
         "the parts add up: {audit}"
     );
     (
         audit["outstanding_matured"].as_u64().unwrap(),
         audit["outstanding_unmatured"].as_u64().unwrap(),
-        audit["outstanding_unsplit"].as_u64().unwrap(),
         audit["requests_unfinished"].as_u64().unwrap(),
     )
 }
@@ -594,12 +580,12 @@ fn the_audit_splits_the_outstanding_esp_by_maturity_and_keeps_the_split_across_a
         ..Default::default()
     };
     let (esp, state) = start_esp_with(&rt1, &dir, &psp_url, config);
-    assert_eq!(split_of(&esp), (0, 0, 0, 0));
+    assert_eq!(split_of(&esp), (0, 0, 0));
     let (note, keypair) = psp_note(&psp, 2);
     let (first, _) = request(note, &keypair, 2, &[2 * ONE_PSP]);
     let (code, first_body) = post_json(&esp, "/exchange", &first);
     assert_eq!(code, 200, "{first_body}");
-    assert_eq!(split_of(&esp), (2 * ONE_PSP, 0, 0, 0));
+    assert_eq!(split_of(&esp), (2 * ONE_PSP, 0, 0));
     drop(esp);
     drop(state);
     drop(rt1);
@@ -608,47 +594,17 @@ fn the_audit_splits_the_outstanding_esp_by_maturity_and_keeps_the_split_across_a
     // matured, and what is issued now is not.
     let rt2 = Runtime::new().unwrap();
     let (esp, state) = start_esp_with(&rt2, &dir, &psp_url, esp_mint::config::Config::default());
-    assert_eq!(split_of(&esp), (2 * ONE_PSP, 0, 0, 0));
+    assert_eq!(split_of(&esp), (2 * ONE_PSP, 0, 0));
     let (note, keypair) = psp_note(&psp, 1);
     let (second, _) = request(note, &keypair, 1, &[ONE_PSP]);
     let (code, body) = post_json(&esp, "/exchange", &second);
     assert_eq!(code, 200, "{body}");
-    assert_eq!(split_of(&esp), (2 * ONE_PSP, ONE_PSP, 0, 0));
+    assert_eq!(split_of(&esp), (2 * ONE_PSP, ONE_PSP, 0));
     // asking again counts nothing twice
     assert_eq!(post_json(&esp, "/exchange", &second), (200, body));
     assert_eq!(post_json(&esp, "/exchange", &first), (200, first_body));
-    assert_eq!(split_of(&esp), (2 * ONE_PSP, ONE_PSP, 0, 0));
+    assert_eq!(split_of(&esp), (2 * ONE_PSP, ONE_PSP, 0));
 
-    // ESP the mint signed without the ledger (as before 0.5.0) is outstanding
-    // and not split.
-    {
-        let terms = Terms {
-            service: service(),
-            redeemable_after_day: 1,
-        };
-        let amount = Amount::from_units(1 << 36);
-        let sk = state.master.key_for(amount, &terms);
-        let keypair = Keypair::new(SECP256K1, &mut OsRng);
-        let (blind, _) =
-            bdhke::blind_message(&Nonce(keypair.public_key()).as_hash_preimage(), None);
-        state
-            .logic
-            .lock()
-            .unwrap()
-            .issue_with_key(
-                &sk,
-                &MintOutput {
-                    amount,
-                    blind_nonce: BlindNonce(blind),
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            split_of(&esp),
-            (2 * ONE_PSP, ONE_PSP, amount.units, 0),
-            "the new notes are not in the ledger, so they are unsplit"
-        );
-    }
     drop(esp);
     drop(state);
     drop(rt2);

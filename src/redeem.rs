@@ -73,7 +73,6 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
-use mint_core::MintLogic;
 #[cfg(test)]
 use mint_types::MintOutput;
 use mint_types::{MintInput, MintOutputError};
@@ -82,7 +81,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sp_wire::ServiceDid;
 
-use crate::keys::MasterSecret;
 use crate::ledger::Movements;
 use crate::queue::{self, Queue, QueueError, SignedOutput, Status, dec};
 use crate::responses::{Entry, Responses};
@@ -687,52 +685,13 @@ fn respond(
     })
 }
 
-/// Run a redemption at this fee rate and the default limits. `now_unix` is the
-/// mint's clock, which decides maturity and stamps the queue entry.
-pub fn redeem(
-    logic: &MintLogic,
-    master: &MasterSecret,
-    responses: &mut Responses,
-    queue_path: &Path,
-    request: &RedeemRequest,
-    fee_per_byte: u128,
-    now_unix: u64,
-) -> Result<RedeemResponse, RedeemError> {
-    let settings = RedeemSettings {
-        fee_per_byte,
-        ..RedeemSettings::default()
-    };
-    redeem_with(
-        logic, master, responses, queue_path, request, &settings, now_unix,
-    )
-}
-
-/// Run a redemption with the mint's settings. The fee rate in `settings` is the
-/// rate in force now: it is charged to a new request and written into its
-/// decision, and a retry uses the stored decision, so the rate never changes for
-/// a request once it has been accepted.
-pub fn redeem_with(
-    logic: &MintLogic,
-    master: &MasterSecret,
-    responses: &mut Responses,
-    queue_path: &Path,
-    request: &RedeemRequest,
-    settings: &RedeemSettings,
-    now_unix: u64,
-) -> Result<RedeemResponse, RedeemError> {
-    redeem_gens(
-        &Gens::only(logic, master),
-        responses,
-        queue_path,
-        request,
-        settings,
-        now_unix,
-    )
-}
-
-/// [`redeem_with`] over both live key sets: each note is decided and burned in
-/// the set that signed it, and the refund and decline outputs are signed with
-/// the current set.
+/// Run a redemption with the mint's settings, over both live key sets: each
+/// note is decided and burned in the set that signed it, and the refund and
+/// decline outputs are signed with the current set. `now_unix` is the mint's
+/// clock, which decides maturity and stamps the queue entry. The fee rate in
+/// `settings` is the rate in force now: it is charged to a new request and
+/// written into its decision, and a retry uses the stored decision, so the
+/// rate never changes for a request once it has been accepted.
 pub fn redeem_gens(
     gens: &Gens,
     responses: &mut Responses,
@@ -991,62 +950,19 @@ impl Error for DeclineError {}
 
 /// Decline the payout of an open queue entry: sign its stored decline outputs,
 /// which reissue the accepted notes minus the fee, each under its original
-/// service and day, then mark the entry declined with the reason and the
-/// signatures. The service reads them by asking about its redemption again.
+/// service and day, then mark the entry declined with the reason (at most
+/// `max_reason_bytes`) and the signatures. The service reads them by asking
+/// about its redemption again.
 ///
 /// The fee is not returned. If this stops after signing and before the entry is
 /// marked, run it again: signing is deterministic, so the same signatures come
 /// out. Do not mark the entry paid in between.
-pub fn decline(
-    logic: &MintLogic,
-    master: &MasterSecret,
-    responses: &mut Responses,
-    queue_path: &Path,
-    entry_id: &str,
-    reason: &str,
-    now_unix: u64,
-) -> Result<Declined, DeclineError> {
-    decline_with(
-        logic,
-        master,
-        responses,
-        queue_path,
-        entry_id,
-        reason,
-        DEFAULT_MAX_REASON_BYTES,
-        now_unix,
-    )
-}
-
-/// `decline`, with the longest reason set by the config.
-#[allow(clippy::too_many_arguments)]
-pub fn decline_with(
-    logic: &MintLogic,
-    master: &MasterSecret,
-    responses: &mut Responses,
-    queue_path: &Path,
-    entry_id: &str,
-    reason: &str,
-    max_reason_bytes: usize,
-    now_unix: u64,
-) -> Result<Declined, DeclineError> {
-    decline_gens(
-        &Gens::only(logic, master),
-        responses,
-        queue_path,
-        entry_id,
-        reason,
-        max_reason_bytes,
-        now_unix,
-    )
-}
-
-/// [`decline_with`] over the live key sets. The queue rule: the decline
-/// outputs are signed with the keyset the redemption asked for if it is still
-/// current or previous; if it retired before the decline, with the current
-/// keyset. Either way each signature names the keyset that made it, so the
-/// service unblinds with the right keys. Nothing is lost: blinding does not
-/// depend on the key.
+///
+/// The queue rule: the decline outputs are signed with the keyset the
+/// redemption asked for if it is still current or previous; if it retired
+/// before the decline, with the current keyset. Either way each signature names
+/// the keyset that made it, so the service unblinds with the right keys.
+/// Nothing is lost: blinding does not depend on the key.
 pub fn decline_gens(
     gens: &Gens,
     responses: &mut Responses,
@@ -1158,11 +1074,13 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use mint_core::MintLogic;
     use mint_types::{Amount, BlindNonce, Nonce, Note};
     use rand::rngs::OsRng;
     use secp256k1::schnorr::Signature;
     use secp256k1::{Keypair, SecretKey};
 
+    use crate::keys::MasterSecret;
     use crate::queue::Payment;
     use crate::responses::TransferPending;
 
@@ -1233,6 +1151,7 @@ mod tests {
 
     struct Setup {
         dir: PathBuf,
+        rotor: crate::rotation::Rotor,
         logic: MintLogic,
         master: MasterSecret,
         responses: Responses,
@@ -1250,12 +1169,14 @@ mod tests {
 
     fn setup(name: &str) -> Setup {
         let dir = scratch(name);
-        let (logic, master) = crate::mint::open(&dir.join("esp")).unwrap();
-        KS.with(|k| *k.borrow_mut() = crate::rotation::keyset_id(&master));
+        let (rotor, logic) = crate::rotation::Rotor::open_at(&dir.join("esp"), 1, 1, NOW).unwrap();
+        let master = rotor.current.master.clone();
+        KS.with(|k| *k.borrow_mut() = rotor.current.id.clone());
         let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
         let queue_path = dir.join("esp").join("queue.json");
         Setup {
             dir,
+            rotor,
             logic,
             master,
             responses,
@@ -1370,14 +1291,51 @@ mod tests {
         }
 
         fn run(&mut self, request: &RedeemRequest) -> Result<RedeemResponse, RedeemError> {
-            redeem(
-                &self.logic,
-                &self.master,
+            self.run_with(request, &at_rate(RATE))
+        }
+
+        /// The redemption, as the server runs it, under these settings.
+        fn run_with(
+            &mut self,
+            request: &RedeemRequest,
+            settings: &RedeemSettings,
+        ) -> Result<RedeemResponse, RedeemError> {
+            redeem_gens(
+                &self.rotor.gens(&self.logic),
                 &mut self.responses,
                 &self.queue_path,
                 request,
-                RATE,
+                settings,
                 NOW,
+            )
+        }
+
+        /// Decline an entry, as the admin route does, with the default longest
+        /// reason.
+        fn decline(
+            &mut self,
+            entry_id: &str,
+            reason: &str,
+            now_unix: u64,
+        ) -> Result<Declined, DeclineError> {
+            self.decline_with(entry_id, reason, DEFAULT_MAX_REASON_BYTES, now_unix)
+        }
+
+        fn decline_with(
+            &mut self,
+            entry_id: &str,
+            reason: &str,
+            max_reason_bytes: usize,
+            now_unix: u64,
+        ) -> Result<Declined, DeclineError> {
+            decline_gens(
+                &self.rotor.gens(&self.logic),
+                &mut self.responses,
+                &self.queue_path,
+                entry_id,
+                reason,
+                max_reason_bytes,
+                now_unix,
             )
         }
 
@@ -1427,7 +1385,7 @@ mod tests {
         /// the plan.
         fn pend(&mut self, request: &RedeemRequest) -> Plan {
             let plan = decide(
-                &Gens::only(&self.logic, &self.master),
+                &self.rotor.gens(&self.logic),
                 request,
                 request.digest(),
                 &HashSet::new(),
@@ -2563,98 +2521,7 @@ mod tests {
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
-    // ---- digest and hash ----
-
-    #[test]
-    fn the_digest_covers_the_terms_the_memo_and_both_lists() {
-        let s = setup("digest");
-        let a = s.held(4 * ONE, service(), PAST);
-        let (request, _, _) = build_with(
-            &[&a],
-            &[(ONE, service(), PAST)],
-            &[(ONE, service(), PAST)],
-            MEMO,
-            &service_keypair(),
-            None,
-        );
-        let base = request.digest();
-
-        let mut retagged = request.clone();
-        retagged.inputs[0].redeemable_after_day += 1;
-        assert_ne!(retagged.digest(), base);
-        let mut other_service = request.clone();
-        other_service.inputs[0].service = other();
-        assert_ne!(other_service.digest(), base);
-        let mut memo = request.clone();
-        memo.memo.push('x');
-        assert_ne!(memo.digest(), base);
-        let mut other_signer = request.clone();
-        other_signer.service = other();
-        assert_ne!(other_signer.digest(), base);
-        let mut swapped = request.clone();
-        std::mem::swap(&mut swapped.decline_outputs, &mut swapped.refund_outputs);
-        assert_ne!(swapped.digest(), base);
-        let mut output_terms = request.clone();
-        output_terms.decline_outputs[0].redeemable_after_day += 1;
-        assert_ne!(output_terms.digest(), base);
-        let mut output_amount = request.clone();
-        output_amount.decline_outputs[0].output.amount = Amount::from_units(ONE + 1);
-        assert_ne!(output_amount.digest(), base);
-        // the spend signatures are not part of the digest, but are part of the hash
-        let mut resigned = request.clone();
-        resigned.inputs[0].input.spend_signature = dummy_signature();
-        assert_eq!(resigned.digest(), base);
-        assert_ne!(request_hash(&resigned), request_hash(&request));
-        fs::remove_dir_all(&s.dir).unwrap();
-    }
-
-    #[test]
-    fn the_size_is_exact_and_a_request_survives_its_encoding() {
-        let s = setup("encoding");
-        let a = s.held(4 * ONE, service(), PAST);
-        let b = s.held(2 * ONE, other(), PAST2);
-        let request = build(
-            &[&a, &b],
-            &[(ONE, service(), PAST)],
-            &[(ONE, other(), PAST2), (1, service(), PAST)],
-        );
-        let bytes = request.encode();
-        // 120 + 187 * 2 + the memo + 82 * 3
-        assert_eq!(bytes.len(), 120 + 374 + MEMO.len() + 246);
-        assert_eq!(request.encoded_len(), bytes.len() as u64);
-        assert_eq!(encoded_len(2, MEMO.len(), 1, 2), bytes.len() as u64);
-        assert_eq!(bytes[0], FORMAT_VERSION);
-
-        let back = decode(&bytes).unwrap();
-        assert_eq!(back.digest(), request.digest());
-        assert_eq!(request_hash(&back), request_hash(&request));
-        assert_eq!(back.encode(), bytes);
-        assert_eq!(back.memo, MEMO);
-        assert_eq!(back.inputs, request.inputs);
-        assert_eq!(back.decline_outputs, request.decline_outputs);
-        assert_eq!(back.refund_outputs, request.refund_outputs);
-        fs::remove_dir_all(&s.dir).unwrap();
-    }
-
-    #[test]
-    fn one_input_and_one_output_have_the_sizes_the_readme_gives() {
-        assert_eq!(INPUT_BYTES, 187);
-        assert_eq!(OUTPUT_BYTES, 82);
-        assert_eq!(FIXED_BYTES, 120);
-        // an empty memo is not allowed, but the arithmetic still holds
-        assert_eq!(encoded_len(0, 0, 0, 0), 120);
-        assert_eq!(encoded_len(1, 0, 0, 0), 307);
-        assert_eq!(encoded_len(0, 0, 1, 0), 202);
-        // 220,000 notes with one output each: about 59 MB, so about four requests
-        assert_eq!(
-            encoded_len(220_000, 40, 220_000, 0),
-            120 + 220_000 * 269 + 40
-        );
-        assert!(encoded_len(220_000, 40, 220_000, 0) > DEFAULT_MAX_REQUEST_BYTES as u64);
-        // and the ceiling is about 84,000 notes with none coming back
-        let most = (DEFAULT_MAX_REQUEST_BYTES as u64 - FIXED_BYTES - 40) / INPUT_BYTES;
-        assert_eq!(most, 84109);
-    }
+    // ---- size and limits ----
 
     #[test]
     fn a_request_at_the_default_ceiling_fits_one_air_message() {
@@ -2715,78 +2582,6 @@ mod tests {
         );
         fs::remove_dir_all(&s.dir).unwrap();
         fs::remove_dir_all(&other_setup.dir).unwrap();
-    }
-
-    #[test]
-    fn a_body_that_is_not_exactly_one_request_does_not_decode() {
-        let s = setup("decode");
-        let a = s.held(4 * ONE, service(), PAST);
-        let request = build(&[&a], &[(ONE, service(), PAST)], &[]);
-        let bytes = request.encode();
-        assert!(decode(&bytes).is_ok());
-
-        // every shorter body ends inside a field
-        for len in 0..bytes.len() {
-            assert!(decode(&bytes[..len]).is_err(), "decoded {len} bytes");
-        }
-        // bytes after the end
-        let mut longer = bytes.clone();
-        longer.push(0);
-        assert!(decode(&longer).unwrap_err().contains("after its end"));
-        // another version
-        let mut v = bytes.clone();
-        v[0] = 4;
-        assert!(decode(&v).unwrap_err().contains("version"));
-        // version 1, which names no keysets
-        v[0] = 1;
-        assert!(decode(&v).unwrap_err().contains("no keysets"));
-        // version 2, which names each service by its x-only key
-        v[0] = 2;
-        assert!(decode(&v).unwrap_err().contains("x-only"));
-        // a service ID that is not a point
-        let mut bad_key = bytes.clone();
-        bad_key[1..34].copy_from_slice(&[0xff; 33]);
-        assert!(decode(&bad_key).is_err());
-        // a nonce that is not a point
-        let mut bad_nonce = bytes.clone();
-        bad_nonce[103..136].copy_from_slice(&[0u8; 33]);
-        assert!(decode(&bad_nonce).is_err());
-        // a count that is larger than the body, with nothing allocated for it
-        let mut huge = bytes.clone();
-        huge[42..46].copy_from_slice(&u32::MAX.to_be_bytes());
-        assert!(decode(&huge).unwrap_err().contains("counts more"));
-        // a memo longer than the limit
-        let memo_at = 46 + 187;
-        let mut long = bytes.clone();
-        long[memo_at..memo_at + 2]
-            .copy_from_slice(&((DEFAULT_MAX_MEMO_BYTES + 1) as u16).to_be_bytes());
-        assert!(decode(&long).unwrap_err().contains("memo"));
-        // a memo that is not UTF-8
-        let mut not_utf8 = bytes.clone();
-        not_utf8[memo_at + 2] = 0xff;
-        assert!(decode(&not_utf8).unwrap_err().contains("UTF-8"));
-        fs::remove_dir_all(&s.dir).unwrap();
-    }
-
-    #[test]
-    fn the_request_hash_covers_every_byte_that_is_measured() {
-        let s = setup("hash-covers");
-        let a = s.held(4 * ONE, service(), PAST);
-        let request = build(&[&a], &[(ONE, service(), PAST)], &[]);
-        let base = request_hash(&request);
-        let bytes = request.encode();
-        // flip one bit anywhere that still decodes: the hash changes
-        let mut changed = 0;
-        for at in 0..bytes.len() {
-            let mut b = bytes.clone();
-            b[at] ^= 1;
-            if let Ok(other) = decode(&b) {
-                assert_ne!(request_hash(&other), base, "byte {at}");
-                changed += 1;
-            }
-        }
-        assert!(changed > 100);
-        fs::remove_dir_all(&s.dir).unwrap();
     }
 
     // ---- idempotence and crashes ----
@@ -3164,16 +2959,9 @@ mod tests {
         let id = request_hash(&request);
         assert_eq!(s.totals(), (6 * ONE, 6 * ONE));
 
-        let declined = decline(
-            &s.logic,
-            &s.master,
-            &mut s.responses,
-            &s.queue_path,
-            &id,
-            "uptime terms were not met",
-            NOW + 60,
-        )
-        .unwrap();
+        let declined = s
+            .decline(&id, "uptime terms were not met", NOW + 60)
+            .unwrap();
         assert_eq!(declined.outputs, 2);
         assert_eq!(declined.reissued_esp, u128::from(4 * ONE));
         // 4 came back; the fee stays burned
@@ -3206,29 +2994,23 @@ mod tests {
 
         // it cannot be declined twice, or paid after
         assert!(matches!(
-            decline(
-                &s.logic,
-                &s.master,
-                &mut s.responses,
-                &s.queue_path,
-                &id,
-                "again",
-                NOW + 70
-            ),
+            s.decline(&id, "again", NOW + 70),
             Err(DeclineError::Refused(_))
         ));
         let mut queue = s.queue();
-        assert!(
-            queue
-                .complete(&Payment {
-                    service: service(),
-                    payment_ref: "late",
-                    entry_ids: std::slice::from_ref(&id),
-                    allow_mixed_memos: false,
-                    now_unix: NOW + 80,
-                })
-                .is_err()
-        );
+        assert!(matches!(
+            queue.complete(&Payment {
+                service: service(),
+                payment_ref: "late",
+                entry_ids: std::slice::from_ref(&id),
+                allow_mixed_memos: false,
+                now_unix: NOW + 80,
+            }),
+            Err(queue::QueueError::NotOpen {
+                status: Status::Declined,
+                ..
+            })
+        ));
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
@@ -3257,16 +3039,7 @@ mod tests {
             .unwrap();
         let issued = s.totals().0;
 
-        let declined = decline(
-            &s.logic,
-            &s.master,
-            &mut s.responses,
-            &s.queue_path,
-            &id,
-            "late",
-            NOW,
-        )
-        .unwrap();
+        let declined = s.decline(&id, "late", NOW).unwrap();
         assert_eq!(declined.outputs, 1);
         assert_eq!(s.totals().0, issued);
         let queue = s.queue();
@@ -3285,16 +3058,7 @@ mod tests {
         let request = build(&[&a], &[], &[]);
         s.run(&request).unwrap();
         let id = request_hash(&request);
-        let declined = decline(
-            &s.logic,
-            &s.master,
-            &mut s.responses,
-            &s.queue_path,
-            &id,
-            "no",
-            NOW,
-        )
-        .unwrap();
+        let declined = s.decline(&id, "no", NOW).unwrap();
         assert_eq!(declined.outputs, 0);
         assert_eq!(declined.reissued_esp, 0);
         assert_eq!(s.queue().get(&id).unwrap().status, Status::Declined);
@@ -3308,17 +3072,7 @@ mod tests {
         let request = build(&[&a], &[(ONE, service(), PAST)], &[]);
         s.run(&request).unwrap();
         let id = request_hash(&request);
-        let call = |s: &mut Setup, id: &str, reason: &str| {
-            decline(
-                &s.logic,
-                &s.master,
-                &mut s.responses,
-                &s.queue_path,
-                id,
-                reason,
-                NOW,
-            )
-        };
+        let call = |s: &mut Setup, id: &str, reason: &str| s.decline(id, reason, NOW);
         // no such entry
         assert!(matches!(
             call(&mut s, "nope", "why"),
@@ -3357,22 +3111,6 @@ mod tests {
 
     // ---- settings ----
 
-    fn run_with(
-        s: &mut Setup,
-        request: &RedeemRequest,
-        settings: &RedeemSettings,
-    ) -> Result<RedeemResponse, RedeemError> {
-        redeem_with(
-            &s.logic,
-            &s.master,
-            &mut s.responses,
-            &s.queue_path,
-            request,
-            settings,
-            NOW,
-        )
-    }
-
     fn at_rate(rate: u128) -> RedeemSettings {
         RedeemSettings {
             fee_per_byte: rate,
@@ -3388,7 +3126,7 @@ mod tests {
         let first = build(&[&a], &[], &[]);
         let size = first.encode().len() as u128;
 
-        let response = run_with(&mut s, &first, &at_rate(2_000_000_000)).unwrap();
+        let response = s.run_with(&first, &at_rate(2_000_000_000)).unwrap();
         assert_eq!(response.fee_per_byte, 2_000_000_000);
         assert_eq!(response.fee_esp, size * 2_000_000_000);
         let id = request_hash(&first);
@@ -3402,13 +3140,13 @@ mod tests {
 
         // the operator changes the rate; a retry of the finished request still
         // shows the rate it was charged at, and the entry is not touched
-        let retry = run_with(&mut s, &first, &at_rate(7)).unwrap();
+        let retry = s.run_with(&first, &at_rate(7)).unwrap();
         assert_eq!(retry, response);
         assert_eq!(s.queue().get(&id).unwrap().fee_per_byte, 2_000_000_000);
 
         // a new request is charged at the new rate
         let second = build(&[&b], &[], &[]);
-        let later = run_with(&mut s, &second, &at_rate(7)).unwrap();
+        let later = s.run_with(&second, &at_rate(7)).unwrap();
         assert_eq!(later.fee_per_byte, 7);
         assert_eq!(later.fee_esp, size * 7);
         assert_eq!(
@@ -3428,7 +3166,7 @@ mod tests {
         let plan = s.pend(&request);
         assert_eq!(plan.totals.fee_per_byte, RATE);
         // it comes back up with a different rate in force
-        let response = run_with(&mut s, &request, &at_rate(RATE * 10)).unwrap();
+        let response = s.run_with(&request, &at_rate(RATE * 10)).unwrap();
         assert_eq!(response.fee_per_byte, RATE);
         assert_eq!(response.fee_esp, size * RATE);
         assert_eq!(
@@ -3448,7 +3186,7 @@ mod tests {
             ..at_rate(RATE)
         };
         assert_eq!(
-            rejection(run_with(&mut s, &request, &short)),
+            rejection(s.run_with(&request, &short)),
             RedeemRejection::MemoInvalid { max: 10 }
         );
         assert!(
@@ -3459,31 +3197,12 @@ mod tests {
         assert!(decode_with(&request.encode(), MEMO.len()).is_ok());
         assert!(!s.is_spent(&a));
         // the same request passes at the default
-        run_with(&mut s, &request, &at_rate(RATE)).unwrap();
+        s.run_with(&request, &at_rate(RATE)).unwrap();
 
         let id = request_hash(&request);
-        let refused = decline_with(
-            &s.logic,
-            &s.master,
-            &mut s.responses,
-            &s.queue_path,
-            &id,
-            "too long a reason",
-            5,
-            NOW,
-        );
+        let refused = s.decline_with(&id, "too long a reason", 5, NOW);
         assert!(matches!(refused, Err(DeclineError::Refused(_))));
-        let done = decline_with(
-            &s.logic,
-            &s.master,
-            &mut s.responses,
-            &s.queue_path,
-            &id,
-            "short",
-            5,
-            NOW,
-        );
-        assert!(done.is_ok());
+        s.decline_with(&id, "short", 5, NOW).unwrap();
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
@@ -3575,16 +3294,7 @@ mod tests {
         );
         s.run(&request).unwrap();
         let id = request_hash(&request);
-        decline(
-            &s.logic,
-            &s.master,
-            &mut s.responses,
-            &s.queue_path,
-            &id,
-            "terms",
-            NOW + 60,
-        )
-        .unwrap();
+        s.decline(&id, "terms", NOW + 60).unwrap();
         assert_eq!(day_of(&s, PAST), (u128::from(2 * ONE), u128::from(4 * ONE)));
         assert_eq!(
             day_of(&s, PAST2),
@@ -3618,16 +3328,7 @@ mod tests {
         s.responses = Responses::open(&s.dir.join("esp").join("responses.json")).unwrap();
         assert!(s.responses.ledger().decline_counted(&id));
         // The decline is run again, and finishes.
-        decline(
-            &s.logic,
-            &s.master,
-            &mut s.responses,
-            &s.queue_path,
-            &id,
-            "terms",
-            NOW + 60,
-        )
-        .unwrap();
+        s.decline(&id, "terms", NOW + 60).unwrap();
         assert_eq!(s.queue().get(&id).unwrap().status, Status::Declined);
         assert_eq!(day_of(&s, PAST), (u128::from(3 * ONE), u128::from(4 * ONE)));
         fs::remove_dir_all(&s.dir).unwrap();
@@ -3647,28 +3348,11 @@ mod tests {
         );
         s.run(&request).unwrap();
         let id = request_hash(&request);
-        let refused = decline_with(
-            &s.logic,
-            &s.master,
-            &mut s.responses,
-            &s.queue_path,
-            &id,
-            "a reason that is far too long",
-            5,
-            NOW,
-        );
+        let refused = s.decline_with(&id, "a reason that is far too long", 5, NOW);
         assert!(matches!(refused, Err(DeclineError::Refused(_))));
         assert!(!s.responses.ledger().decline_counted(&id));
         assert_eq!(day_of(&s, PAST), (0, u128::from(4 * ONE)));
-        let unknown = decline(
-            &s.logic,
-            &s.master,
-            &mut s.responses,
-            &s.queue_path,
-            "no-such-entry",
-            "terms",
-            NOW,
-        );
+        let unknown = s.decline("no-such-entry", "terms", NOW);
         assert!(matches!(unknown, Err(DeclineError::Refused(_))));
         assert!(!s.responses.ledger().decline_counted("no-such-entry"));
         fs::remove_dir_all(&s.dir).unwrap();

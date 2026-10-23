@@ -12,7 +12,6 @@ use esp_mint::did;
 use esp_mint::netdir;
 use esp_mint::payouts;
 use esp_mint::psp_client::HttpPsp;
-use esp_mint::responses::Responses;
 use esp_mint::server::{self, EspState};
 
 /// Load the settings, or say everything that is wrong with them.
@@ -60,14 +59,14 @@ fn serve() -> Result<(), Box<dyn Error>> {
     // AIR is the only way wallets reach this mint: without its server and host
     // there is nothing to serve.
     cfg.require_air()?;
-    netdir::refuse_legacy(&base)?;
+    // Everything that can be refused is refused before the data folder is made.
+    let admin_token = match env::var("ESP_ADMIN_TOKEN") {
+        Ok(token) if token.is_empty() => return Err("ESP_ADMIN_TOKEN is set but empty".into()),
+        Ok(token) => Some(token),
+        Err(_) => None,
+    };
     let data_dir = netdir::network_dir(&base, &cfg.network);
     std::fs::create_dir_all(&data_dir)?;
-    println!(
-        "esp-mint on {}: data in {}",
-        cfg.network,
-        data_dir.display()
-    );
     let bind = cfg.bind.clone();
     let psp_url = cfg.psp_url.clone();
     let admin_bind = admin::check_loopback(&cfg.admin_bind)?;
@@ -76,23 +75,7 @@ fn serve() -> Result<(), Box<dyn Error>> {
     // the settings handle.
     let air = cfg.air_listener(&data_dir);
     let did_key = did::load_or_generate(&data_dir.join(did::KEY_FILENAME))?;
-    let admin_token = match env::var("ESP_ADMIN_TOKEN") {
-        Ok(token) if token.is_empty() => return Err("ESP_ADMIN_TOKEN is set but empty".into()),
-        Ok(token) => Some(token),
-        Err(_) => None,
-    };
 
-    let (rotor, logic) = esp_mint::rotation::Rotor::open(
-        &data_dir,
-        cfg.rotation_activation_hours,
-        cfg.rotation_period_hours,
-    )?;
-    for line in rotor.describe() {
-        println!("{line}");
-    }
-    let master = rotor.current.master.clone();
-    let rollovers = esp_mint::rotation::Rollovers::open(&data_dir)?;
-    let responses = Responses::open(&data_dir.join("responses.json"))?;
     // The blocking client is made here, before the async runtime exists.
     let psp = HttpPsp::with_timeout(&cfg.psp_url, cfg.psp_timeout_secs)?;
     // The PSP must be on our network, or PSP notes from one chain would buy ESP
@@ -106,18 +89,17 @@ fn serve() -> Result<(), Box<dyn Error>> {
         "esp-mint on {}: the PSP at {psp_url} is on the same network",
         cfg.network
     );
-    let state = Arc::new(EspState {
-        logic: Mutex::new(logic),
-        master,
-        psp: Box::new(psp),
-        responses: Mutex::new(responses),
-        queue_path: queue_path(&data_dir),
-        queue_lock: Mutex::new(()),
-        config: config::Handle::new(cfg),
-        rotor: Some(Mutex::new(rotor)),
-        rollovers: Some(Mutex::new(rollovers)),
-        in_flight: Default::default(),
-    });
+    // The mint, the rotor, the stored responses and the queue, on the system
+    // clock (`0`).
+    let state = Arc::new(EspState::open(&data_dir, Box::new(psp), cfg, 0)?);
+    for line in state
+        .rotor
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .describe()
+    {
+        println!("{line}");
+    }
 
     start_air_listener(air, did_key, Arc::clone(&state))?;
 
@@ -139,10 +121,10 @@ fn serve() -> Result<(), Box<dyn Error>> {
         .build()?;
     let app = server::router(Arc::clone(&state));
     let admin_app = admin::router(Arc::new(AdminState {
-        queue_path: queue_path(&data_dir),
+        queue_path: server::queue_path(&data_dir),
         lock: Mutex::new(()),
         token: admin_token,
-        esp: Some(Arc::clone(&state)),
+        esp: Arc::clone(&state),
     }));
     let reload_state = Arc::clone(&state);
     runtime.block_on(async move {
@@ -289,16 +271,27 @@ fn data_dir() -> Result<PathBuf, Box<dyn Error>> {
     Ok(PathBuf::from(format!("{home}/.esp-mint")))
 }
 
-/// The data folder of the configured network, after refusing old files.
+/// Say which network this run is on and where its data is, on stderr, as
+/// psp-mint does: `esp-mint on regtest: data in /home/me/.esp-mint/regtest`.
+/// Every command that reads the settings says it first, `pubkey` too (a DID made
+/// on the wrong network looks the same as a right one), and on stderr, so that
+/// `ESP_DID=$(esp-mint pubkey)` captures only the DID. A command that cannot
+/// read its settings says why instead, since it cannot know the network.
+fn say_network() -> Result<(), Box<dyn Error>> {
+    let base = data_dir()?;
+    let network = load_config(&base)?.config.network;
+    eprintln!(
+        "esp-mint on {network}: data in {}",
+        netdir::network_dir(&base, &network).display()
+    );
+    Ok(())
+}
+
+/// The data folder of the configured network.
 fn net_dir() -> Result<PathBuf, Box<dyn Error>> {
     let base = data_dir()?;
     let network = load_config(&base)?.config.network;
-    netdir::refuse_legacy(&base)?;
     Ok(netdir::network_dir(&base, &network))
-}
-
-fn queue_path(data_dir: &std::path::Path) -> PathBuf {
-    data_dir.join("queue.json")
 }
 
 const USAGE: &str = "\
@@ -318,8 +311,6 @@ esp-mint <command>
   decline <entry id> --reason TEXT
                         Decline a payout and sign its stored decline outputs.
                         Asks the running serve, on its operator listener.
-  migrate               Once: move files from before the per-network split into
-                        <ESP_DATA_DIR>/regtest.
   --help                Print this text.
 
 Settings: esp-mint.toml in ESP_DATA_DIR (default ~/.esp-mint) or the file
@@ -407,6 +398,11 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if let Some("serve" | "config" | "pubkey" | "payouts" | "pay" | "decline") =
+        args.first().map(String::as_str)
+    {
+        say_network()?;
+    }
     match args.first().map(String::as_str) {
         Some("serve") => serve(),
         Some("config") => {
@@ -423,15 +419,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         // These read and write the queue file only. They never open the mint's
         // database, so they can run while `serve` is up.
-        Some("migrate") => {
-            let moved = netdir::migrate_to_regtest(&data_dir()?)?;
-            println!("moved into regtest/: {}", moved.join(", "));
-            Ok(())
-        }
         Some("payouts") => {
             print!(
                 "{}",
-                payouts::run_payouts(&queue_path(&net_dir()?), &args[1..])?
+                payouts::run_payouts(&server::queue_path(&net_dir()?), &args[1..])?
             );
             Ok(())
         }
@@ -439,7 +430,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let now = server::now_secs();
             print!(
                 "{}",
-                payouts::run_pay(&queue_path(&net_dir()?), &args[1..], now)?
+                payouts::run_pay(&server::queue_path(&net_dir()?), &args[1..], now)?
             );
             Ok(())
         }

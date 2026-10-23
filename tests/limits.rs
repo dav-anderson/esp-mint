@@ -1,6 +1,6 @@
-//! The ceilings and the fee settings over AIR: an over-ceiling body on each
-//! call is refused with 413 before it is parsed, and a reload changes what the
-//! next request sees.
+//! The ceilings and the fee settings over AIR: a reload of the config file
+//! changes what the next request sees (the ceiling and the rates). The 413 for a
+//! body over its ceiling, on every call, is in `air_info.rs`.
 //!
 //! The calls go to esp-mint's own AIR listener on a real `air_server` (see
 //! `common`); a refusal is read as its HTTP status and body.
@@ -8,11 +8,10 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use esp_mint::config::{self, Config, Handle};
+use esp_mint::config::{self, Config};
 use esp_mint::exchange::{Burn, Psp};
-use esp_mint::responses::Responses;
 use esp_mint::server::EspState;
 use mint_types::{Amount, MintInput, Nonce};
 
@@ -45,8 +44,6 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn start(dir: &Path) -> (common::Air, Arc<EspState>) {
-    let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
-    let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
     let cfg = Config {
         exchange_max_request_bytes: CEILING,
         transfer_max_request_bytes: CEILING,
@@ -54,47 +51,9 @@ fn start(dir: &Path) -> (common::Air, Arc<EspState>) {
         redeem_max_request_bytes: CEILING,
         ..Config::default()
     };
-    let state = Arc::new(EspState {
-        logic: Mutex::new(logic),
-        master,
-        psp: Box::new(NoPsp),
-        responses: Mutex::new(responses),
-        queue_path: dir.join("esp").join("queue.json"),
-        queue_lock: Mutex::new(()),
-        config: Handle::new(cfg),
-        rotor: None,
-        rollovers: None,
-        in_flight: Default::default(),
-    });
+    // The state `serve` builds, on the system clock.
+    let state = Arc::new(EspState::open(&dir.join("esp"), Box::new(NoPsp), cfg, 0).unwrap());
     (common::Air::start(&state, &dir.join("air")), state)
-}
-
-#[test]
-fn a_body_over_the_ceiling_is_refused_before_it_is_parsed_on_every_route() {
-    let dir = scratch("ceilings");
-    let (air, state) = start(&dir);
-    for route in ["exchange", "transfer", "rollover", "redeem"] {
-        let url = format!("/{route}");
-        // not a request at all, and too big: 413, not 400, so it was never parsed
-        let (status, body) = air.post_bytes(&url, &vec![b'x'; CEILING + 1]);
-        assert_eq!(status, 413, "{route}");
-        assert_eq!(body["code"], "request_too_large", "{route}");
-        assert_eq!(body["limit_bytes"], CEILING as u64, "{route}");
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap()
-                .contains("Nothing was parsed, burned or charged")
-        );
-        // the same junk within the ceiling is read and found not to be a request
-        let (status, body) = air.post_bytes(&url, &vec![b'x'; CEILING]);
-        assert_eq!(status, 400, "{route}");
-        assert_eq!(body["code"], "malformed_request", "{route}");
-    }
-    // nothing was written
-    assert!(state.responses.lock().unwrap().is_empty());
-    drop(air);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

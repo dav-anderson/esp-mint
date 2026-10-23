@@ -5,6 +5,10 @@
 //! `MintLogic` here has an empty table and is used only through
 //! `issue_with_key` and `redeem_with_key`. It still keeps the spent set, the
 //! used blind nonces and the issued and redeemed totals in its database.
+//!
+//! Only `rotation::open_gen` opens a generation: a mint is opened through
+//! [`crate::server::EspState::open`] (or `rotation::Rotor::open_at`), which
+//! always rotates.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -20,7 +24,7 @@ use crate::keys::{self, MasterSecret};
 pub const MASTER_SECRET_FILENAME: &str = "master_secret.hex";
 pub const DB_DIRNAME: &str = "db";
 
-pub fn open(data_dir: &Path) -> Result<(MintLogic, MasterSecret), Box<dyn Error>> {
+pub(crate) fn open(data_dir: &Path) -> Result<(MintLogic, MasterSecret), Box<dyn Error>> {
     fs::create_dir_all(data_dir)?;
     let master = keys::load_or_generate(&data_dir.join(MASTER_SECRET_FILENAME))?;
     let store = Store::open(&data_dir.join(DB_DIRNAME))?;
@@ -31,24 +35,4 @@ pub fn open(data_dir: &Path) -> Result<(MintLogic, MasterSecret), Box<dyn Error>
         store,
     );
     Ok((logic, master))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A restart must never open the mint's data while another process (or the
-    /// old one, still shutting down) has it open. The database refuses a second
-    /// open, so the new process stops with an error and the supervisor starts it
-    /// again after its delay. This is a requirement of the storage (see
-    /// DESIGN.md, "What the storage must provide").
-    #[test]
-    fn the_same_data_cannot_be_opened_twice_at_once() {
-        let dir = std::env::temp_dir().join(format!("esp-mint-open-twice-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let first = open(&dir).unwrap();
-        assert!(open(&dir).is_err());
-        drop(first);
-        let _ = fs::remove_dir_all(&dir);
-    }
 }

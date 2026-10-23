@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use esp_mint::air_listener::{self, Serve, Settings};
+use esp_mint::exchange::ExchangeResponse;
+use esp_mint::ledger::Movements;
+use esp_mint::responses::Entry;
 use esp_mint::server::{self, EspState};
 use serde_json::Value;
 use sp_wire::ServiceDid;
@@ -116,6 +119,49 @@ pub struct Air {
     /// Dropped before `server`, so the listener has stopped when the turn ends.
     _listener: Listener,
     pub server: Server,
+}
+
+/// Record in the ledger ESP that a test signed straight from the mint
+/// (`issue_with_key`), the way an exchange records the outputs it signs: an entry
+/// is put and finished with the movements in one write. Without it the counters
+/// say the ESP is outstanding and the ledger does not, and the parts of the
+/// audit do not add up to the total. Only a test that reads those parts needs
+/// it.
+pub fn record_issued(state: &EspState, day: u64, units: u64) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let hash = format!("fixture-issue-{}", N.fetch_add(1, Ordering::Relaxed));
+    let mut movements = Movements::new();
+    movements.issue(day, u128::from(units));
+    let mut responses = state.responses.lock().unwrap();
+    responses
+        .put(
+            &hash,
+            Entry::Pending {
+                redeemable_after_day: day,
+                inputs: vec![],
+                outputs: vec![],
+            },
+        )
+        .unwrap();
+    responses
+        .finish(
+            &hash,
+            Entry::Done(ExchangeResponse {
+                keyset: String::new(),
+                service: ServiceDid::parse(
+                    "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                )
+                .unwrap(),
+                redeemable_after_day: day,
+                signatures: vec![],
+                keys: vec![],
+                fee_per_byte: 0,
+                fee_esp: 0,
+                size_bytes: 0,
+            }),
+            &movements,
+        )
+        .unwrap();
 }
 
 /// The kind of request a route of the old HTTP API stands for.

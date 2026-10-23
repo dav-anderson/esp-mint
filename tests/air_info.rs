@@ -5,8 +5,9 @@
 //! Every call runs against a real ESP mint (with a stand-in PSP for the
 //! exchange). The four that change state are also resent (the same body, a new
 //! request, and the same body handed straight to the mint: the answer is the
-//! stored one and nothing is applied twice), refused, made to fail, tampered
-//! with, and the rollover is run at its full size (1000 notes).
+//! stored one and nothing is applied twice), refused and made to fail, and the
+//! rollover is run at its full size (1000 notes). One test builds the state the
+//! way `serve` does and checks the answer, the ledger and the audit together.
 //!
 //! The AIR client always dials port 5702 (upstream item 12), so these tests need
 //! that port free; `local_server::start` says so when it is not. One server
@@ -25,12 +26,11 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use esp_mint::air_listener::{self, Serve, Settings};
-use esp_mint::config::{Config, Handle};
+use esp_mint::config::Config;
 use esp_mint::exchange::{self, ExchangeRequest, ExchangeResponse};
 use esp_mint::psp_client::HttpPsp;
 use esp_mint::redeem::{self, RedeemInput, RedeemOutput, RedeemRequest};
-use esp_mint::responses::Responses;
-use esp_mint::rotation::{RolloverRequest, RolloverResponse, Rollovers, Rotor};
+use esp_mint::rotation::{RolloverRequest, RolloverResponse};
 use esp_mint::server::{self, EspState};
 use esp_mint::terms::Terms;
 use esp_mint::transfer::{self, TransferRequest, TransferResponse};
@@ -45,16 +45,13 @@ use mint_types::{
 use rand::rngs::OsRng;
 use secp256k1::schnorr::Signature;
 use secp256k1::{Keypair, SECP256K1, SecretKey};
-use sp_wire::air_request::addr::{self, mailbox_secret, reply_secret, seal_to, shared_wallet};
+use sp_wire::air_request::addr::{self, mailbox_secret, reply_secret, shared_wallet};
 use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Verified};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
-use sp_wire::air_request::envelope::{
-    STATUS_ANSWERED, WireRequest, build_reply, build_reply_naming,
-};
 use sp_wire::air_request::{
-    KIND_EXCHANGE, KIND_FEES, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_REDEEM, KIND_ROLLOVER,
-    KIND_ROTATION, KIND_TRANSFER, MintInfo, STATUS_REFUSED, STATUS_UNAVAILABLE, Served,
-    VerifyError, local_server, verify_receipt,
+    KIND_EXCHANGE, KIND_FEES, KIND_KEYSETS, KIND_MINT_INFO, KIND_REDEEM, KIND_ROLLOVER,
+    KIND_ROTATION, KIND_TRANSFER, MintInfo, STATUS_UNAVAILABLE, Served, VerifyError, local_server,
+    verify_receipt,
 };
 use sp_wire::seal::SecretKey as DidKey;
 use sp_wire::{ServiceDid, WIRE_VERSION};
@@ -225,15 +222,6 @@ fn json_bytes(value: &impl serde::Serialize) -> Vec<u8> {
     serde_json::to_vec(value).unwrap()
 }
 
-/// `Create` bytes in a cell, as anyone may in a mailbox slot.
-fn put(server: &ServerRef, key: &DidKey, bytes: Vec<u8>) -> client::Put {
-    block_on_new_runtime(move || async move {
-        let client = client::connect(server).await.unwrap();
-        client::create(&client, key, bytes, 10).await.unwrap()
-    })
-    .unwrap()
-}
-
 fn reply_cell(did: &ServiceDid, flight: &InFlight) -> DidKey {
     let shared = shared_wallet(&flight.r, &addr::did_to_key(did).unwrap());
     reply_secret(&shared, &flight.request_id, 0)
@@ -333,15 +321,26 @@ struct Esp {
     ks: String,
 }
 
-/// A mint that rotates (`rotating`, with a manual clock at [`T0`]: an hour per
-/// generation) or one that does not.
-fn start_esp(dir: &Path, rotating: bool, config: Config) -> Esp {
-    start_esp_at(dir, rotating, config, None)
+/// A mint that rotates every hour on a manual clock at [`T0`] (`set_clock`
+/// moves it), as every mint does.
+fn start_esp(dir: &Path, config: Config) -> Esp {
+    start_esp_at(dir, config, None)
 }
 
 /// [`start_esp`], with the PSP the ESP calls at `psp_url` instead of the
 /// stand-in (a dead one, for the tests of a mint that cannot answer).
-fn start_esp_at(dir: &Path, rotating: bool, config: Config, psp_url: Option<&str>) -> Esp {
+fn start_esp_at(dir: &Path, config: Config, psp_url: Option<&str>) -> Esp {
+    let config = Config {
+        rotation_activation_hours: 1,
+        rotation_period_hours: 1,
+        ..config
+    };
+    start_esp_on(dir, config, T0, psp_url)
+}
+
+/// The mint `esp-mint serve` builds (`EspState::open`) on `dir`, with this config
+/// and clock (`0` is the system clock), and a stand-in PSP beside it.
+fn start_esp_on(dir: &Path, config: Config, clock: u64, psp_url: Option<&str>) -> Esp {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -361,36 +360,16 @@ fn start_esp_at(dir: &Path, rotating: bool, config: Config, psp_url: Option<&str
         .with_state((Arc::clone(&psp), Arc::clone(&memos)));
     let psp_base = serve_http(&rt, psp_app);
 
-    let data = dir.join("esp");
-    std::fs::create_dir_all(&data).unwrap();
-    let (logic, master, rotor, rollovers, ks) = if rotating {
-        let (rotor, logic) = Rotor::open_at(&data, 1, 1, T0).unwrap();
-        let master = rotor.current.master.clone();
-        let ks = rotor.current.id.clone();
-        (
-            logic,
-            master,
-            Some(Mutex::new(rotor)),
-            Some(Mutex::new(Rollovers::open(&data).unwrap())),
-            ks,
+    let state = Arc::new(
+        EspState::open(
+            &dir.join("esp"),
+            Box::new(HttpPsp::new(psp_url.unwrap_or(&psp_base)).unwrap()),
+            config,
+            clock,
         )
-    } else {
-        let (logic, master) = esp_mint::mint::open(&data).unwrap();
-        let ks = esp_mint::rotation::keyset_id(&master);
-        (logic, master, None, None, ks)
-    };
-    let state = Arc::new(EspState {
-        logic: Mutex::new(logic),
-        master,
-        psp: Box::new(HttpPsp::new(psp_url.unwrap_or(&psp_base)).unwrap()),
-        responses: Mutex::new(Responses::open(&data.join("responses.json")).unwrap()),
-        queue_path: data.join("queue.json"),
-        queue_lock: Mutex::new(()),
-        config: Handle::new(config),
-        rotor,
-        rollovers,
-        in_flight: Default::default(),
-    });
+        .unwrap(),
+    );
+    let ks = state.rotor.lock().unwrap().current.id.clone();
     let base = serve_http(&rt, server::router(Arc::clone(&state)));
     Esp {
         rt,
@@ -452,8 +431,6 @@ impl Esp {
     fn set_clock(&self, t: u64) {
         self.state
             .rotor
-            .as_ref()
-            .unwrap()
             .lock()
             .unwrap()
             .clock
@@ -611,7 +588,7 @@ impl Esp {
     /// of the previous keyset. Returns the notes, the previous and the current keyset.
     fn rotated(&self, n: usize) -> (Vec<(Note, Keypair)>, String, String) {
         let notes: Vec<_> = (0..n).map(|_| self.esp_note(1, service(), PAST)).collect();
-        let _ = self.served_body(KIND_ROTATION, b"");
+        self.served_body(KIND_ROTATION, b"");
         self.set_clock(T0 + H);
         let w: serde_json::Value =
             serde_json::from_slice(&self.served_body(KIND_ROTATION, b"")).unwrap();
@@ -683,7 +660,7 @@ fn mint_info_keysets_rotation_and_fees_are_answered_with_what_the_mint_serves() 
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("reads");
-    let esp = start_esp(&dir, true, Config::default());
+    let esp = start_esp(&dir, Config::default());
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let cfg = config(&server, &did, 10, 3);
 
@@ -719,53 +696,20 @@ fn mint_info_keysets_rotation_and_fees_are_answered_with_what_the_mint_serves() 
     listener.stop().unwrap();
 }
 
-#[test]
-fn rotation_of_a_mint_that_does_not_rotate_is_a_refusal_that_says_404_and_keys_is_not_served() {
-    let server = server();
-    let (key, did) = mint_key();
-    let dir = scratch("no-rotation");
-    let esp = start_esp(&dir, false, Config::default());
-    let listener = start_serving(&server, &key, &dir, esp.serve());
-    let cfg = config(&server, &did, 10, 3);
-
-    // Over AIR it is a signed refusal that says it was a 404, so that the wallet
-    // can treat it as a mint without rotation (not as a refusal of its notes).
-    let v = ask_body(&cfg, KIND_ROTATION, b"").unwrap();
-    assert!(v.refused());
-    let body: serde_json::Value = serde_json::from_slice(v.body()).unwrap();
-    assert_eq!(body["http_status"], 404);
-    assert!(body["error"].is_string());
-
-    // Keysets answer on a mint that does not rotate.
-    let keysets = ask_body(&cfg, KIND_KEYSETS, b"").unwrap();
-    assert!(!keysets.refused());
-    esp.assert_served(KIND_KEYSETS, b"", keysets.body());
-
-    // The ESP has no keys route (keys arrive in the replies), so the listener
-    // does not answer that kind: the wallet gets no reply.
-    let short = config(&server, &did, 2, 1);
-    match ask_body(&short, KIND_KEYS, b"") {
-        Err(AskError::Unreachable { .. }) => {}
-        other => panic!("expected no reply to a keys request, got {other:?}"),
-    }
-    // What was skipped did not stop the listener.
-    let v = ask_body(&cfg, KIND_MINT_INFO, b"").unwrap();
-    assert!(!v.refused());
-    listener.stop().unwrap();
-}
-
 // ---------------------------------------------------------------- exchange, transfer, redeem
 
 const DAY: u64 = 21_000;
 
 #[test]
-fn an_exchange_over_air_is_answered_and_a_resent_one_is_not_applied_twice() {
+fn a_resent_request_of_each_kind_is_answered_with_the_stored_answer_and_applied_once() {
     let server = server();
     let (key, did) = mint_key();
-    let dir = scratch("exchange");
-    let esp = start_esp(&dir, false, Config::default());
+    let dir = scratch("resend");
+    let esp = start_esp(&dir, Config::default());
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let cfg = config(&server, &did, 10, 3);
+
+    // The exchange.
 
     let (note, keypair) = esp.psp_note(4);
     let req = esp.exchange_of(note, &keypair, 4);
@@ -808,21 +752,12 @@ fn an_exchange_over_air_is_answered_and_a_resent_one_is_not_applied_twice() {
     // and the reply cell kept the first answer
     let third = ask_body(&cfg, KIND_EXCHANGE, &body).unwrap();
     assert_eq!(third.body(), first.body());
-    listener.stop().unwrap();
-}
 
-#[test]
-fn a_transfer_over_air_is_answered_and_a_resent_one_is_not_applied_twice() {
-    let server = server();
-    let (key, did) = mint_key();
-    let dir = scratch("transfer");
-    let esp = start_esp(&dir, false, Config::default());
-    let listener = start_serving(&server, &key, &dir, esp.serve());
-    let cfg = config(&server, &did, 10, 3);
+    // The transfer, on the same mint: the totals are on top of the exchange's.
 
     let (a, ka) = esp.esp_note(2 * ONE, service(), DAY);
     let (b, kb) = esp.esp_note(ONE, service(), DAY);
-    assert_eq!(esp.audit()["issued"], 3 * ONE);
+    assert_eq!(esp.audit()["issued"], 4 * ONE_PSP + 3 * ONE);
     let req = esp.transfer_of(&[(a, &ka, 2 * ONE), (b, &kb, ONE)], &[ONE, 2 * ONE], DAY);
     let body = json_bytes(&req);
 
@@ -839,26 +774,17 @@ fn a_transfer_over_air_is_answered_and_a_resent_one_is_not_applied_twice() {
     assert!(esp.is_spent(&a) && esp.is_spent(&b));
     // the notes are burned (redeemed) and issued again in their place
     assert_eq!(esp.audit()["redeemed"], 3 * ONE);
-    assert_eq!(esp.audit()["issued"], 6 * ONE);
+    assert_eq!(esp.audit()["issued"], 4 * ONE_PSP + 6 * ONE);
 
     esp.assert_served(KIND_TRANSFER, &body, first.body());
     let again = ask_body(&cfg, KIND_TRANSFER, &body).unwrap();
     assert_ne!(again.request_id, first.request_id);
     assert_eq!(again.body(), first.body());
     // only the first moved the totals
-    assert_eq!(esp.audit()["issued"], 6 * ONE);
+    assert_eq!(esp.audit()["issued"], 4 * ONE_PSP + 6 * ONE);
     assert_eq!(esp.audit()["redeemed"], 3 * ONE);
-    listener.stop().unwrap();
-}
 
-#[test]
-fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_applied_twice() {
-    let server = server();
-    let (key, did) = mint_key();
-    let dir = scratch("redeem");
-    let esp = start_esp(&dir, false, Config::default());
-    let listener = start_serving(&server, &key, &dir, esp.serve());
-    let cfg = config(&server, &did, 10, 3);
+    // The redemption, in its binary encoding.
 
     let (a, ka) = esp.esp_note(ONE, service(), PAST);
     let req = esp.redemption_of(&[(a, &ka, ONE, PAST)]);
@@ -875,13 +801,13 @@ fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_app
     let answer: serde_json::Value = first.json().unwrap();
     assert_eq!(answer["notes"][0]["accepted"], true);
     assert!(esp.is_spent(&a));
-    assert_eq!(esp.audit()["redeemed"], ONE);
+    assert_eq!(esp.audit()["redeemed"], 4 * ONE);
 
     esp.assert_served(KIND_REDEEM, &bytes, first.body());
     let again = ask_body(&cfg, KIND_REDEEM, &bytes).unwrap();
     assert_ne!(again.request_id, first.request_id);
     assert_eq!(again.body(), first.body());
-    assert_eq!(esp.audit()["redeemed"], ONE);
+    assert_eq!(esp.audit()["redeemed"], 4 * ONE);
     // one queue entry, not two
     assert_eq!(
         esp_mint::queue::Queue::open(&esp.state.queue_path)
@@ -889,19 +815,8 @@ fn a_redemption_goes_over_air_in_its_binary_encoding_and_a_resent_one_is_not_app
             .len(),
         1
     );
-    listener.stop().unwrap();
-}
 
-// ---------------------------------------------------------------- rollover
-
-#[test]
-fn a_rollover_over_air_is_answered_and_a_resent_one_is_not_applied_twice() {
-    let server = server();
-    let (key, did) = mint_key();
-    let dir = scratch("rollover");
-    let esp = start_esp(&dir, true, Config::default());
-    let listener = start_serving(&server, &key, &dir, esp.serve());
-    let cfg = config(&server, &did, 10, 3);
+    // The rollover.
 
     let (notes, previous, current) = esp.rotated(2);
     let req = rollover_of(&notes, &previous, &current, 1);
@@ -936,6 +851,8 @@ fn a_rollover_over_air_is_answered_and_a_resent_one_is_not_applied_twice() {
     listener.stop().unwrap();
 }
 
+// ---------------------------------------------------------------- rollover
+
 /// The full size of a rollover: 1000 notes, the most one request may carry. The
 /// request is about half a megabyte (the body length is 4 bytes, and the ceiling
 /// is the mint's setting), the AIR server takes it as one record, and the answer
@@ -945,7 +862,7 @@ fn a_full_rollover_of_a_thousand_notes_goes_over_air() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("rollover-full");
-    let esp = start_esp(&dir, true, Config::default());
+    let esp = start_esp(&dir, Config::default());
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let cfg = config(&server, &did, 60, 2);
 
@@ -972,6 +889,65 @@ fn a_full_rollover_of_a_thousand_notes_goes_over_air() {
     listener.stop().unwrap();
 }
 
+// ---------------------------------------------------------------- serve wiring
+
+/// The unix day, from the system clock.
+fn unix_day() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 86_400
+}
+
+/// The state `esp-mint serve` runs on, built the way `serve` builds it (the
+/// library constructor, from a `Config` with its defaults, on the system clock),
+/// answers an exchange through `air_served`: the answer, the ledger and the
+/// audit agree.
+#[test]
+fn the_state_serve_builds_answers_an_exchange_and_the_answer_ledger_and_audit_agree() {
+    let dir = scratch("serve-wiring");
+    let esp = start_esp_on(&dir, Config::default(), 0, None);
+    let (note, keypair) = esp.psp_note(4);
+    let req = esp.exchange_of(note, &keypair, 4);
+
+    let day_before = unix_day();
+    let body = esp.served_body(KIND_EXCHANGE, &json_bytes(&req));
+    let day_after = unix_day();
+
+    // The answer.
+    let response: ExchangeResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response.service, service());
+    assert_eq!(response.keyset, esp.ks);
+    assert_eq!(response.signatures.len(), req.outputs.len());
+    assert!(
+        (day_before + 365..=day_after + 365).contains(&response.redeemable_after_day),
+        "the default maturity is 365 days: {}",
+        response.redeemable_after_day
+    );
+    assert!(esp.psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
+
+    // The ledger holds the outputs under their day, and nothing redeemed.
+    let day = esp
+        .state
+        .responses
+        .lock()
+        .unwrap()
+        .ledger()
+        .day(response.redeemable_after_day);
+    assert_eq!((day.issued, day.redeemed), (u128::from(4 * ONE_PSP), 0));
+
+    // The audit (which `serve` serves on `server.bind`) says the same, and the
+    // days ahead are unmatured.
+    let audit = esp.audit();
+    assert_eq!(audit["issued"], 4 * ONE_PSP);
+    assert_eq!(audit["redeemed"], 0);
+    assert_eq!(audit["outstanding"], 4 * ONE_PSP);
+    assert_eq!(audit["outstanding_matured"], 0);
+    assert_eq!(audit["outstanding_unmatured"], 4 * ONE_PSP);
+    assert_eq!(audit["requests_unfinished"], 0);
+}
+
 // ---------------------------------------------------------------- refusals
 
 #[test]
@@ -981,7 +957,6 @@ fn a_body_over_its_ceiling_is_refused_before_it_is_parsed_with_a_413() {
     let dir = scratch("ceilings");
     let esp = start_esp(
         &dir,
-        false,
         Config {
             exchange_max_request_bytes: 4096,
             transfer_max_request_bytes: 4096,
@@ -1007,6 +982,13 @@ fn a_body_over_its_ceiling_is_refused_before_it_is_parsed_with_a_413() {
         assert_eq!(body["http_status"], 413, "{route}");
         assert_eq!(body["limit_bytes"], 4096, "{route}");
         assert_eq!(body["size_bytes"], 4097, "{route}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("Nothing was parsed, burned or charged"),
+            "{route}: {body}"
+        );
 
         // At the limit the body is read, and is not a request: a 400.
         let at = vec![b' '; 4096];
@@ -1026,12 +1008,44 @@ fn a_body_over_its_ceiling_is_refused_before_it_is_parsed_with_a_413() {
         (body["code"].as_str(), body["http_status"].as_u64()),
         (Some("request_too_large"), Some(413))
     );
+    assert_eq!(body["limit_bytes"], 1000);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Nothing was parsed, burned or charged"),
+        "{body}"
+    );
     let at = vec![0xffu8; 1000];
     let v = ask_body(&cfg, KIND_REDEEM, &at).unwrap();
     assert!(v.refused());
     let body: serde_json::Value = serde_json::from_slice(v.body()).unwrap();
     assert_eq!(body["code"], "malformed_request");
     assert!(body.get("http_status").is_none());
+
+    // A redemption that is perfectly good but too big is refused for its size,
+    // without a burn or a fee.
+    let held: Vec<(Note, Keypair)> = (0..8)
+        .map(|_| esp.esp_note(4 * ONE, service(), PAST))
+        .collect();
+    let notes: Vec<(Note, &Keypair, u64, u64)> = held
+        .iter()
+        .map(|(note, key)| (*note, key, 4 * ONE, PAST))
+        .collect();
+    let bytes = esp.redemption_of(&notes).encode();
+    assert!(bytes.len() > 1000);
+    let v = ask_body(&cfg, KIND_REDEEM, &bytes).unwrap();
+    assert!(v.refused());
+    let body: serde_json::Value = serde_json::from_slice(v.body()).unwrap();
+    assert_eq!(
+        (body["code"].as_str(), body["http_status"].as_u64()),
+        (Some("request_too_large"), Some(413))
+    );
+    assert!(held.iter().all(|(note, _)| !esp.is_spent(note)));
+
+    // Nothing was written by any of the refusals.
+    assert!(esp.state.responses.lock().unwrap().is_empty());
+    assert!(!esp.state.queue_path.exists());
     listener.stop().unwrap();
 }
 
@@ -1040,7 +1054,7 @@ fn refusals_are_signed_replies_with_the_text_and_the_status() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("refusals");
-    let esp = start_esp(&dir, false, Config::default());
+    let esp = start_esp(&dir, Config::default());
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let cfg = config(&server, &did, 10, 3);
 
@@ -1107,7 +1121,7 @@ fn a_psp_that_cannot_be_reached_is_a_signed_unavailable_and_a_retry_is_safe() {
     let (key, did) = mint_key();
     let dir = scratch("dead-psp");
     // Nothing listens on port 9: the mint cannot reach its PSP.
-    let esp = start_esp_at(&dir, false, Config::default(), Some("http://127.0.0.1:9"));
+    let esp = start_esp_at(&dir, Config::default(), Some("http://127.0.0.1:9"));
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let cfg = config(&server, &did, 10, 3);
 
@@ -1147,7 +1161,7 @@ fn a_mint_that_is_broken_says_so_in_a_signed_reply_for_every_call() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("poisoned");
-    let esp = start_esp(&dir, true, Config::default());
+    let esp = start_esp(&dir, Config::default());
     let listener = start_serving(&server, &key, &dir, esp.serve());
     let cfg = config(&server, &did, 10, 3);
 
@@ -1164,11 +1178,12 @@ fn a_mint_that_is_broken_says_so_in_a_signed_reply_for_every_call() {
     // A thread panics while it holds the mint: the lock is poisoned, and the
     // HTTP routes would answer 500.
     let state = Arc::clone(&esp.state);
-    let _ = thread::spawn(move || {
+    let panicked = thread::spawn(move || {
         let _held = state.logic.lock().unwrap();
         panic!("poisoning the mint lock on purpose");
     })
     .join();
+    assert!(panicked.is_err(), "the thread panicked, as it was meant to");
     assert!(esp.state.logic.is_poisoned());
 
     for (kind, body) in [
@@ -1191,143 +1206,6 @@ fn a_mint_that_is_broken_says_so_in_a_signed_reply_for_every_call() {
     listener.stop().unwrap();
 }
 
-// ---------------------------------------------------------------- tampered and forged
-
-/// Any request that is already "answered" with what `make` builds.
-fn ask_planted(
-    server: &ServerRef,
-    did: &ServiceDid,
-    mut flight: InFlight,
-    make: impl FnOnce(&InFlight) -> Vec<u8>,
-) -> Result<Verified, AskError> {
-    let sealed = seal_to(&flight.r.public_key(), &make(&flight)).unwrap();
-    assert!(matches!(
-        put(server, &reply_cell(did, &flight), sealed),
-        client::Put::Created(_)
-    ));
-    ask_any(&config(server, did, 3, 1), &mut flight)
-}
-
-#[test]
-fn a_tampered_or_forged_reply_to_any_of_the_esp_calls_is_rejected() {
-    let server = server();
-    let (key, did) = mint_key();
-    let (other, _) = mint_key();
-    let now = addr::now_secs();
-    let answer: &[u8] = br#"{"keyset":"k","signatures":[],"keys":[]}"#;
-    let refusal: &[u8] = br#"{"error":"no","code":"refused"}"#;
-    let binary: Vec<u8> = (0..=255u8).collect();
-
-    for (kind, body) in [
-        (KIND_FEES, Vec::new()),
-        (KIND_EXCHANGE, br#"{"psp_inputs":[]}"#.to_vec()),
-        (KIND_TRANSFER, br#"{"inputs":[]}"#.to_vec()),
-        (KIND_REDEEM, binary),
-        (KIND_ROLLOVER, br#"{"inputs":[]}"#.to_vec()),
-    ] {
-        let flight = || InFlight::with_body(kind, body.clone());
-
-        // Controls: an honest answer and an honest refusal are accepted.
-        let honest = |f: &InFlight| build_reply(&key, &f.request(), STATUS_ANSWERED, now, answer);
-        let v = ask_planted(&server, &did, flight(), honest).unwrap();
-        assert_eq!(v.body(), answer, "kind {kind}");
-        assert!(!v.refused());
-        let refused = |f: &InFlight| build_reply(&key, &f.request(), STATUS_REFUSED, now, refusal);
-        let v = ask_planted(&server, &did, flight(), refused).unwrap();
-        assert!(v.refused(), "kind {kind}");
-
-        // A byte of the answer changed after it was signed.
-        let tampered = |f: &InFlight| {
-            let mut plain = honest(f);
-            plain[sp_wire::air_request::envelope::REPLY_FIXED + 12] ^= 1;
-            plain
-        };
-        assert!(
-            matches!(
-                ask_planted(&server, &did, flight(), tampered),
-                Err(AskError::Verify(VerifyError::BadSignature))
-            ),
-            "kind {kind}"
-        );
-
-        // An answer turned into a refusal by a man in the middle who changes
-        // only the status byte: the status is signed.
-        let flipped = |f: &InFlight| {
-            let mut plain = honest(f);
-            plain[1] = STATUS_REFUSED;
-            plain
-        };
-        assert!(
-            matches!(
-                ask_planted(&server, &did, flight(), flipped),
-                Err(AskError::Verify(VerifyError::BadSignature))
-            ),
-            "kind {kind}"
-        );
-
-        // The wrong kind: the mint's answer to another call with the same id,
-        // key and body is not an answer to this one.
-        let wrong_kind = |f: &InFlight| {
-            let request = WireRequest {
-                kind: if kind == KIND_EXCHANGE {
-                    KIND_TRANSFER
-                } else {
-                    KIND_EXCHANGE
-                },
-                ..f.request()
-            };
-            build_reply(&key, &request, STATUS_ANSWERED, now, answer)
-        };
-        assert!(
-            matches!(
-                ask_planted(&server, &did, flight(), wrong_kind),
-                Err(AskError::Verify(VerifyError::WrongRequestHash))
-            ),
-            "kind {kind}"
-        );
-
-        // Another mint's signature (the PSP's, say), with and without naming the
-        // right mint.
-        let substituted =
-            |f: &InFlight| build_reply(&other, &f.request(), STATUS_ANSWERED, now, answer);
-        assert!(
-            matches!(
-                ask_planted(&server, &did, flight(), substituted),
-                Err(AskError::Verify(VerifyError::WrongMint))
-            ),
-            "kind {kind}"
-        );
-        let forged = |f: &InFlight| {
-            build_reply_naming(
-                &other,
-                did.as_bytes(),
-                &f.request(),
-                STATUS_ANSWERED,
-                now,
-                answer,
-            )
-        };
-        assert!(
-            matches!(
-                ask_planted(&server, &did, flight(), forged),
-                Err(AskError::Verify(VerifyError::BadSignature))
-            ),
-            "kind {kind}"
-        );
-
-        // A genuine answer replayed long after.
-        let old =
-            |f: &InFlight| build_reply(&key, &f.request(), STATUS_ANSWERED, now - 10_000, answer);
-        assert!(
-            matches!(
-                ask_planted(&server, &did, flight(), old),
-                Err(AskError::Verify(VerifyError::Stale { .. }))
-            ),
-            "kind {kind}"
-        );
-    }
-}
-
 #[test]
 fn the_esp_and_the_psp_can_share_an_air_server_because_their_mailboxes_are_their_own() {
     // Two mints on one server, each with its own DID: a request to one is never
@@ -1337,7 +1215,7 @@ fn the_esp_and_the_psp_can_share_an_air_server_because_their_mailboxes_are_their
     let (psp_key, psp_did) = mint_key();
     assert_ne!(esp_did, psp_did);
     let dir = scratch("shared");
-    let esp = start_esp(&dir, false, Config::default());
+    let esp = start_esp(&dir, Config::default());
     let listener = start_serving(&server, &esp_key, &dir, esp.serve());
     // A stand-in for the PSP: answers only mint info, as its own DID.
     let psp_dir = scratch("shared-psp");

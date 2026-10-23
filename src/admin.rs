@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -54,10 +55,10 @@ pub struct AdminState {
     pub lock: Mutex<()>,
     /// The bearer token, if one is required.
     pub token: Option<String>,
-    /// The mint, which the decline call needs to sign. Without it the decline
-    /// route answers `501`. When it is there, the queue is also changed under the
-    /// mint's own queue lock, so a redemption never writes it at the same moment.
-    pub esp: Option<Arc<EspState>>,
+    /// The mint, which the decline call needs to sign. The queue is changed
+    /// under the mint's own queue lock, so a redemption never writes it at the
+    /// same moment.
+    pub esp: Arc<EspState>,
 }
 
 /// Refuse a bind address that is not loopback.
@@ -125,6 +126,20 @@ fn error(code: StatusCode, why: &str, text: bool) -> Response {
     }
 }
 
+/// Read a JSON request body, after the token and the format have been checked.
+/// A body that is not JSON is a `400`; JSON of the wrong shape (a missing or
+/// unknown field, a wrong type) is a `422`, as axum's `Json` extractor answers.
+fn parse_body<T: serde::de::DeserializeOwned>(raw: &[u8], text: bool) -> Result<T, Response> {
+    serde_json::from_slice(raw).map_err(|e| {
+        let code = if e.classify() == serde_json::error::Category::Data {
+            StatusCode::UNPROCESSABLE_ENTITY
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        error(code, &format!("the request body is not valid: {e}"), text)
+    })
+}
+
 fn authorized(state: &AdminState, headers: &HeaderMap) -> bool {
     match &state.token {
         None => true,
@@ -141,17 +156,19 @@ async fn payouts_handler(
     headers: HeaderMap,
     Query(query): Query<FormatQuery>,
 ) -> Response {
-    let text = match query.text() {
-        Ok(text) => text,
-        Err(response) => return response,
-    };
+    // The token comes first: a caller without it learns nothing about the query,
+    // not even that its format is wrong.
     if !authorized(&state, &headers) {
         return error(
             StatusCode::UNAUTHORIZED,
             "missing or wrong admin token",
-            text,
+            query.format.as_deref() == Some("text"),
         );
     }
+    let text = match query.text() {
+        Ok(text) => text,
+        Err(response) => return response,
+    };
     let Ok(_guard) = state.lock.lock() else {
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -174,19 +191,25 @@ async fn pay_handler(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Query(query): Query<FormatQuery>,
-    Json(body): Json<PayBody>,
+    raw: Bytes,
 ) -> Response {
-    let text = match query.text() {
-        Ok(text) => text,
-        Err(response) => return response,
-    };
+    // The token, then the format, then the body: a caller without the token
+    // learns nothing about its query or its body.
     if !authorized(&state, &headers) {
         return error(
             StatusCode::UNAUTHORIZED,
             "missing or wrong admin token",
-            text,
+            query.format.as_deref() == Some("text"),
         );
     }
+    let text = match query.text() {
+        Ok(text) => text,
+        Err(response) => return response,
+    };
+    let body: PayBody = match parse_body(&raw, text) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let Ok(_guard) = state.lock.lock() else {
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -194,22 +217,14 @@ async fn pay_handler(
             text,
         );
     };
-    let _queue_guard = match state.esp.as_ref().map(|esp| esp.queue_lock.lock()) {
-        None => None,
-        Some(Ok(guard)) => Some(guard),
-        Some(Err(_)) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the queue lock is poisoned",
-                text,
-            );
-        }
+    let Ok(_queue_guard) = state.esp.queue_lock.lock() else {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the queue lock is poisoned",
+            text,
+        );
     };
-    let max_ref_bytes = state
-        .esp
-        .as_ref()
-        .map(|esp| esp.config.current().queue_max_payment_ref_bytes)
-        .unwrap_or(crate::queue::MAX_REF_LEN);
+    let max_ref_bytes = state.esp.config.current().queue_max_payment_ref_bytes;
     let result = Queue::open(&state.queue_path).and_then(|queue| {
         let mut queue = queue.with_max_ref_bytes(max_ref_bytes);
         queue.complete(&Payment {
@@ -238,26 +253,23 @@ async fn decline_handler(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Query(query): Query<FormatQuery>,
-    Json(body): Json<DeclineBody>,
+    raw: Bytes,
 ) -> Response {
-    let text = match query.text() {
-        Ok(text) => text,
-        Err(response) => return response,
-    };
     if !authorized(&state, &headers) {
         return error(
             StatusCode::UNAUTHORIZED,
             "missing or wrong admin token",
-            text,
+            query.format.as_deref() == Some("text"),
         );
     }
-    if state.esp.is_none() {
-        return error(
-            StatusCode::NOT_IMPLEMENTED,
-            "this admin listener has no mint to sign with",
-            text,
-        );
-    }
+    let text = match query.text() {
+        Ok(text) => text,
+        Err(response) => return response,
+    };
+    let body: DeclineBody = match parse_body(&raw, text) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     // Signing reads and writes the mint's files, so it runs on a blocking thread.
     let joined = tokio::task::spawn_blocking(move || {
         let Ok(_guard) = state.lock.lock() else {
@@ -266,9 +278,7 @@ async fn decline_handler(
                 "the admin lock is poisoned".to_string(),
             ));
         };
-        let Some(esp) = state.esp.as_ref() else {
-            return Err((StatusCode::NOT_IMPLEMENTED, "no mint".to_string()));
-        };
+        let esp = &state.esp;
         let (Ok(mut logic), Ok(mut responses), Ok(_queue)) = (
             esp.logic.lock(),
             esp.responses.lock(),
@@ -283,10 +293,7 @@ async fn decline_handler(
         // redemption asked for; the signatures name it (see decline_gens).
         let rot = crate::server::rotor_of(esp, &mut logic)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        let gens = match &rot {
-            Some(r) => r.gens(&logic),
-            None => crate::rotation::Gens::only(&logic, &esp.master),
-        };
+        let gens = rot.gens(&logic);
         redeem::decline_gens(
             &gens,
             &mut responses,
@@ -351,11 +358,7 @@ async fn limit_body(
 pub fn router(state: Arc<AdminState>) -> Router {
     // The ceiling on a request body here is `admin.max_request_bytes`. It is read
     // once, when the router is built, so changing it needs a restart.
-    let limit = state
-        .esp
-        .as_ref()
-        .map(|esp| esp.config.current().admin_max_request_bytes)
-        .unwrap_or(1024 * 1024);
+    let limit = state.esp.config.current().admin_max_request_bytes;
     Router::new()
         .route("/payouts", get(payouts_handler))
         .route("/payouts/pay", post(pay_handler))

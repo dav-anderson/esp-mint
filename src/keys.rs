@@ -143,14 +143,6 @@ mod tests {
     }
 
     #[test]
-    fn same_inputs_give_the_same_key() {
-        assert_eq!(
-            key_hex(&master(), 4, &terms()),
-            key_hex(&master(), 4, &terms())
-        );
-    }
-
-    #[test]
     fn every_input_changes_the_key() {
         let base = key_hex(&master(), 4, &terms());
         assert_ne!(base, key_hex(&master(), 2, &terms()));
@@ -197,7 +189,12 @@ mod tests {
         let dir = scratch("damaged");
         let path = dir.join("master_secret.hex");
         fs::write(&path, "not hex").unwrap();
-        assert!(load_or_generate(&path).is_err());
+        let e = load_or_generate(&path).unwrap_err().to_string();
+        assert!(
+            e.contains("not a 64 character hex master secret")
+                && e.contains(&path.display().to_string()),
+            "{e}"
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "not hex");
         fs::remove_dir_all(&dir).unwrap();
     }

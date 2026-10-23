@@ -32,7 +32,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use esp_mint::exchange::{self, ExchangeRequest, ExchangeResponse};
 use esp_mint::psp_client::HttpPsp;
-use esp_mint::responses::{Entry, Responses};
+use esp_mint::responses::Entry;
 use esp_mint::server::{self, EspState};
 use mint_core::MintLogic;
 use mint_core::keygen;
@@ -85,28 +85,22 @@ fn nonce_key(nonce: &Nonce) -> String {
     hex::encode(nonce.0.serialize())
 }
 
-/// What the PSP's first `/melt` does before it burns.
-#[derive(Clone, Copy)]
-enum Hold {
-    /// Wait until the test calls [`Gate::release`].
-    UntilReleased,
-    /// Wait this long, then burn, as a PSP that answers late would.
-    Sleep(Duration),
-}
-
-/// Controls the PSP's first `/melt`. Later melts are never held.
+/// Controls the PSP's first `/melt`, which waits until the test calls
+/// [`Gate::release`]. Later melts are never held.
 struct Gate {
-    hold: Hold,
     /// How many `/melt` calls have reached the PSP.
     arrived: AtomicUsize,
+    /// How many held calls are over: the handler returned, or it was dropped
+    /// because the mint gave up and closed the connection.
+    finished: AtomicUsize,
     released: AtomicBool,
 }
 
 impl Gate {
-    fn new(hold: Hold) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         Arc::new(Gate {
-            hold,
             arrived: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
             released: AtomicBool::new(false),
         })
     }
@@ -117,14 +111,31 @@ impl Gate {
 
     /// Wait until `n` melts have reached the PSP.
     fn wait_for_arrivals(&self, n: usize) {
-        let start = Instant::now();
-        while self.arrived.load(Ordering::SeqCst) < n {
-            assert!(
-                start.elapsed() < Duration::from_secs(10),
-                "the melt never reached the PSP"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_for(&self.arrived, n, "the melt never reached the PSP");
+    }
+
+    /// Wait until `n` held melts are over, after [`Gate::release`]: the burn has
+    /// been done, or the call was given up on and will never burn.
+    fn wait_for_finished(&self, n: usize) {
+        wait_for(&self.finished, n, "the held melt never finished");
+    }
+}
+
+/// Wait, up to ten seconds, until `counter` reaches `n`; fail with `message`.
+fn wait_for(counter: &AtomicUsize, n: usize, message: &str) {
+    let start = Instant::now();
+    while counter.load(Ordering::SeqCst) < n {
+        assert!(start.elapsed() < Duration::from_secs(10), "{message}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Counts a held melt as finished when its handler ends, however it ends.
+struct Finished(Arc<Gate>);
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        self.0.finished.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -137,19 +148,16 @@ async fn melt_gated(
     Json(req): Json<MeltRequest>,
 ) -> Result<Json<MeltResponse>, (StatusCode, Json<serde_json::Value>)> {
     let first = gate.arrived.fetch_add(1, Ordering::SeqCst) == 0;
+    let _finished = first.then(|| Finished(Arc::clone(&gate)));
     if first {
         let gate = Arc::clone(&gate);
         // Waiting blocks, so it is done off the async threads.
-        tokio::task::spawn_blocking(move || match gate.hold {
-            Hold::UntilReleased => {
-                let start = Instant::now();
-                while !gate.released.load(Ordering::SeqCst)
-                    && start.elapsed() < Duration::from_secs(60)
-                {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+        tokio::task::spawn_blocking(move || {
+            let start = Instant::now();
+            while !gate.released.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(60)
+            {
+                std::thread::sleep(Duration::from_millis(5));
             }
-            Hold::Sleep(d) => std::thread::sleep(d),
         })
         .await
         .unwrap();
@@ -220,28 +228,25 @@ fn ks() -> String {
     KS.with(|k| k.borrow().clone())
 }
 
-/// The ESP mint, with its PSP client giving up after `psp_timeout_secs`.
+/// The mint `serve` builds (`EspState::open`) on `dir`, on the system clock and
+/// with the default config, with its PSP client giving up after
+/// `psp_timeout_secs`.
 fn start_esp(
     rt: &Runtime,
     dir: &Path,
     psp_url: &str,
     psp_timeout_secs: u64,
 ) -> (String, Arc<EspState>) {
-    let (logic, master) = esp_mint::mint::open(&dir.join("esp")).unwrap();
-    KS.with(|k| *k.borrow_mut() = esp_mint::rotation::keyset_id(&master));
-    let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
-    let state = Arc::new(EspState {
-        logic: Mutex::new(logic),
-        master,
-        psp: Box::new(HttpPsp::with_timeout(psp_url, psp_timeout_secs).unwrap()),
-        responses: Mutex::new(responses),
-        queue_path: dir.join("esp").join("queue.json"),
-        queue_lock: Mutex::new(()),
-        config: esp_mint::config::Handle::default(),
-        rotor: None,
-        rollovers: None,
-        in_flight: Default::default(),
-    });
+    let state = Arc::new(
+        EspState::open(
+            &dir.join("esp"),
+            Box::new(HttpPsp::with_timeout(psp_url, psp_timeout_secs).unwrap()),
+            esp_mint::config::Config::default(),
+            0,
+        )
+        .unwrap(),
+    );
+    KS.with(|k| *k.borrow_mut() = state.rotor.lock().unwrap().current.id.clone());
     (serve(rt, server::router(Arc::clone(&state))), state)
 }
 
@@ -339,7 +344,7 @@ fn is_pending(state: &EspState, req: &ExchangeRequest) -> bool {
 fn an_exchange_stuck_at_the_psp_does_not_block_an_unrelated_request() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("unrelated");
-    let gate = Gate::new(Hold::UntilReleased);
+    let gate = Gate::new();
     let (psp_url, psp) = start_psp(&rt, &dir, &gate);
     let (esp, state) = start_esp(&rt, &dir, &psp_url, 30);
 
@@ -386,7 +391,7 @@ fn an_exchange_stuck_at_the_psp_does_not_block_an_unrelated_request() {
 fn the_same_request_sent_again_while_it_is_in_progress_is_not_processed_twice() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("duplicate");
-    let gate = Gate::new(Hold::UntilReleased);
+    let gate = Gate::new();
     let (psp_url, psp) = start_psp(&rt, &dir, &gate);
     let (esp, state) = start_esp(&rt, &dir, &psp_url, 30);
 
@@ -429,8 +434,9 @@ fn the_same_request_sent_again_while_it_is_in_progress_is_not_processed_twice() 
 fn a_psp_timeout_leaves_nothing_stuck_and_the_retry_finishes() {
     let rt = Runtime::new().unwrap();
     let dir = scratch("timeout");
-    // The PSP's first melt takes 3 seconds, and the mint gives up after 1.
-    let gate = Gate::new(Hold::Sleep(Duration::from_secs(3)));
+    // The PSP's first melt is held until the test lets it go, and the mint gives
+    // up after 1 second.
+    let gate = Gate::new();
     let (psp_url, psp) = start_psp(&rt, &dir, &gate);
     let (esp, state) = start_esp(&rt, &dir, &psp_url, 1);
     let air = common::Air::start(&state, &dir.join("air"));
@@ -454,9 +460,11 @@ fn a_psp_timeout_leaves_nothing_stuck_and_the_retry_finishes() {
     let (code, body) = air.post_json("/exchange", &other);
     assert_eq!(code, 200, "{body}");
 
-    // The retry, once the PSP has answered or given up, finishes the request
-    // whether or not the late burn happened, and burns the note once.
-    std::thread::sleep(Duration::from_millis(3500));
+    // The PSP is let go. Once the held call is over (it burned late, or the mint's
+    // giving up ended it first), the retry finishes the request whether or not
+    // the late burn happened, and burns the note once.
+    gate.release();
+    gate.wait_for_finished(1);
     let (code, body) = air.post_json("/exchange", &first);
     assert_eq!(code, 200, "{body}");
     assert!(psp.logic.lock().unwrap().is_spent(a.nonce).unwrap());

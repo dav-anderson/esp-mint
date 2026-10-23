@@ -218,18 +218,6 @@ pub struct Gens<'a> {
 }
 
 impl<'a> Gens<'a> {
-    /// One generation only (a mint without rotation, and the unit tests).
-    pub fn only(logic: &'a MintLogic, master: &'a MasterSecret) -> Self {
-        Gens {
-            current: (logic, master),
-            previous: None,
-            current_id: keyset_id(master),
-            previous_id: None,
-            retired: &[],
-            burn_proofs: None,
-        }
-    }
-
     /// Whether `input` was proven burned (by the request holding it) when its
     /// keyset was deleted: read from the deleted set's spent list just before
     /// the deletion, see `Retired::burn_proofs`.
@@ -704,6 +692,24 @@ impl Rollovers {
         save_json(&self.path, self).map_err(|e| e.to_string())
     }
 
+    /// Record the rollover `id` as started under `epoch`, holding the notes
+    /// (nonce hex) it is about to burn, and write the file. Done before anything
+    /// is burned, so that no other request takes the notes meanwhile and a retry
+    /// after a crash knows the rollover was begun.
+    pub fn begin(&mut self, id: &str, epoch: u64, nonces: Vec<String>) -> Result<(), String> {
+        self.pending.insert(id.to_string(), epoch);
+        self.holds.insert(id.to_string(), nonces);
+        self.save()
+    }
+
+    /// Record that every input of the pending rollover `id` has been burned
+    /// under it, and write the file. Done after the burn and before any
+    /// signing: it is what proves the burn once the inputs' keyset is deleted.
+    pub fn mark_burned(&mut self, id: &str) -> Result<(), String> {
+        self.burned.insert(id.to_string());
+        self.save()
+    }
+
     /// The notes (nonce hex) pending rollovers other than `except` hold.
     pub fn held_nonces(&self, except: &str) -> std::collections::HashSet<String> {
         self.holds
@@ -719,9 +725,10 @@ pub enum RolloverError {
     Refused(String),
     /// `missing_keyset`, `keyset_retired` or `unknown_keyset`, with why.
     Keyset(&'static str, String),
-    /// Input `index` is already spent. The body says which, so the wallet can
-    /// stop offering that note (`code: note_spent_elsewhere`, `spent: [index]`).
-    Spent(usize),
+    /// These inputs are already spent: every one of them, in order. The body
+    /// says which, so the wallet can stop offering those notes
+    /// (`code: note_spent_elsewhere`, `spent: [indexes]`).
+    Spent(Vec<usize>),
     Internal(String),
 }
 
@@ -807,7 +814,22 @@ pub fn rollover(
             .is_spent(input.note.nonce)
             .map_err(|e| Internal(e.to_string()))?;
         if spent && resumed.is_none() {
-            return Err(Spent(i));
+            // The first problem in order is this note. Say every spent note, not
+            // only this one: the inputs after it are looked at for that alone (a
+            // key that cannot be found or a note that is no good there is not
+            // this answer's business), so the wallet drops them all in one go.
+            let mut all = vec![i];
+            for (j, later) in req.inputs.iter().enumerate().skip(i + 1) {
+                let Ok((l, _)) = gens.input_key(&req.input_keysets[j], later, &terms) else {
+                    continue;
+                };
+                if l.is_spent(later.note.nonce)
+                    .map_err(|e| Internal(e.to_string()))?
+                {
+                    all.push(j);
+                }
+            }
+            return Err(Spent(all));
         }
         plan.push((logic, sk, input, spent));
     }
@@ -823,15 +845,16 @@ pub fn rollover(
                 return Err(Refused("an output's blind nonce was used before".into()));
             }
         }
-        store.pending.insert(id.clone(), rotor.current.epoch);
-        store.holds.insert(
-            id.clone(),
-            req.inputs
-                .iter()
-                .map(|i| hex::encode(i.note.nonce.0.serialize()))
-                .collect(),
-        );
-        store.save().map_err(Internal)?;
+        store
+            .begin(
+                &id,
+                rotor.current.epoch,
+                req.inputs
+                    .iter()
+                    .map(|i| hex::encode(i.note.nonce.0.serialize()))
+                    .collect(),
+            )
+            .map_err(Internal)?;
     }
     for (logic, sk, input, spent) in plan {
         if !spent {
@@ -841,8 +864,7 @@ pub fn rollover(
         }
     }
     if !proven {
-        store.burned.insert(id.clone());
-        store.save().map_err(Internal)?;
+        store.mark_burned(&id).map_err(Internal)?;
     }
     let mut signatures = Vec::new();
     let mut keys = Vec::new();

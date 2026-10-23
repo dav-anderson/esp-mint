@@ -47,9 +47,81 @@ pub const FILE_NAME: &str = "esp-mint.toml";
 pub const FILE_ENV: &str = "ESP_CONFIG";
 /// The default ceiling on one exchange, transfer or admin request body (1 MiB).
 pub const DEFAULT_SMALL_REQUEST_BYTES: usize = 1024 * 1024;
-/// The smallest ceiling accepted for those routes: a request with one note and
-/// one output has to fit.
-pub const MIN_SMALL_REQUEST_BYTES: u64 = 4096;
+
+// ---- the caps ----------------------------------------------------------------
+//
+// Every size ceiling and every fee rate has a hard cap (and a ceiling a floor),
+// checked when the settings load, so that no setting can reach a value that
+// breaks the mint's own routes. The numbers and the reasoning are in DESIGN.md,
+// "Caps on sizes and fees"; the sums are checked at compile time below.
+
+/// The most any request ceiling (`*.max_request_bytes`) may be: 15 MiB, the
+/// largest message AIR carries (16 MiB) less the room kept for the envelope, its
+/// seal and AIR's framing ([`redeem::AIR_ROOM`]). A higher ceiling would let the
+/// mint take a request that no wallet can send.
+pub const MAX_REQUEST_BYTES_CAP: u64 = redeem::DEFAULT_MAX_REQUEST_BYTES as u64;
+/// The least a ceiling on a JSON request (exchange, transfer, rollover, or the
+/// operator's listener) may be: 16 KiB. The largest one-note request is about
+/// 8.1 KB: one note and 64 outputs (one amount splits into at most 64 powers of
+/// two), each at its widest in JSON.
+pub const MIN_SMALL_REQUEST_BYTES: u64 = 16 * 1024;
+/// The least `redeem.max_request_bytes` may be: 12 KiB. A wallet sizes a
+/// redemption for the worst case of 64 decline and 64 refund outputs a service
+/// and day can need, which is 10,803 bytes for one note and no memo, and 11,827
+/// with the longest memo the mint allows ([`MAX_MEMO_BYTES_CAP`]).
+pub const MIN_REDEEM_REQUEST_BYTES: u64 = 12 * 1024;
+/// The longest `redeem.max_memo_bytes` may be.
+pub const MAX_MEMO_BYTES_CAP: u64 = 1024;
+/// The most outputs one amount can need: a `u64` splits into at most 64 powers
+/// of two. The wallet's `MAX_OUTPUTS_PER_TERMS` is the same number.
+pub const MAX_OUTPUTS_ONE_AMOUNT: u64 = 64;
+/// The least `exchange.max_items` and `transfer.max_items` may be: the outputs
+/// one amount can need, so that a one-note request always fits.
+pub const MIN_ITEMS: u64 = MAX_OUTPUTS_ONE_AMOUNT;
+/// The most `*.max_items` may be: 25,000. At about 500 bytes for a note and an
+/// output in JSON (the widest pair is 501) a request of that many is 12.5 MB,
+/// which fits [`MAX_REQUEST_BYTES_CAP`]; a higher count could not.
+pub const MAX_ITEMS_CAP: u64 = 25_000;
+/// The smallest note a fee is held against: 1 PSP of ESP, 10^11 units ($0.10).
+/// That is the smallest exchange the mint takes (`exchange.min_psp` is at least
+/// 1). Smaller ESP notes exist only as the pieces of a larger exchange, and are
+/// worth less than any fee above 0 whatever the rate.
+pub const SMALLEST_NOTE_ESP: u64 = crate::units::ESP_PER_PSP;
+/// The most `exchange.fee_per_byte` and `transfer.fee_per_byte` may be:
+/// 30,000,000 ESP units a byte, which makes the worst one-note request (2,891
+/// canonical bytes) cost 86.7 billion units, under the smallest note.
+pub const EXCHANGE_FEE_CAP: u64 = 30_000_000;
+pub const TRANSFER_FEE_CAP: u64 = 30_000_000;
+/// The most `redeem.fee_per_byte` may be: 8,000,000 ESP units a byte, which
+/// makes the worst one-note redemption (11,827 bytes) cost 94.6 billion units,
+/// under the smallest note.
+pub const REDEEM_FEE_CAP: u64 = 8_000_000;
+
+const _: () = {
+    use sp_wire::esp::redeem as wire;
+    // the worst one-note redemption at the wallet's sizing, with the longest memo
+    let redeem_worst = wire::FIXED_BYTES
+        + wire::INPUT_BYTES
+        + MAX_MEMO_BYTES_CAP
+        + 2 * MAX_OUTPUTS_ONE_AMOUNT * wire::OUTPUT_BYTES;
+    assert!(MIN_REDEEM_REQUEST_BYTES >= redeem_worst);
+    assert!(REDEEM_FEE_CAP * redeem_worst <= SMALLEST_NOTE_ESP);
+    // the worst one-note exchange and transfer, in canonical bytes
+    let exchange_worst = crate::fee::EXCHANGE_FIXED_BYTES
+        + crate::fee::INPUT_BYTES
+        + MAX_OUTPUTS_ONE_AMOUNT * crate::fee::OUTPUT_BYTES;
+    let transfer_worst = crate::fee::TRANSFER_FIXED_BYTES
+        + crate::fee::INPUT_BYTES
+        + MAX_OUTPUTS_ONE_AMOUNT * crate::fee::OUTPUT_BYTES;
+    assert!(EXCHANGE_FEE_CAP * exchange_worst <= SMALLEST_NOTE_ESP);
+    assert!(TRANSFER_FEE_CAP * transfer_worst <= SMALLEST_NOTE_ESP);
+    // a request of the most items fits the largest request ceiling (the widest
+    // JSON note-and-output pair is 501 bytes)
+    assert!(MAX_ITEMS_CAP * 501 < MAX_REQUEST_BYTES_CAP);
+    // the widest JSON request this mint takes, one note and 64 outputs of a
+    // transfer, is 8,056 bytes; the smallest ceiling is twice that, near enough
+    assert!(MIN_SMALL_REQUEST_BYTES >= 2 * 8_056);
+};
 
 /// Settings that were taken out, with the environment variable each had and what
 /// replaces it. A file or an environment that still names one is refused with this
@@ -180,7 +252,7 @@ pub const SPECS: &[Spec] = &[
         default: "1000",
         units: "notes",
         reload: true,
-        what: "The most PSP notes, and the most ESP outputs, in one exchange.",
+        what: "The most PSP notes, and the most ESP outputs, in one exchange. 64 to 25000: at least the 64 outputs one amount can need, at most what fits one AIR message.",
     },
     Spec {
         key: "exchange.min_psp",
@@ -196,7 +268,7 @@ pub const SPECS: &[Spec] = &[
         default: "1048576",
         units: "bytes",
         reload: true,
-        what: "The ceiling on one exchange request body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned, nothing is charged.",
+        what: "The ceiling on one exchange request body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned, nothing is charged. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
         key: "exchange.fee_per_byte",
@@ -204,7 +276,7 @@ pub const SPECS: &[Spec] = &[
         default: "0",
         units: "ESP units per canonical byte",
         reload: true,
-        what: "The exchange fee rate. 0 means no mint fee. If set, a request pays this times its canonical size (48 + 146 per PSP note + 41 per output bytes), paid in ESP on top of the exact amount, at the rate in force when it is accepted; the rate is stored on the reply.",
+        what: "The exchange fee rate. 0 means no mint fee. If set, a request pays this times its canonical size (49 + 146 per PSP note + 41 per output bytes), paid in ESP on top of the exact amount, at the rate in force when it is accepted; the rate is stored on the reply. 0 to 30000000: the cap keeps the worst one-note exchange under the value of the smallest note (1 PSP, 10^11 ESP units).",
     },
     Spec {
         key: "transfer.max_items",
@@ -212,7 +284,7 @@ pub const SPECS: &[Spec] = &[
         default: "1000",
         units: "notes",
         reload: true,
-        what: "The most notes, and the most outputs, in one transfer.",
+        what: "The most notes, and the most outputs, in one transfer. 64 to 25000.",
     },
     Spec {
         key: "transfer.max_request_bytes",
@@ -220,7 +292,7 @@ pub const SPECS: &[Spec] = &[
         default: "1048576",
         units: "bytes",
         reload: true,
-        what: "The ceiling on one transfer request body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned, nothing is charged.",
+        what: "The ceiling on one transfer request body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned, nothing is charged. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
         key: "rollover.max_items",
@@ -228,7 +300,7 @@ pub const SPECS: &[Spec] = &[
         default: "1000",
         units: "notes",
         reload: true,
-        what: "The most notes in one rollover. More is refused before anything is burned.",
+        what: "The most notes in one rollover. More is refused before anything is burned. 1 to 25000.",
     },
     Spec {
         key: "rollover.max_request_bytes",
@@ -236,7 +308,7 @@ pub const SPECS: &[Spec] = &[
         default: "1048576",
         units: "bytes",
         reload: true,
-        what: "The ceiling on one rollover request body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned, nothing is charged.",
+        what: "The ceiling on one rollover request body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned, nothing is charged. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
         key: "transfer.fee_per_byte",
@@ -244,7 +316,7 @@ pub const SPECS: &[Spec] = &[
         default: "0",
         units: "ESP units per canonical byte",
         reload: true,
-        what: "The transfer fee rate. 0 means no mint fee (the AIR send fee covers a transfer). If set, a request pays this times its canonical size (120 + 146 per note + 41 per output bytes), paid in ESP on top of the exact amount, at the rate in force when it is accepted; the rate is stored on the reply.",
+        what: "The transfer fee rate. 0 means no mint fee (the AIR send fee covers a transfer). If set, a request pays this times its canonical size (121 + 146 per note + 41 per output bytes), paid in ESP on top of the exact amount, at the rate in force when it is accepted; the rate is stored on the reply. 0 to 30000000, as for the exchange.",
     },
     Spec {
         key: "redeem.fee_per_byte",
@@ -252,7 +324,7 @@ pub const SPECS: &[Spec] = &[
         default: "0",
         units: "ESP units per encoded byte",
         reload: true,
-        what: "The redemption fee rate. 0 means no mint fee. If set, a request pays this times its encoded size, at the rate in force when it is accepted; the rate is stored on the reply and on the queue entry.",
+        what: "The redemption fee rate. 0 means no mint fee. If set, a request pays this times its encoded size, at the rate in force when it is accepted; the rate is stored on the reply and on the queue entry. 0 to 8000000: the cap keeps the worst one-note redemption (11,827 bytes) under the value of the smallest note (1 PSP, 10^11 ESP units).",
     },
     Spec {
         key: "redeem.max_request_bytes",
@@ -260,7 +332,7 @@ pub const SPECS: &[Spec] = &[
         default: "15728640",
         units: "bytes",
         reload: true,
-        what: "The ceiling on one encoded redemption request (15 MiB: AIR carries at most 16 MiB in one message, so every redemption the mint takes can be sent over AIR; the wallet splits a larger one). A larger body is refused with 413 before it is parsed: no burn, no fee. A higher value does not let a wallet send a larger request: AIR carries no larger message.",
+        what: "The ceiling on one encoded redemption request (15 MiB: AIR carries at most 16 MiB in one message, so every redemption the mint takes can be sent over AIR; the wallet splits a larger one). A larger body is refused with 413 before it is parsed: no burn, no fee. A higher value does not let a wallet send a larger request: AIR carries no larger message, so 15 MiB is also the most this setting takes. 12288 to 15728640: the least is a one-note redemption at the wallet's worst-case sizing (64 decline and 64 refund outputs, 10,803 bytes) with the longest memo the mint allows.",
     },
     Spec {
         key: "redeem.max_memo_bytes",
@@ -284,7 +356,7 @@ pub const SPECS: &[Spec] = &[
         default: "1048576",
         units: "bytes",
         reload: false,
-        what: "The ceiling on one request body on the operator's listener (1 MiB).",
+        what: "The ceiling on one request body on the operator's listener (1 MiB). 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
         key: "queue.max_payment_ref_bytes",
@@ -535,9 +607,9 @@ impl Config {
         range(
             "exchange.max_items",
             self.exchange_max_items as u64,
-            1,
-            100_000,
-            "notes",
+            MIN_ITEMS,
+            MAX_ITEMS_CAP,
+            "notes; at least the 64 outputs one amount can need, and at most what fits one AIR message",
         );
         range(
             "exchange.min_psp",
@@ -549,16 +621,16 @@ impl Config {
         range(
             "transfer.max_items",
             self.transfer_max_items as u64,
-            1,
-            100_000,
-            "notes",
+            MIN_ITEMS,
+            MAX_ITEMS_CAP,
+            "notes; at least the 64 outputs one amount can need, and at most what fits one AIR message",
         );
         range(
             "rollover.max_items",
             self.rollover_max_items as u64,
             1,
-            100_000,
-            "notes",
+            MAX_ITEMS_CAP,
+            "notes; at most what fits one AIR message",
         );
         for (key, value) in [
             (
@@ -579,35 +651,47 @@ impl Config {
                 key,
                 value as u64,
                 MIN_SMALL_REQUEST_BYTES,
-                1 << 30,
-                "bytes; a request with one note and one output has to fit, and 1 GiB is the most the mint will hold in memory",
+                MAX_REQUEST_BYTES_CAP,
+                "bytes; a one-note request with 64 outputs has to fit, and 15 MiB is the most one AIR message carries",
             );
         }
-        for (key, value) in [
-            ("exchange.fee_per_byte", self.exchange_fee_per_byte),
-            ("transfer.fee_per_byte", self.transfer_fee_per_byte),
-            ("redeem.fee_per_byte", self.redeem_fee_per_byte),
+        for (key, value, cap) in [
+            (
+                "exchange.fee_per_byte",
+                self.exchange_fee_per_byte,
+                EXCHANGE_FEE_CAP,
+            ),
+            (
+                "transfer.fee_per_byte",
+                self.transfer_fee_per_byte,
+                TRANSFER_FEE_CAP,
+            ),
+            (
+                "redeem.fee_per_byte",
+                self.redeem_fee_per_byte,
+                REDEEM_FEE_CAP,
+            ),
         ] {
             range(
                 key,
                 value,
                 0,
-                1_000_000_000_000_000,
-                "ESP units per byte; 0 means no fee",
+                cap,
+                "ESP units per byte; 0 means no fee, and the cap keeps a one-note request under the value of the smallest note, 10^11 units",
             );
         }
         range(
             "redeem.max_request_bytes",
             self.redeem_max_request_bytes as u64,
-            redeem::MIN_REQUEST_BYTES,
-            1 << 30,
-            "bytes; the smallest possible request is 290 bytes, and 1 GiB is the most the mint will hold in memory",
+            MIN_REDEEM_REQUEST_BYTES,
+            MAX_REQUEST_BYTES_CAP,
+            "bytes; a one-note redemption at the wallet's worst-case sizing is 11,827 bytes, and 15 MiB is the most one AIR message carries",
         );
         range(
             "redeem.max_memo_bytes",
             self.redeem_max_memo_bytes as u64,
             1,
-            1024,
+            MAX_MEMO_BYTES_CAP,
             "bytes",
         );
         range(
@@ -1161,7 +1245,10 @@ mod tests {
             assert!(!spec.what.is_empty() && !spec.units.is_empty());
         }
         assert!(Config::default().get("nope").is_none());
-        assert!(Config::default().set("nope", "1").is_err());
+        assert_eq!(
+            Config::default().set("nope", "1").unwrap_err(),
+            "unknown setting `nope`"
+        );
     }
 
     #[test]
@@ -1505,7 +1592,13 @@ mod tests {
             "[redeem]\nfee_per_byte = 2000000000000000\n",
         )
         .unwrap();
-        assert!(handle.reload(&dir, &no_env).is_err());
+        let problems = handle.reload(&dir, &no_env).unwrap_err();
+        assert!(
+            problems.iter().any(|p| p.contains(
+                "redeem.fee_per_byte = 2000000000000000 is out of range: it must be from 0 to 8000000"
+            )),
+            "{problems:?}"
+        );
         assert_eq!(handle.current().redeem_fee_per_byte, 5_000_000);
 
         // removing the file puts the defaults back
@@ -1603,15 +1696,15 @@ mod tests {
             &env_of(&[
                 ("ESP_EXCHANGE_MAX_BYTES", "65536"),
                 ("ESP_EXCHANGE_FEE_PER_BYTE", "0"),
-                ("ESP_TRANSFER_MAX_BYTES", "4096"),
-                ("ESP_ROLLOVER_MAX_BYTES", "8192"),
+                ("ESP_TRANSFER_MAX_BYTES", "16384"),
+                ("ESP_ROLLOVER_MAX_BYTES", "32768"),
                 ("ESP_ROLLOVER_MAX_ITEMS", "50"),
             ]),
         )
         .unwrap();
         assert_eq!(fixed.config.exchange_fee_per_byte, 0);
-        assert_eq!(fixed.config.transfer_max_request_bytes, 4096);
-        assert_eq!(fixed.config.rollover_max_request_bytes, 8192);
+        assert_eq!(fixed.config.transfer_max_request_bytes, 16384);
+        assert_eq!(fixed.config.rollover_max_request_bytes, 32768);
         assert_eq!(fixed.config.rollover_max_items, 50);
         fs::write(dir.join(FILE_NAME), "").unwrap();
         let ok = load(
@@ -1637,14 +1730,14 @@ mod tests {
         assert_eq!(before.exchange_settings().fee_per_byte, 0);
         fs::write(
             dir.join(FILE_NAME),
-            "[exchange]\nfee_per_byte = 5\nmax_request_bytes = 8192\n[transfer]\nfee_per_byte = 6\n",
+            "[exchange]\nfee_per_byte = 5\nmax_request_bytes = 32768\n[transfer]\nfee_per_byte = 6\n",
         )
         .unwrap();
         let lines = handle.reload(&dir, &no_env).unwrap();
         let after = handle.current();
         assert_eq!(after.exchange_settings().fee_per_byte, 5);
         assert_eq!(after.transfer_settings().fee_per_byte, 6);
-        assert_eq!(after.exchange_max_request_bytes, 8192);
+        assert_eq!(after.exchange_max_request_bytes, 32768);
         assert!(
             lines
                 .iter()
@@ -1653,6 +1746,106 @@ mod tests {
         // the settings a request already took are not touched
         assert_eq!(before.exchange_settings().fee_per_byte, 0);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- the caps: a value past one is refused when the settings load ----
+
+    /// A settings file that sets `key` (`section.name`) to `value` is refused at
+    /// load, and the message names the setting, the value and the range.
+    fn refused_at_load(key: &str, value: u64, range: &str) {
+        let (section, name) = key.split_once('.').unwrap();
+        let dir = scratch(&format!("cap-{section}-{name}-{value}"));
+        fs::write(
+            dir.join(FILE_NAME),
+            format!("[{section}]\n{name} = {value}\n"),
+        )
+        .unwrap();
+        let problems = load(&dir, &no_env).unwrap_err();
+        let want = format!("{key} = {value} is out of range: it must be from {range} (");
+        assert!(problems.iter().any(|p| p.contains(&want)), "{problems:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn exchange_max_items_past_its_cap_is_refused_at_load() {
+        refused_at_load("exchange.max_items", 25_001, "64 to 25000");
+        refused_at_load("exchange.max_items", 63, "64 to 25000");
+    }
+
+    #[test]
+    fn transfer_max_items_past_its_cap_is_refused_at_load() {
+        refused_at_load("transfer.max_items", 25_001, "64 to 25000");
+        refused_at_load("transfer.max_items", 63, "64 to 25000");
+    }
+
+    #[test]
+    fn rollover_max_items_past_its_cap_is_refused_at_load() {
+        refused_at_load("rollover.max_items", 25_001, "1 to 25000");
+    }
+
+    #[test]
+    fn exchange_max_request_bytes_past_its_cap_is_refused_at_load() {
+        refused_at_load(
+            "exchange.max_request_bytes",
+            15_728_641,
+            "16384 to 15728640",
+        );
+        refused_at_load("exchange.max_request_bytes", 16_383, "16384 to 15728640");
+    }
+
+    #[test]
+    fn transfer_max_request_bytes_past_its_cap_is_refused_at_load() {
+        refused_at_load(
+            "transfer.max_request_bytes",
+            15_728_641,
+            "16384 to 15728640",
+        );
+        refused_at_load("transfer.max_request_bytes", 16_383, "16384 to 15728640");
+    }
+
+    #[test]
+    fn rollover_max_request_bytes_past_its_cap_is_refused_at_load() {
+        refused_at_load(
+            "rollover.max_request_bytes",
+            15_728_641,
+            "16384 to 15728640",
+        );
+        refused_at_load("rollover.max_request_bytes", 16_383, "16384 to 15728640");
+    }
+
+    #[test]
+    fn admin_max_request_bytes_past_its_cap_is_refused_at_load() {
+        refused_at_load("admin.max_request_bytes", 15_728_641, "16384 to 15728640");
+        refused_at_load("admin.max_request_bytes", 16_383, "16384 to 15728640");
+    }
+
+    #[test]
+    fn redeem_max_request_bytes_past_its_cap_is_refused_at_load() {
+        // above what one AIR message carries, and below one note at the
+        // wallet's worst-case sizing (10,803 bytes and the longest memo)
+        refused_at_load("redeem.max_request_bytes", 15_728_641, "12288 to 15728640");
+        refused_at_load("redeem.max_request_bytes", 12_287, "12288 to 15728640");
+    }
+
+    #[test]
+    fn redeem_max_memo_bytes_past_its_cap_is_refused_at_load() {
+        // the memo is part of the redemption a wallet sizes for
+        refused_at_load("redeem.max_memo_bytes", 1_025, "1 to 1024");
+    }
+
+    #[test]
+    fn exchange_fee_per_byte_past_its_cap_is_refused_at_load() {
+        refused_at_load("exchange.fee_per_byte", 30_000_001, "0 to 30000000");
+    }
+
+    #[test]
+    fn transfer_fee_per_byte_past_its_cap_is_refused_at_load() {
+        refused_at_load("transfer.fee_per_byte", 30_000_001, "0 to 30000000");
+    }
+
+    #[test]
+    fn redeem_fee_per_byte_past_its_cap_is_refused_at_load() {
+        refused_at_load("redeem.fee_per_byte", 8_000_001, "0 to 8000000");
     }
 }
 
@@ -1667,14 +1860,21 @@ mod network_tests {
         c.set("server.network", "mainnet").unwrap();
         assert_eq!(c.get("server.network").as_deref(), Some("main"));
         c.set("server.network", "regtest").unwrap();
-        assert!(c.set("server.network", "moon").is_err());
+        assert_eq!(
+            c.set("server.network", "moon").unwrap_err(),
+            "`moon` is not a network: use main, regtest, signet or testnet"
+        );
         assert_eq!(check_psp_network("regtest", Some("regtest")), Ok(()));
         let e = check_psp_network("main", Some("regtest")).unwrap_err();
         assert!(
             e.contains("Refusing to start") && e.contains("regtest"),
             "{e}"
         );
-        assert!(check_psp_network("main", None).is_err());
+        let e = check_psp_network("main", None).unwrap_err();
+        assert!(
+            e.contains("does not say which network it is on") && e.contains("main"),
+            "{e}"
+        );
         let spec = SPECS.iter().find(|s| s.key == "server.network").unwrap();
         assert_eq!(
             (spec.env, spec.default, spec.reload),

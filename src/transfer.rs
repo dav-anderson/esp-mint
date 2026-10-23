@@ -50,7 +50,6 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
-use mint_core::MintLogic;
 use mint_types::MintOutputError;
 #[cfg(test)]
 use mint_types::{MintInput, MintOutput};
@@ -62,7 +61,6 @@ use sp_wire::ServiceDid;
 
 use crate::exchange::MAX_ITEMS;
 use crate::fee;
-use crate::keys::MasterSecret;
 use crate::ledger::Movements;
 use crate::responses::{Entry, Responses, TransferPending};
 use crate::rotation::Gens;
@@ -115,9 +113,9 @@ pub enum TransferRejection {
     BadSpendSignature {
         index: usize,
     },
-    /// An input is already spent.
+    /// These inputs are already spent: every one of them, in order.
     AlreadySpent {
-        index: usize,
+        indexes: Vec<usize>,
     },
     /// An input or an output blind nonce is held by another transfer that has
     /// not finished.
@@ -203,9 +201,13 @@ impl fmt::Display for TransferRejection {
                 f,
                 "the spend signature of note {index} does not cover this request"
             ),
-            TransferRejection::AlreadySpent { index } => {
-                write!(f, "note {index} is already spent")
-            }
+            TransferRejection::AlreadySpent { indexes } => match indexes.as_slice() {
+                [one] => write!(f, "note {one} is already spent"),
+                many => {
+                    let list: Vec<String> = many.iter().map(|i| i.to_string()).collect();
+                    write!(f, "notes {} are already spent", list.join(", "))
+                }
+            },
             TransferRejection::NoteHeld => write!(
                 f,
                 "a note or an output in this request is held by another transfer that has not finished"
@@ -368,36 +370,9 @@ impl Default for TransferSettings {
     }
 }
 
-/// Run a transfer with the default settings.
-pub fn transfer(
-    logic: &MintLogic,
-    master: &MasterSecret,
-    responses: &mut Responses,
-    request: &TransferRequest,
-) -> Result<TransferResponse, TransferError> {
-    transfer_with(
-        logic,
-        master,
-        responses,
-        request,
-        &TransferSettings::default(),
-    )
-}
-
-/// Run a transfer with the mint's settings.
-pub fn transfer_with(
-    logic: &MintLogic,
-    master: &MasterSecret,
-    responses: &mut Responses,
-    request: &TransferRequest,
-    settings: &TransferSettings,
-) -> Result<TransferResponse, TransferError> {
-    transfer_gens(&Gens::only(logic, master), responses, request, settings)
-}
-
-/// Run a transfer over both live key sets: each input is checked and burned
-/// in the set that signed it (current or previous), and the outputs are signed
-/// with the current set, under the same terms.
+/// Run a transfer with the mint's settings, over both live key sets: each
+/// input is checked and burned in the set that signed it (current or previous),
+/// and the outputs are signed with the current set, under the same terms.
 pub fn transfer_gens(
     gens: &Gens,
     responses: &mut Responses,
@@ -508,7 +483,7 @@ pub fn transfer_gens(
         //    reservations below have been looked at, because a note that is
         //    spent may be spent by an unfinished request, and then "held" is the
         //    truer answer.
-        let mut spent_index = None;
+        let mut spent_indexes = Vec::new();
         for (index, input) in request.inputs.iter().enumerate() {
             if in_keys[index]
                 .as_ref()
@@ -517,8 +492,7 @@ pub fn transfer_gens(
                 .is_spent(input.note.nonce)
                 .map_err(internal)?
             {
-                spent_index = Some(index);
-                break;
+                spent_indexes.push(index);
             }
         }
         let mut blind_nonce_used = false;
@@ -567,8 +541,11 @@ pub fn transfer_gens(
         {
             return Err(TransferRejection::NoteHeld.into());
         }
-        if let Some(index) = spent_index {
-            return Err(TransferRejection::AlreadySpent { index }.into());
+        if !spent_indexes.is_empty() {
+            return Err(TransferRejection::AlreadySpent {
+                indexes: spent_indexes,
+            }
+            .into());
         }
         if blind_nonce_used {
             return Err(TransferRejection::BlindNonceAlreadyUsed.into());
@@ -655,10 +632,12 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use mint_core::MintLogic;
     use mint_types::{Amount, BlindNonce, Nonce, Note};
     use rand::rngs::OsRng;
     use secp256k1::{Keypair, SecretKey};
 
+    use crate::keys::MasterSecret;
     use crate::ledger::Day;
 
     const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -702,6 +681,7 @@ mod tests {
 
     struct Setup {
         dir: PathBuf,
+        rotor: crate::rotation::Rotor,
         logic: MintLogic,
         master: MasterSecret,
         responses: Responses,
@@ -718,11 +698,13 @@ mod tests {
 
     fn setup(name: &str) -> Setup {
         let dir = scratch(name);
-        let (logic, master) = crate::mint::open(&dir.join("esp")).unwrap();
-        KS.with(|k| *k.borrow_mut() = crate::rotation::keyset_id(&master));
+        let (rotor, logic) = crate::rotation::Rotor::open_at(&dir.join("esp"), 1, 1, NOW).unwrap();
+        let master = rotor.current.master.clone();
+        KS.with(|k| *k.borrow_mut() = rotor.current.id.clone());
         let responses = Responses::open(&dir.join("esp").join("responses.json")).unwrap();
         Setup {
             dir,
+            rotor,
             logic,
             master,
             responses,
@@ -765,7 +747,21 @@ mod tests {
         }
 
         fn run(&mut self, request: &TransferRequest) -> Result<TransferResponse, TransferError> {
-            transfer(&self.logic, &self.master, &mut self.responses, request)
+            self.run_with(request, &TransferSettings::default())
+        }
+
+        /// The transfer, as the server runs it, under these settings.
+        fn run_with(
+            &mut self,
+            request: &TransferRequest,
+            settings: &TransferSettings,
+        ) -> Result<TransferResponse, TransferError> {
+            transfer_gens(
+                &self.rotor.gens(&self.logic),
+                &mut self.responses,
+                request,
+                settings,
+            )
         }
 
         /// (issued, redeemed) ESP units.
@@ -945,14 +941,6 @@ mod tests {
     }
 
     #[test]
-    fn the_test_service_key_is_the_generator() {
-        assert_eq!(ServiceDid::from(service_keypair().public_key()), service());
-        assert_ne!(ServiceDid::from(other_keypair().public_key()), service());
-        // what a signature is checked against is the DID's x-only key
-        assert_eq!(service().x_only(), service_keypair().x_only_public_key().0);
-    }
-
-    #[test]
     fn a_transfer_swaps_the_notes_for_new_ones_with_the_same_terms() {
         let mut s = setup("happy");
         let (a, ka) = s.esp_note(2 * ONE_PSP, service(), DAY);
@@ -1122,13 +1110,7 @@ mod tests {
         // The exact amount with no fee on top is refused under a fee, and says
         // what the fee is. Nothing is burned.
         let (request, _) = build(&[(a, &ka, ONE_PSP)], &[ONE_PSP]);
-        match rejection(transfer_with(
-            &s.logic,
-            &s.master,
-            &mut s.responses,
-            &request,
-            &with_fee,
-        )) {
+        match rejection(s.run_with(&request, &with_fee)) {
             TransferRejection::NotExactWithFee {
                 fee,
                 size_bytes,
@@ -1153,8 +1135,7 @@ mod tests {
             .unwrap();
         let (request, _) = build_exact(&[(a, &ka, ONE_PSP)], &split_into(rest, n));
         assert_eq!(request.outputs.len(), n);
-        let response =
-            transfer_with(&s.logic, &s.master, &mut s.responses, &request, &with_fee).unwrap();
+        let response = s.run_with(&request, &with_fee).unwrap();
         assert_eq!(
             (response.fee_per_byte, response.fee_esp, response.size_bytes),
             (rate, fee_esp, size)
@@ -1164,7 +1145,7 @@ mod tests {
             fee_per_byte: rate * 5,
             ..TransferSettings::default()
         };
-        let again = transfer_with(&s.logic, &s.master, &mut s.responses, &request, &later).unwrap();
+        let again = s.run_with(&request, &later).unwrap();
         assert_eq!(again, response);
         fs::remove_dir_all(&s.dir).unwrap();
     }
@@ -1404,7 +1385,7 @@ mod tests {
         let (second, _) = build(&[(a, &ka, ONE_PSP)], &[ONE_PSP]);
         assert_eq!(
             rejection(s.run(&second)),
-            TransferRejection::AlreadySpent { index: 0 }
+            TransferRejection::AlreadySpent { indexes: vec![0] }
         );
         assert_eq!(s.totals(), totals);
         fs::remove_dir_all(&s.dir).unwrap();
@@ -1530,7 +1511,7 @@ mod tests {
         s.run(&first).unwrap();
         assert_eq!(
             rejection(s.run(&second)),
-            TransferRejection::AlreadySpent { index: 0 }
+            TransferRejection::AlreadySpent { indexes: vec![0] }
         );
         fs::remove_dir_all(&s.dir).unwrap();
     }
@@ -1676,110 +1657,6 @@ mod tests {
     }
 
     #[test]
-    fn the_digest_covers_every_field_and_not_the_signatures() {
-        let (a, b) = (fake_input(5), fake_input(6));
-        let out = fake_output(11);
-        let base = digest(
-            &service(),
-            DAY,
-            &[a.clone(), b.clone()],
-            std::slice::from_ref(&out),
-        );
-        let other = ServiceDid::from(other_keypair().public_key());
-        assert_ne!(
-            base,
-            digest(
-                &other,
-                DAY,
-                &[a.clone(), b.clone()],
-                std::slice::from_ref(&out)
-            )
-        );
-        assert_ne!(
-            base,
-            digest(
-                &service(),
-                DAY + 1,
-                &[a.clone(), b.clone()],
-                std::slice::from_ref(&out)
-            )
-        );
-        assert_ne!(
-            base,
-            digest(
-                &service(),
-                DAY,
-                &[b.clone(), a.clone()],
-                std::slice::from_ref(&out)
-            )
-        );
-        assert_ne!(
-            base,
-            digest(
-                &service(),
-                DAY,
-                std::slice::from_ref(&a),
-                std::slice::from_ref(&out)
-            )
-        );
-        assert_ne!(
-            base,
-            digest(&service(), DAY, &[a.clone(), b.clone()], &[fake_output(11)])
-        );
-        let mut a2 = a.clone();
-        a2.amount = Amount::from_units(6);
-        assert_ne!(
-            base,
-            digest(
-                &service(),
-                DAY,
-                &[a2, b.clone()],
-                std::slice::from_ref(&out)
-            )
-        );
-        // the spend signature is not part of the digest
-        let mut signed = a.clone();
-        signed.spend_signature = SECP256K1.sign_schnorr(&base, &other_keypair());
-        assert_eq!(base, digest(&service(), DAY, &[signed, b], &[out]));
-    }
-
-    #[test]
-    fn the_request_hash_covers_the_signatures() {
-        let s = setup("hash");
-        let (a, ka) = s.esp_note(ONE_PSP, service(), DAY);
-        let (request, _) = build(&[(a, &ka, ONE_PSP)], &[ONE_PSP]);
-        let hash = request_hash(&request);
-        assert_eq!(hash, request_hash(&request.clone()));
-
-        let mut other_service_sig = request.clone();
-        other_service_sig.service_signature =
-            SECP256K1.sign_schnorr(&request.digest(), &other_keypair());
-        assert_ne!(hash, request_hash(&other_service_sig));
-
-        let mut other_spend_sig = request.clone();
-        other_spend_sig.inputs[0].spend_signature =
-            SECP256K1.sign_schnorr(&request.digest(), &other_keypair());
-        assert_ne!(hash, request_hash(&other_spend_sig));
-
-        // the digest is the same in all three
-        assert_eq!(request.digest(), other_service_sig.digest());
-        assert_eq!(request.digest(), other_spend_sig.digest());
-        fs::remove_dir_all(&s.dir).unwrap();
-    }
-
-    #[test]
-    fn a_request_survives_json() {
-        let s = setup("json");
-        let (a, ka) = s.esp_note(ONE_PSP, service(), DAY);
-        let (request, _) = build(&[(a, &ka, ONE_PSP)], &[ONE_PSP]);
-        let text = serde_json::to_string(&request).unwrap();
-        let back: TransferRequest = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.digest(), request.digest());
-        assert_eq!(request_hash(&back), request_hash(&request));
-        fs::remove_dir_all(&s.dir).unwrap();
-    }
-
-    #[test]
     fn a_finished_transfer_is_counted_once_in_the_ledger_under_the_notes_day() {
         let mut s = setup("ledger");
         let (a, ka) = s.esp_note(2 * ONE_PSP, service(), DAY);
@@ -1825,7 +1702,7 @@ mod tests {
             })
             .unwrap();
         let (request, _) = build_exact(&[(a, &ka, ONE_PSP)], &split_into(rest, n));
-        transfer_with(&s.logic, &s.master, &mut s.responses, &request, &with_fee).unwrap();
+        s.run_with(&request, &with_fee).unwrap();
         let day = s.responses.ledger().day(DAY);
         assert_eq!(day.redeemed, u128::from(ONE_PSP));
         assert_eq!(day.issued, u128::from(rest));

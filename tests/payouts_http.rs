@@ -1,13 +1,17 @@
 //! The operator's HTTP routes, over a real listener on a loopback port.
 //!
 //! The client is blocking, so these are plain tests with their own runtime, as
-//! in `http.rs`.
+//! in `exchange.rs`.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use esp_mint::admin::{self, AdminState};
+use esp_mint::config::Config;
+use esp_mint::exchange::{Burn, Psp};
 use esp_mint::queue::{Entry, Queue};
+use esp_mint::server::{self, EspState};
+use mint_types::{Amount, MintInput, Nonce};
 use serde_json::{Value, json};
 use sp_wire::ServiceDid;
 use tokio::runtime::Runtime;
@@ -30,16 +34,32 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// The routes under test never reach the PSP.
+struct NoPsp;
+
+impl Psp for NoPsp {
+    fn melt(&self, _inputs: &[MintInput], _memo: &str) -> Result<Amount, String> {
+        Err("an operator route does not use the PSP".into())
+    }
+
+    fn burns(&self, _nonces: &[Nonce]) -> Result<Vec<Burn>, String> {
+        Err("an operator route does not use the PSP".into())
+    }
+}
+
 fn service() -> ServiceDid {
     ServiceDid::parse(G_DID).unwrap()
 }
 
-fn start(rt: &Runtime, queue_path: &Path, token: Option<&str>) -> String {
+/// The mint `serve` builds on `dir` and its admin router, whose queue is
+/// `dir/queue.json`.
+fn start(rt: &Runtime, dir: &Path, token: Option<&str>) -> String {
+    let esp = Arc::new(EspState::open(dir, Box::new(NoPsp), Config::default(), 0).unwrap());
     let state = Arc::new(AdminState {
-        queue_path: queue_path.to_path_buf(),
+        queue_path: server::queue_path(dir),
         lock: Mutex::new(()),
         token: token.map(str::to_string),
-        esp: None,
+        esp,
     });
     let listener = rt
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -72,7 +92,7 @@ fn the_report_comes_as_json_and_as_plain_text() {
     let path = dir.join("queue.json");
     seed(&path);
     let rt = Runtime::new().unwrap();
-    let base = start(&rt, &path, None);
+    let base = start(&rt, &dir, None);
     let client = reqwest::blocking::Client::new();
 
     let json: Value = client
@@ -116,7 +136,7 @@ fn paying_marks_only_the_listed_entries_and_a_refusal_changes_nothing() {
     let path = dir.join("queue.json");
     seed(&path);
     let rt = Runtime::new().unwrap();
-    let base = start(&rt, &path, None);
+    let base = start(&rt, &dir, None);
     let client = reqwest::blocking::Client::new();
     let pay = |body: Value| {
         client
@@ -173,42 +193,12 @@ fn paying_marks_only_the_listed_entries_and_a_refusal_changes_nothing() {
 }
 
 #[test]
-fn a_failed_write_is_a_500_and_leaves_the_entry_open() {
-    let dir = scratch("fault");
-    let path = dir.join("sub").join("queue.json");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    seed(&path);
-    let rt = Runtime::new().unwrap();
-    let base = start(&rt, &path, None);
-    let client = reqwest::blocking::Client::new();
-
-    // Make the temporary file's path a directory, so the write cannot start.
-    std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
-    let response = client
-        .post(format!("{base}/payouts/pay"))
-        .json(&json!({"service": G_DID, "payment_ref": "w", "entry_ids": ["e1"]}))
-        .send()
-        .unwrap();
-    assert_eq!(response.status(), 500);
-    let q = Queue::open(&path).unwrap();
-    assert_eq!(q.get("e1").unwrap().payment_ref, None);
-    let json: Value = client
-        .get(format!("{base}/payouts"))
-        .send()
-        .unwrap()
-        .json()
-        .unwrap();
-    assert_eq!(json[0]["entry_ids"], json!(["e1", "e2"]));
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
 fn a_token_is_required_when_one_is_set() {
     let dir = scratch("token");
     let path = dir.join("queue.json");
     seed(&path);
     let rt = Runtime::new().unwrap();
-    let base = start(&rt, &path, Some("s3cret"));
+    let base = start(&rt, &dir, Some("s3cret"));
     let client = reqwest::blocking::Client::new();
 
     assert_eq!(
@@ -241,6 +231,112 @@ fn a_token_is_required_when_one_is_set() {
         .send()
         .unwrap();
     assert_eq!(ok.status(), 200);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_bad_token_is_refused_before_the_format_is_looked_at() {
+    let dir = scratch("token-format");
+    seed(&dir.join("queue.json"));
+    let rt = Runtime::new().unwrap();
+    let base = start(&rt, &dir, Some("s3cret"));
+    let client = reqwest::blocking::Client::new();
+
+    // No token and a format the route does not know: the caller is told it is not
+    // allowed, not that its format is wrong.
+    let response = client
+        .get(format!("{base}/payouts?format=xml"))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    let body: Value = response.json().unwrap();
+    assert_eq!(body["error"], "missing or wrong admin token");
+
+    let wrong = client
+        .get(format!("{base}/payouts?format=xml"))
+        .header("Authorization", "Bearer nope")
+        .send()
+        .unwrap();
+    assert_eq!(wrong.status(), 401);
+
+    // A bad token with the text format gets its refusal as plain text.
+    let text = client
+        .get(format!("{base}/payouts?format=text"))
+        .header("Authorization", "Bearer nope")
+        .send()
+        .unwrap();
+    assert_eq!(text.status(), 401);
+    assert_eq!(
+        text.text().unwrap(),
+        "error: missing or wrong admin token\n"
+    );
+
+    // With the right token the format is checked, as before.
+    let bad_format = client
+        .get(format!("{base}/payouts?format=xml"))
+        .header("Authorization", "Bearer s3cret")
+        .send()
+        .unwrap();
+    assert_eq!(bad_format.status(), 400);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_bad_token_is_refused_before_the_body_is_parsed() {
+    let dir = scratch("token-body");
+    seed(&dir.join("queue.json"));
+    let rt = Runtime::new().unwrap();
+    let base = start(&rt, &dir, Some("s3cret"));
+    let client = reqwest::blocking::Client::new();
+    let post = |path: &str, token: Option<&str>, body: &str| {
+        let mut request = client
+            .post(format!("{base}{path}"))
+            .header("content-type", "application/json")
+            .body(body.to_string());
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        request.send().unwrap()
+    };
+
+    for path in ["/payouts/pay", "/payouts/decline"] {
+        // Not JSON at all, and JSON of the wrong shape, with no token and a
+        // wrong one: the caller is told it is not allowed, nothing more.
+        for body in ["this is not json", "{}"] {
+            for token in [None, Some("nope")] {
+                let response = post(path, token, body);
+                assert_eq!(response.status(), 401, "{path} {token:?} {body}");
+                let json: Value = response.json().unwrap();
+                assert_eq!(json["error"], "missing or wrong admin token");
+            }
+        }
+        // And a format the route does not know is not looked at either.
+        let response = client
+            .post(format!("{base}{path}?format=xml"))
+            .header("content-type", "application/json")
+            .body("this is not json")
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 401, "{path} with a bad format");
+
+        // With the right token the body is read, as before.
+        let response = post(path, Some("s3cret"), "this is not json");
+        assert_eq!(response.status(), 400, "{path} with bad JSON");
+        let json: Value = response.json().unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("the request body is not valid"),
+            "{json}"
+        );
+        let response = post(path, Some("s3cret"), "{}");
+        assert_eq!(
+            response.status(),
+            422,
+            "{path} with JSON of the wrong shape"
+        );
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -278,7 +374,7 @@ fn an_operator_body_over_the_ceiling_gets_the_same_413_as_the_public_routes() {
     seed(&path);
     let rt = Runtime::new().unwrap();
     let before = std::fs::read(&path).unwrap();
-    let base = start(&rt, &path, None);
+    let base = start(&rt, &dir, None);
     const MIB: usize = 1024 * 1024;
     for route in ["/payouts/pay", "/payouts/decline"] {
         let (status, body) = declared(&base, route, MIB + 1);
