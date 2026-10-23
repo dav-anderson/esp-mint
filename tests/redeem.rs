@@ -1026,9 +1026,9 @@ fn transfer_req(note: &(Note, Keypair), units: u64) -> esp_mint::transfer::Trans
 
 /// After one rotation: (generation 0's id, the current id).
 fn rotate_once(mint: &Mint) -> (String, String) {
-    esp_get_json(&mint, "/rotation");
+    esp_get_json(mint, "/rotation");
     set_clock(mint, T0 + 3600);
-    let w = esp_get_json(&mint, "/rotation");
+    let w = esp_get_json(mint, "/rotation");
     (
         w["previous"]["id"].as_str().unwrap().to_string(),
         w["current"]["id"].as_str().unwrap().to_string(),

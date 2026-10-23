@@ -4,7 +4,9 @@
 //! in `exchange.rs`.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use esp_mint::admin::{self, AdminState};
 use esp_mint::config::Config;
@@ -429,4 +431,143 @@ fn an_operator_body_over_the_ceiling_gets_the_same_413_as_the_public_routes() {
     assert_ne!(response.status().as_u16(), 413);
     assert_eq!(std::fs::read(&path).unwrap(), before);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// What one run of the `esp-mint` binary printed and how it ended.
+struct Ran {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run `esp-mint args` as the operator does: an empty environment but the data
+/// folder `data`, the operator's listener at `base` (as `ESP_ADMIN_BIND`) and
+/// the admin token, when there is one.
+fn esp_mint(data: &Path, base: &str, token: Option<&str>, args: &[&str]) -> Ran {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_esp-mint"));
+    command
+        .args(args)
+        .env_clear()
+        .env("ESP_DATA_DIR", data)
+        .env("ESP_ADMIN_BIND", base.trim_start_matches("http://"));
+    if let Some(token) = token {
+        command.env("ESP_ADMIN_TOKEN", token);
+    }
+    let out = command
+        .stdin(Stdio::null())
+        .output()
+        .expect("the esp-mint binary runs");
+    Ran {
+        code: out.status.code(),
+        stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr: String::from_utf8(out.stderr).unwrap(),
+    }
+}
+
+/// A data folder whose `main` folder (the default network's) holds the queue
+/// `serve` works on, with two open entries; and the operator's listener over it.
+fn data_with_serve(rt: &Runtime, name: &str, token: Option<&str>) -> (PathBuf, String) {
+    let data = scratch(name);
+    let net = data.join("main");
+    std::fs::create_dir_all(&net).unwrap();
+    seed(&server::queue_path(&net));
+    let base = start(rt, &net, token);
+    (data, base)
+}
+
+#[test]
+fn the_pay_command_settles_through_the_running_serve_and_sends_its_token() {
+    let rt = Runtime::new().unwrap();
+    let (data, base) = data_with_serve(&rt, "cli-pay", Some("s3cret"));
+    let queue = server::queue_path(&data.join("main"));
+    let payment_refs = || -> Vec<Option<String>> {
+        let q = Queue::open(&queue).unwrap();
+        ["e1", "e2"]
+            .map(|id| q.get(id).unwrap().payment_ref.clone())
+            .to_vec()
+    };
+
+    // Without the token serve refuses, and the entries stay open.
+    let ran = esp_mint(&data, &base, None, &["pay", G_DID, "wire-1", "e1", "e2"]);
+    assert_eq!((ran.code, ran.stdout.as_str()), (Some(1), ""));
+    assert!(
+        ran.stderr
+            .ends_with("error: missing or wrong admin token\n"),
+        "{}",
+        ran.stderr
+    );
+    assert_eq!(payment_refs(), [None, None]);
+
+    // An entry serve does not know is serve's refusal, word for word.
+    let ran = esp_mint(&data, &base, Some("s3cret"), &["pay", G_DID, "w0", "nope"]);
+    assert_eq!((ran.code, ran.stdout.as_str()), (Some(1), ""));
+    assert!(
+        ran.stderr.ends_with("error: no entry nope\n"),
+        "{}",
+        ran.stderr
+    );
+    assert_eq!(payment_refs(), [None, None]);
+
+    // With it, serve settles both entries under the reference.
+    let ran = esp_mint(
+        &data,
+        &base,
+        Some("s3cret"),
+        &["pay", G_DID, "wire-1", "e1", "e2"],
+    );
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+    assert_eq!(
+        ran.stdout,
+        format!(
+            "marked 2 entries completed for {G_DID}: 15.000000000000 USD (15000000000000 ESP), payment reference wire-1\n"
+        )
+    );
+    assert_eq!(
+        payment_refs(),
+        [Some("wire-1".to_string()), Some("wire-1".to_string())]
+    );
+    std::fs::remove_dir_all(&data).unwrap();
+}
+
+#[test]
+fn two_pays_of_the_same_entries_at_once_settle_them_once() {
+    let rt = Runtime::new().unwrap();
+    let (data, base) = data_with_serve(&rt, "cli-pay-twice", None);
+    let racers = ["wire-a", "wire-b"].map(|payment_ref| {
+        let (data, base) = (data.clone(), base.clone());
+        thread::spawn(move || {
+            esp_mint(&data, &base, None, &["pay", G_DID, payment_ref, "e1", "e2"])
+        })
+    });
+    let ran: Vec<Ran> = racers.into_iter().map(|t| t.join().unwrap()).collect();
+
+    // Exactly one of them settled; the other was told the entry is not open.
+    let winners: Vec<usize> = (0..2).filter(|&i| ran[i].code == Some(0)).collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "{:?}",
+        ran.iter().map(|r| &r.stderr).collect::<Vec<_>>()
+    );
+    let (won, lost) = (winners[0], 1 - winners[0]);
+    assert_eq!(ran[lost].code, Some(1));
+    assert_eq!(ran[lost].stdout, "");
+    assert!(
+        ran[lost]
+            .stderr
+            .ends_with("error: entry e1 is not open (it is Completed)\n"),
+        "{}",
+        ran[lost].stderr
+    );
+    let winning_ref = ["wire-a", "wire-b"][won];
+    assert!(
+        ran[won]
+            .stdout
+            .ends_with(&format!("payment reference {winning_ref}\n"))
+    );
+    let q = Queue::open(&server::queue_path(&data.join("main"))).unwrap();
+    for id in ["e1", "e2"] {
+        assert_eq!(q.get(id).unwrap().payment_ref.as_deref(), Some(winning_ref));
+    }
+    std::fs::remove_dir_all(&data).unwrap();
 }

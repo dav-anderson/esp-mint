@@ -20,12 +20,21 @@
 //! read from `ESP_ADMIN_TOKEN` only; it is never in the file.
 //!
 //! Reloading: send the running mint `SIGHUP`. It reads the file and the
-//! environment again, checks the result, and swaps it in all at once, or keeps
-//! the old values and says why. A request already running finishes with the
-//! values it started with, and every request is charged at the rate in force
-//! when it was accepted. The settings marked "restart" in `SPECS` (addresses and
-//! the PSP client) are read once and are not changed by a reload: the mint says
-//! so, and the new value takes effect at the next start.
+//! environment again, checks the result, and applies it without stopping, or
+//! keeps the old values and says why. A request already running finishes with
+//! the values it started with, and every request is charged at the rate in force
+//! when it was accepted. Each setting is one of two kinds (`reload` in `SPECS`):
+//!
+//! - **live**: swapped in at once, for the next request;
+//! - **needs a restart** (`reload` false: the addresses, the network, the PSP
+//!   address, rotation, the storage list, the AIR settings and the admin body
+//!   ceiling): these shape something that is opened once when a process starts (a
+//!   socket, the databases, the AIR connection), so they cannot be swapped under a
+//!   running request. A `SIGHUP` that changes one names it in the log; the old
+//!   value stays in force until the mint is restarted, which is a brief downtime.
+//!
+//! A reload stops nothing and refuses no connection. `spi reload` sends the
+//! `SIGHUP`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -211,7 +220,7 @@ pub const SPECS: &[Spec] = &[
         env: "ESP_PSP_TIMEOUT_SECS",
         default: "30",
         units: "seconds",
-        reload: false,
+        reload: true,
         what: "How long a call to the PSP may take before the exchange fails and can be retried.",
     },
     Spec {
@@ -219,7 +228,7 @@ pub const SPECS: &[Spec] = &[
         env: "ESP_PSP_STARTUP_RETRY_SECS",
         default: "5",
         units: "seconds",
-        reload: false,
+        reload: true,
         what: "At startup the mint asks the PSP which network it is on. If the PSP cannot be reached, the mint waits this long and asks again, for as long as it takes, so that starting the mint before the PSP (or after a power cut) needs no one to start it again. A PSP that answers with another network, or with none, is not waited for: the mint stops with a message.",
     },
     Spec {
@@ -749,18 +758,18 @@ impl Config {
         // What is set is checked when the settings load; that both are set is
         // checked by `serve` (`require_air`), so the other commands do not need
         // them.
-        if !self.air_server.is_empty() {
-            if let Err(e) = sp_wire::seal::parse_public_key(&self.air_server) {
-                problems.push(format!(
-                    "air.server = `{}` is not an AIR server name (a public key of 66 hex characters): {e}",
-                    self.air_server
-                ));
-            }
+        if !self.air_server.is_empty()
+            && let Err(e) = sp_wire::seal::parse_public_key(&self.air_server)
+        {
+            problems.push(format!(
+                "air.server = `{}` is not an AIR server name (a public key of 66 hex characters): {e}",
+                self.air_server
+            ));
         }
-        if !self.air_host.is_empty() {
-            if let Some(why) = sp_wire::air_request::host_problem(&self.air_host) {
-                problems.push(format!("air.host = `{}` {why}", self.air_host));
-            }
+        if !self.air_host.is_empty()
+            && let Some(why) = sp_wire::air_request::host_problem(&self.air_host)
+        {
+            problems.push(format!("air.host = `{}` {why}", self.air_host));
         }
         if problems.is_empty() {
             Ok(())
@@ -829,8 +838,9 @@ impl Config {
         }
     }
 
-    /// The settings that cannot change while the mint runs, put back to what the
-    /// running mint has. Returns the keys whose new value was therefore ignored.
+    /// The settings that need a restart, put back to what the running mint has
+    /// until it is restarted. Returns the keys whose new value was therefore held
+    /// back.
     fn keep_restart_only(&mut self, running: &Config) -> Vec<&'static str> {
         let mut ignored = Vec::new();
         for spec in SPECS.iter().filter(|s| !s.reload) {
@@ -838,11 +848,12 @@ impl Config {
                 ignored.push(spec.key);
             }
         }
+        self.network = running.network.clone();
         self.bind = running.bind.clone();
         self.admin_bind = running.admin_bind.clone();
         self.psp_url = running.psp_url.clone();
-        self.psp_timeout_secs = running.psp_timeout_secs;
-        self.psp_startup_retry_secs = running.psp_startup_retry_secs;
+        self.rotation_activation_hours = running.rotation_activation_hours;
+        self.rotation_period_hours = running.rotation_period_hours;
         self.admin_max_request_bytes = running.admin_max_request_bytes;
         self.storage_mint_state = running.storage_mint_state.clone();
         self.air_server = running.air_server.clone();
@@ -1011,10 +1022,10 @@ pub fn load(data_dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Loa
         }
     }
 
-    if problems.is_empty() {
-        if let Err(list) = config.validate() {
-            problems.extend(list);
-        }
+    if problems.is_empty()
+        && let Err(list) = config.validate()
+    {
+        problems.extend(list);
     }
     if problems.is_empty() {
         Ok(Loaded {
@@ -1058,18 +1069,25 @@ impl Handle {
         }
     }
 
-    /// Read the file and the environment again. On success the new settings are
-    /// in force at once, except the ones that need a restart, which keep their
-    /// running value. On any problem nothing changes. Returns what to log.
+    /// Read the file and the environment again. On success the live settings are
+    /// in force at once. The settings that need a restart keep their running
+    /// value until the mint is restarted; which of them changed is in the answer.
+    /// On any problem nothing changes. Returns what to log.
     pub fn reload(
         &self,
         data_dir: &Path,
         env: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<Vec<String>, Vec<String>> {
+    ) -> Result<Reloaded, Vec<String>> {
         let loaded = load(data_dir, env)?;
         let running = self.current();
         let mut next = loaded.config;
-        let ignored = next.keep_restart_only(&running);
+        // What the file says, for the lines about the settings held back.
+        let loaded_values: std::collections::BTreeMap<&'static str, String> = SPECS
+            .iter()
+            .filter(|spec| !spec.reload)
+            .map(|spec| (spec.key, next.get(spec.key).unwrap_or_default()))
+            .collect();
+        let needs_restart = next.keep_restart_only(&running);
         let mut lines = Vec::new();
         for spec in SPECS {
             let before = running.get(spec.key).unwrap_or_default();
@@ -1081,18 +1099,33 @@ impl Handle {
                 ));
             }
         }
-        for key in ignored {
+        for key in &needs_restart {
             lines.push(format!(
-                "  {key} is changed in the file but needs a restart, so it stays {}",
-                running.get(key).unwrap_or_default()
+                "  {key} is changed in the file from {} to {}: it needs a restart (a brief downtime) and waits for one",
+                running.get(key).unwrap_or_default(),
+                loaded_values.get(key).cloned().unwrap_or_default()
             ));
         }
         if lines.is_empty() {
             lines.push("  no setting changed".to_string());
         }
         self.replace(next);
-        Ok(lines)
+        Ok(Reloaded {
+            lines,
+            needs_restart,
+        })
     }
+}
+
+/// What a reload did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reloaded {
+    /// What to log, one line for each setting that changed.
+    pub lines: Vec<String>,
+    /// The settings that changed in the file but need a restart (`reload` false
+    /// in `SPECS`): they keep their running value until the mint is restarted.
+    /// Empty when every change was live.
+    pub needs_restart: Vec<&'static str>,
 }
 
 impl Default for Handle {
@@ -1576,7 +1609,7 @@ mod tests {
         let before = handle.current();
 
         fs::write(dir.join(FILE_NAME), "[redeem]\nfee_per_byte = 5000000\n").unwrap();
-        let lines = handle.reload(&dir, &no_env).unwrap();
+        let lines = handle.reload(&dir, &no_env).unwrap().lines;
         assert_eq!(handle.current().redeem_fee_per_byte, 5_000_000);
         assert!(
             lines
@@ -1606,42 +1639,119 @@ mod tests {
         handle.reload(&dir, &no_env).unwrap();
         assert_eq!(handle.current().redeem_fee_per_byte, 0);
         // and nothing changing says so
-        let lines = handle.reload(&dir, &no_env).unwrap();
+        let lines = handle.reload(&dir, &no_env).unwrap().lines;
         assert_eq!(lines, vec!["  no setting changed".to_string()]);
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn a_reload_does_not_change_addresses_or_the_psp_client_and_says_so() {
+    fn a_reload_holds_back_addresses_and_the_psp_address_until_a_restart_and_says_so() {
         let dir = scratch("reload-restart");
         let handle = Handle::new(load(&dir, &no_env).unwrap().config);
         fs::write(
             dir.join(FILE_NAME),
-            "[server]\nbind = \"127.0.0.1:4100\"\n[psp]\nurl = \"http://127.0.0.1:4000\"\ntimeout_secs = 5\n[terms]\nmaturity_days = 10\n",
+            "[server]\nbind = \"127.0.0.1:4100\"\n[psp]\nurl = \"http://127.0.0.1:4000\"\n[terms]\nmaturity_days = 10\n",
         )
         .unwrap();
-        let lines = handle.reload(&dir, &no_env).unwrap();
+        let reloaded = handle.reload(&dir, &no_env).unwrap();
         let c = handle.current();
+        // The live setting is in force at once; the others keep their running value.
         assert_eq!(c.bind, "127.0.0.1:3100");
         assert_eq!(c.psp_url, "http://127.0.0.1:3000");
-        assert_eq!(c.psp_timeout_secs, 30);
-        assert_eq!(c.psp_startup_retry_secs, 5);
         assert_eq!(c.maturity_days, 10);
+        // The answer names exactly the ones that wait for a restart, in the
+        // order of `SPECS`.
+        assert_eq!(reloaded.needs_restart, vec!["server.bind", "psp.url"]);
+        for (key, from, to) in [
+            ("server.bind", "127.0.0.1:3100", "127.0.0.1:4100"),
+            ("psp.url", "http://127.0.0.1:3000", "http://127.0.0.1:4000"),
+        ] {
+            let expected = format!(
+                "  {key} is changed in the file from {from} to {to}: it needs a restart (a brief downtime) and waits for one"
+            );
+            assert!(reloaded.lines.contains(&expected), "{:?}", reloaded.lines);
+        }
         assert!(
-            lines
+            reloaded
+                .lines
                 .iter()
-                .any(|l| l.contains("server.bind is changed in the file but needs a restart"))
+                .any(|l| l.contains("terms.maturity_days changed from"))
         );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("psp.url is changed in the file but needs a restart"))
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reload_changes_the_psp_timeout_and_startup_retry_with_no_restart() {
+        let dir = scratch("reload-psp-live");
+        let handle = Handle::new(load(&dir, &no_env).unwrap().config);
+        assert_eq!(handle.current().psp_timeout_secs, 30);
+        assert_eq!(handle.current().psp_startup_retry_secs, 5);
+        fs::write(
+            dir.join(FILE_NAME),
+            "[psp]\ntimeout_secs = 12\nstartup_retry_secs = 2\n",
+        )
+        .unwrap();
+        let reloaded = handle.reload(&dir, &no_env).unwrap();
+        assert_eq!(reloaded.needs_restart, Vec::<&str>::new());
+        assert_eq!(handle.current().psp_timeout_secs, 12);
+        assert_eq!(handle.current().psp_startup_retry_secs, 2);
+        for line in [
+            "  psp.timeout_secs changed from 30 to 12 seconds",
+            "  psp.startup_retry_secs changed from 5 to 2 seconds",
+        ] {
+            assert!(
+                reloaded.lines.contains(&line.to_string()),
+                "{line:?} not in {:?}",
+                reloaded.lines
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reload_holds_back_the_network_and_the_rotation_hours_too() {
+        let dir = scratch("reload-network");
+        let handle = Handle::new(load(&dir, &no_env).unwrap().config);
+        let running = handle.current();
+        fs::write(
+            dir.join(FILE_NAME),
+            "[server]\nnetwork = \"regtest\"\n[rotation]\nactivation_hours = 3\nperiod_hours = 5\n",
+        )
+        .unwrap();
+        let reloaded = handle.reload(&dir, &no_env).unwrap();
+        let c = handle.current();
+        // The running mint is still the one it was: a request must not see the
+        // network or the rotation change under it.
+        assert_eq!(c.network, running.network);
+        assert_eq!(
+            c.rotation_activation_hours,
+            running.rotation_activation_hours
         );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("psp.timeout_secs is changed in the file but needs a restart"))
+        assert_eq!(c.rotation_period_hours, running.rotation_period_hours);
+        assert_eq!(
+            reloaded.needs_restart,
+            vec![
+                "server.network",
+                "rotation.activation_hours",
+                "rotation.period_hours"
+            ]
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reload_that_changes_only_live_settings_names_nothing_to_restart() {
+        let dir = scratch("reload-live-only");
+        let handle = Handle::new(load(&dir, &no_env).unwrap().config);
+        fs::write(dir.join(FILE_NAME), "[redeem]\nfee_per_byte = 7\n").unwrap();
+        let reloaded = handle.reload(&dir, &no_env).unwrap();
+        assert_eq!(reloaded.needs_restart, Vec::<&str>::new());
+        assert_eq!(handle.current().redeem_fee_per_byte, 7);
+        // A bad file asks for nothing and changes nothing.
+        fs::write(dir.join(FILE_NAME), "[server]\nbind = \"not an address\"\n").unwrap();
+        let before = handle.current();
+        assert!(handle.reload(&dir, &no_env).is_err());
+        assert_eq!(*handle.current(), *before);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1655,8 +1765,6 @@ mod tests {
                 "server.bind",
                 "server.admin_bind",
                 "psp.url",
-                "psp.timeout_secs",
-                "psp.startup_retry_secs",
                 "rotation.activation_hours",
                 "rotation.period_hours",
                 "admin.max_request_bytes",
@@ -1733,7 +1841,7 @@ mod tests {
             "[exchange]\nfee_per_byte = 5\nmax_request_bytes = 32768\n[transfer]\nfee_per_byte = 6\n",
         )
         .unwrap();
-        let lines = handle.reload(&dir, &no_env).unwrap();
+        let lines = handle.reload(&dir, &no_env).unwrap().lines;
         let after = handle.current();
         assert_eq!(after.exchange_settings().fee_per_byte, 5);
         assert_eq!(after.transfer_settings().fee_per_byte, 6);

@@ -306,10 +306,10 @@ impl Responses {
         fs::rename(&tmp, &self.path)?;
         // Make the rename itself durable. Not every platform allows opening a
         // directory, so a failure here is ignored.
-        if let Some(dir) = self.path.parent() {
-            if let Ok(d) = File::open(dir) {
-                let _ = d.sync_all();
-            }
+        if let Some(dir) = self.path.parent()
+            && let Ok(d) = File::open(dir)
+        {
+            let _ = d.sync_all();
         }
         Ok(())
     }

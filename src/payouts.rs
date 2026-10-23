@@ -18,7 +18,7 @@ use std::path::Path;
 use serde::Serialize;
 use sp_wire::ServiceDid;
 
-use crate::queue::{Entry, Paid, Payment, Queue, QueueError, Status, date, dec, usd};
+use crate::queue::{Entry, Paid, Queue, QueueError, Status, date, dec, usd};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoLine {
@@ -177,13 +177,27 @@ pub fn parse_service(text: &str) -> Result<ServiceDid, String> {
     ServiceDid::parse(text).map_err(|e| e.to_string())
 }
 
-/// `esp-mint pay <service> <ref> <entry id>... [--mixed-memos]`.
-pub fn run_pay(queue_path: &Path, args: &[String], now_unix: u64) -> Result<String, String> {
-    let mut allow_mixed_memos = false;
+/// What `esp-mint pay <service> <ref> <entry id>... [--mixed-memos]` asks for.
+/// The command does not settle it: the running `serve` does, on its operator
+/// listener (`POST /payouts/pay`), because only `serve` holds the queue lock that
+/// keeps two writers of the queue file apart.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PayArgs {
+    pub service: ServiceDid,
+    pub payment_ref: String,
+    pub entry_ids: Vec<String>,
+    pub mixed_memos: bool,
+}
+
+/// Read the arguments of `esp-mint pay`: a service, a reference and at least one
+/// entry id. Nothing is looked up: whether the entries exist and are open is
+/// `serve`'s answer.
+pub fn parse_pay(args: &[String]) -> Result<PayArgs, String> {
+    let mut mixed_memos = false;
     let mut words = Vec::new();
     for arg in args {
         if arg == "--mixed-memos" {
-            allow_mixed_memos = true;
+            mixed_memos = true;
         } else {
             words.push(arg.clone());
         }
@@ -191,26 +205,18 @@ pub fn run_pay(queue_path: &Path, args: &[String], now_unix: u64) -> Result<Stri
     if words.len() < 3 {
         return Err("usage: esp-mint pay <service> <ref> <entry id>... [--mixed-memos]".into());
     }
-    let service = parse_service(&words[0])?;
-    let payment_ref = words[1].clone();
-    let entry_ids = &words[2..];
-    let mut queue = Queue::open(queue_path).map_err(|e| e.to_string())?;
-    let paid = queue
-        .complete(&Payment {
-            service,
-            payment_ref: &payment_ref,
-            entry_ids,
-            allow_mixed_memos,
-            now_unix,
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(render_paid(&paid))
+    Ok(PayArgs {
+        service: parse_service(&words[0])?,
+        payment_ref: words[1].clone(),
+        entry_ids: words[2..].to_vec(),
+        mixed_memos,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::ESP_PER_USD;
+    use crate::queue::{ESP_PER_USD, Payment};
     use std::fs;
     use std::path::PathBuf;
 
@@ -537,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn the_command_line_helpers_list_and_settle() {
+    fn the_command_line_helpers_list_read_the_pay_arguments_and_render_a_settlement() {
         let dir = scratch("cli");
         let path = dir.join("queue.json");
         let mut q = Queue::open(&path).unwrap();
@@ -566,18 +572,39 @@ mod tests {
 
         let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            run_pay(&path, &args(&[G_DID, "ref"]), DAY1).unwrap_err(),
+            parse_pay(&args(&[G_DID, "ref"])).unwrap_err(),
             "usage: esp-mint pay <service> <ref> <entry id>... [--mixed-memos]"
         );
         assert_eq!(
-            run_pay(&path, &args(&["zz", "ref", "e1"]), DAY1).unwrap_err(),
+            parse_pay(&args(&["zz", "ref", "e1"])).unwrap_err(),
             "`zz` is not a service ID: it must be hex"
         );
         // The 32-byte x-only form of wire version 2 is refused, with a message that says so.
         let old_form = &G_DID[2..];
-        let refused = run_pay(&path, &args(&[old_form, "ref", "e1"]), DAY1).unwrap_err();
+        let refused = parse_pay(&args(&[old_form, "ref", "e1"])).unwrap_err();
         assert!(refused.contains("x-only"), "{refused}");
-        let done = run_pay(&path, &args(&[G_DID, "wire-1", "e1", "e2"]), DAY1).unwrap();
+        // The option may stand anywhere among the words.
+        assert_eq!(
+            parse_pay(&args(&[G_DID, "wire-1", "--mixed-memos", "e1", "e2"])).unwrap(),
+            PayArgs {
+                service: xyz(),
+                payment_ref: "wire-1".to_string(),
+                entry_ids: ids(&["e1", "e2"]),
+                mixed_memos: true,
+            }
+        );
+        let plain = parse_pay(&args(&[G_DID, "wire-1", "e1", "e2"])).unwrap();
+        assert!(!plain.mixed_memos);
+        // What serve does with it, and the text it prints.
+        let done = q
+            .complete(&pay_args(
+                plain.service,
+                &plain.payment_ref,
+                &plain.entry_ids,
+                DAY1,
+            ))
+            .unwrap();
+        let done = render_paid(&done);
         assert!(done.contains("marked 2 entries completed"));
         assert!(done.contains("15.000000000000 USD") && done.contains("wire-1"));
         assert_eq!(

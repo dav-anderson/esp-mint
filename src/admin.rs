@@ -29,6 +29,11 @@
 //! processes writing at the same moment is still a race: do not run both at the
 //! same time.
 
+// The handlers return an axum `Response` as their error, which is how the
+// operator's listener replies to a bad request. `Response` is large by its type;
+// boxing it would change every handler's signature for no gain.
+#![allow(clippy::result_large_err)]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

@@ -58,9 +58,19 @@
 //! `psp.timeout_secs`) holds up the requests behind it, as a slow request holds
 //! the mint lock.
 //!
+//! **A stop or a snapshot stops the listener on purpose** (`run`'s `stop`): `serve`
+//! stops it never in the middle of a slot (the stop is looked at only once the
+//! slots already read have been answered), so a request is either answered before
+//! the stop or read again by the next listener from `air_mailbox_next`. While nothing reads
+//! the mailbox, a wallet's request waits in its slot on the AIR server (the
+//! slot is a stored record, which the server does not expire) and the wallet's
+//! read of the reply cell stays held on its own session. A request that was
+//! answered but whose counter was not yet written is read again and finds its
+//! reply cell taken ("already answered").
+//!
 //! Held reads left behind by a stopped listener are never cleaned up by the AIR
-//! server (upstream item 17); with the default of 16 a handful of restarts costs
-//! little.
+//! server (upstream item 17); with the default of 16, each restart, snapshot or crash
+//! leaves that many on the server, a small cost.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -273,7 +283,7 @@ async fn handle_fill(
 ) -> Result<(), String> {
     // On a blocking thread: an exchange calls the PSP with a blocking HTTP
     // client, and a redemption reads and writes files (see the module docs).
-    let (key, serve, sealed) = (key.clone(), Arc::clone(serve), sealed.to_vec());
+    let (key, serve, sealed) = (*key, Arc::clone(serve), sealed.to_vec());
     let answered = tokio::task::spawn_blocking(move || {
         answer_request(&key, &sealed, addr::now_secs(), &*serve)
     })
@@ -322,19 +332,21 @@ async fn handle_fill(
 }
 
 /// Run the listener on the calling thread, with a runtime of its own, until it
-/// fails. For a thread of its own: `serve` starts one so that the HTTP API's
-/// runtime and the listener never share a thread. A panic in `serve` is a failed
-/// answer thread, which ends the listener with an error.
+/// fails or `stop` resolves (then `Ok`, with no request half answered). For a
+/// thread of its own: `serve` starts one so that the HTTP API's runtime and the
+/// listener never share a thread. A panic in `serve` is a failed answer thread,
+/// which ends the listener with an error.
 pub fn run_blocking(
     settings: &Settings,
     key: &SecretKey,
     serve: &Arc<Serve>,
+    stop: impl Future<Output = ()>,
 ) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("could not start a runtime: {e}"))?;
-    runtime.block_on(run(settings, key, serve, std::future::pending()))
+    runtime.block_on(run(settings, key, serve, stop))
 }
 
 #[cfg(test)]

@@ -68,6 +68,12 @@
 //! pending request can be burned only by that request, because step 4 keeps
 //! every other request away from it.
 
+// The error types here carry the per-note detail the HTTP reply and the stored
+// response are built from (and the rejections are matched on by callers), so the
+// Err variants are large by design. Boxing them would change the public API of
+// the module for no gain: a redeem request is far from a hot path.
+#![allow(clippy::result_large_err)]
+
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -2528,7 +2534,7 @@ mod tests {
         // the ceiling is 15 MiB and AIR takes 16 MiB: the request body, the
         // envelope (71 bytes) and its seal (80) fit with the room to spare
         assert_eq!(DEFAULT_MAX_REQUEST_BYTES, 15 * 1024 * 1024);
-        assert!(DEFAULT_MAX_REQUEST_BYTES + 71 + 80 + AIR_ROOM / 2 < AIR_MESSAGE_CAP);
+        const _: () = assert!(DEFAULT_MAX_REQUEST_BYTES + 71 + 80 + AIR_ROOM / 2 < AIR_MESSAGE_CAP);
         assert_eq!(DEFAULT_MAX_REQUEST_BYTES + AIR_ROOM, AIR_MESSAGE_CAP);
     }
 

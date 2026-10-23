@@ -4,7 +4,8 @@
 //! Each run clears the environment, so nothing of the machine's leaks in, and
 //! gives the process a scratch `ESP_DATA_DIR` of its own. None of these runs
 //! reaches a network or starts a listener: each is refused before it gets that
-//! far, and each test checks the data folder is as it was (the files that are
+//! far (the one exception, `pay` with no `serve` running, tries the operator's
+//! listener on a loopback port nothing listens on and is refused there), and each test checks the data folder is as it was (the files that are
 //! there are the same bytes, and no file or folder was made). A run that has not
 //! ended after a minute is killed and fails the test, so a command that should
 //! have been refused cannot hang the suite by carrying on instead.
@@ -163,24 +164,29 @@ fn no_command_or_an_unknown_one_is_usage_on_stderr_with_status_2_and_help_is_usa
 }
 
 #[test]
-fn pay_without_a_reference_with_an_unknown_entry_or_with_a_bad_service_is_refused_and_changes_nothing()
- {
+fn pay_without_a_reference_or_with_a_bad_service_is_refused_before_any_request_and_changes_nothing()
+{
     let dir = scratch("pay");
     seed_queue(&dir);
     let before = snapshot(&dir);
-    let refusals: [(&[&str], &str); 3] = [
+    // A listener where the operator's listener would be: a command that got as
+    // far as sending its request would have connected to it.
+    let watch = TcpListener::bind("127.0.0.1:0").unwrap();
+    watch.set_nonblocking(true).unwrap();
+    let bind = watch.local_addr().unwrap().to_string();
+    let env = [("ESP_ADMIN_BIND", bind.as_str())];
+    let refusals: [(&[&str], &str); 2] = [
         (
             &["pay", G_DID, "wire-1"],
             "error: usage: esp-mint pay <service> <ref> <entry id>... [--mixed-memos]\n",
         ),
-        (&["pay", G_DID, "wire-1", "nope"], "error: no entry nope\n"),
         (
             &["pay", "zz", "wire-1", "e1"],
             "error: `zz` is not a service ID: it must be hex\n",
         ),
     ];
     for (args, message) in refusals {
-        let ran = run(&dir, args, &[]);
+        let ran = run(&dir, args, &env);
         assert_eq!(ran.code, Some(1), "{args:?}");
         assert_eq!(ran.stdout, "", "{args:?}");
         assert_eq!(
@@ -190,6 +196,75 @@ fn pay_without_a_reference_with_an_unknown_entry_or_with_a_bad_service_is_refuse
         );
         assert_eq!(snapshot(&dir), before, "{args:?}");
     }
+    assert_eq!(
+        watch.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "a refused pay still connected to the operator's listener"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn pay_with_no_serve_running_says_so_and_does_not_write_the_queue_itself() {
+    let dir = scratch("pay-no-serve");
+    seed_queue(&dir);
+    let before = snapshot(&dir);
+    // An address nothing listens on: the port was free a moment ago.
+    let bind = {
+        let free = TcpListener::bind("127.0.0.1:0").unwrap();
+        free.local_addr().unwrap().to_string()
+    };
+    let ran = run(
+        &dir,
+        &["pay", G_DID, "wire-1", "e1", "e2"],
+        &[("ESP_ADMIN_BIND", bind.as_str())],
+    );
+    assert_eq!(ran.code, Some(1));
+    assert_eq!(ran.stdout, "");
+    let expected_start = format!(
+        "{}error: could not reach the mint's admin listener at {bind}: ",
+        banner(&dir, "main")
+    );
+    assert!(ran.stderr.starts_with(&expected_start), "{}", ran.stderr);
+    assert!(
+        ran.stderr.ends_with(". Is `esp-mint serve` running?\n"),
+        "{}",
+        ran.stderr
+    );
+    // The entries are still open: `pay` did not settle them by writing the file.
+    assert_eq!(snapshot(&dir), before);
+    let queue = Queue::open(&dir.join("main").join("queue.json")).unwrap();
+    assert!(queue.entries().all(|e| e.payment_ref.is_none()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn version_names_the_program_and_the_libraries_and_reads_and_writes_nothing() {
+    let dir = scratch("version");
+    let long = run(&dir, &["--version"], &[]);
+    let short = run(&dir, &["-V"], &[]);
+    assert_eq!((long.code, short.code), (Some(0), Some(0)));
+    assert_eq!(long.stdout, short.stdout);
+    assert_eq!((long.stderr.as_str(), short.stderr.as_str()), ("", ""));
+    let lines: Vec<&str> = long.stdout.lines().collect();
+    assert_eq!(lines[0], format!("esp-mint {}", env!("CARGO_PKG_VERSION")));
+    // Each other line is `name x.y.z`, and the two libraries every mint is built
+    // on are there.
+    for line in &lines[1..] {
+        let (name, version) = line.split_once(' ').expect(line);
+        assert!(
+            !name.is_empty() && version.split('.').count() == 3,
+            "{line}"
+        );
+    }
+    for library in ["sp-wire ", "mint-core "] {
+        assert!(
+            lines.iter().any(|l| l.starts_with(library)),
+            "{library}missing in {lines:?}"
+        );
+    }
+    // Not even a settings file was read or the banner printed, and nothing made.
+    assert!(snapshot(&dir).is_empty());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

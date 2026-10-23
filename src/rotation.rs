@@ -375,10 +375,9 @@ impl Rotor {
                     .to_str()
                     .and_then(|n| n.strip_prefix("gen-"))
                     .and_then(|n| n.parse::<u64>().ok())
+                    && exists(base, n)
                 {
-                    if exists(base, n) {
-                        newest = newest.max(n);
-                    }
+                    newest = newest.max(n);
                 }
             }
         }

@@ -676,6 +676,9 @@ pub fn audit_body(issued: u64, redeemed: u64, responses: &Responses, now_unix: u
     })
 }
 
+/// `GET /health`: `status`, `network` and `wire_version`, and `version` (this
+/// binary's). `spi upgrade` reads `version` after a restart to know that the new
+/// binary is the one serving.
 async fn health_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<Value>) {
     match fatal(&state) {
         None => (
@@ -684,6 +687,7 @@ async fn health_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json
                 "status": "ok",
                 "network": state.config.current().network,
                 "wire_version": sp_wire::WIRE_VERSION,
+                "version": env!("CARGO_PKG_VERSION"),
             })),
         ),
         Some(why) => (
@@ -693,6 +697,7 @@ async fn health_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json
                 "reason": why,
                 "network": state.config.current().network,
                 "wire_version": sp_wire::WIRE_VERSION,
+                "version": env!("CARGO_PKG_VERSION"),
             })),
         ),
     }
@@ -820,10 +825,10 @@ fn spent_inputs_text(spent: &[usize]) -> String {
 /// the others are an error where the outcome may be unknown and the same request
 /// is sent again.
 fn refused(status: StatusCode, mut body: Value) -> sp_wire::air_request::Served {
-    if status != StatusCode::BAD_REQUEST {
-        if let Some(object) = body.as_object_mut() {
-            object.insert("http_status".into(), json!(status.as_u16()));
-        }
+    if status != StatusCode::BAD_REQUEST
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert("http_status".into(), json!(status.as_u16()));
     }
     sp_wire::air_request::Served::Refused(serde_json::to_vec(&body).expect("a JSON value encodes"))
 }
