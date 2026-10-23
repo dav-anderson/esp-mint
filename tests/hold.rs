@@ -1,6 +1,6 @@
 //! The exchange does not hold the mint's lock while it waits on the PSP.
 //!
-//! A PSP built from mint-server's own handlers, with a `/melt` that can be
+//! A PSP stand-in (mint-core's `AppState` behind `/melt` and `/burns` handlers), with a `/melt` that can be
 //! made to wait (until the test lets it go) or to answer late, and the ESP
 //! mint calling it through `HttpPsp`. These tests check that one exchange
 //! stuck at the PSP does not stop another, that the same request sent again
@@ -36,15 +36,15 @@ use esp_mint::responses::Entry;
 use esp_mint::server::{self, EspState};
 use mint_core::MintLogic;
 use mint_core::keygen;
+use mint_core::state::AppState;
 use mint_core::store::Store;
-use mint_server::api::{MeltRequest, MeltResponse};
-use mint_server::state::AppState;
 use mint_types::{
     Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, gen_denominations, melt_sighash,
 };
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 use sp_wire::ServiceDid;
+use sp_wire::melt::{MeltRequest, MeltResponse};
 use tokio::runtime::Runtime;
 
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -209,7 +209,6 @@ fn start_psp(rt: &Runtime, dir: &Path, gate: &Arc<Gate>) -> (String, Arc<AppStat
     let logic = MintLogic::new(cfg, Store::open(&dir.join("psp-db")).unwrap());
     let state = Arc::new(AppState {
         logic: Mutex::new(logic),
-        admin_token: String::new(),
     });
     let memos: Memos = Arc::new(Mutex::new(BTreeMap::new()));
     let app = Router::new()

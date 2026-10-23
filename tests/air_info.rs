@@ -36,9 +36,8 @@ use esp_mint::terms::Terms;
 use esp_mint::transfer::{self, TransferRequest, TransferResponse};
 use mint_core::MintLogic;
 use mint_core::keygen;
+use mint_core::state::AppState;
 use mint_core::store::Store;
-use mint_server::api::{MeltRequest, MeltResponse};
-use mint_server::state::AppState;
 use mint_types::{
     Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, gen_denominations, melt_sighash,
 };
@@ -53,6 +52,7 @@ use sp_wire::air_request::{
     KIND_ROTATION, KIND_TRANSFER, MintInfo, STATUS_UNAVAILABLE, Served, VerifyError, local_server,
     verify_receipt,
 };
+use sp_wire::melt::{MeltRequest, MeltResponse};
 use sp_wire::seal::SecretKey as DidKey;
 use sp_wire::{ServiceDid, WIRE_VERSION};
 
@@ -351,7 +351,6 @@ fn start_esp_on(dir: &Path, config: Config, clock: u64, psp_url: Option<&str>) -
     let psp_logic = MintLogic::new(cfg, Store::open(&dir.join("psp-db")).unwrap());
     let psp = Arc::new(AppState {
         logic: Mutex::new(psp_logic),
-        admin_token: String::new(),
     });
     let memos: Memos = Arc::new(Mutex::new(BTreeMap::new()));
     let psp_app = Router::new()

@@ -9,14 +9,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use mint_server::api::{MeltRequest, MeltResponse};
 use mint_types::{Amount, MintInput, Nonce};
 use serde::{Deserialize, Serialize};
+use sp_wire::melt::{MeltRequest, MeltResponse};
 
 use crate::exchange::{Burn, Psp};
 
-/// Body of the PSP's `POST /melt`: mint-core's melt and the keyset of each
-/// note (psp-mint's `PspMeltRequest`).
+/// Body of the PSP's `POST /melt`: the melt and the keyset of each note
+/// (sp-wire's `psp::PspMeltRequest`).
 #[derive(Serialize)]
 struct PspMelt<'a> {
     #[serde(flatten)]
