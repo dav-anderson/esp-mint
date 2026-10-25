@@ -702,6 +702,12 @@ fn rollover_req(
     r
 }
 
+/// The blind nonces (hex) of the outputs of `rq`, as a pending rollover holds them.
+fn blind_hex(rq: &esp_mint::rotation::RolloverRequest) -> Vec<String> {
+    let blind = |o: &MintOutput| hex::encode(o.blind_nonce.0.serialize());
+    rq.outputs.iter().map(blind).collect()
+}
+
 fn current_key(mint: &Mint, units: u64) -> secp256k1::PublicKey {
     let r = mint.state.rotor.lock().unwrap();
     r.current
@@ -923,6 +929,7 @@ fn an_esp_rollover_interrupted_after_the_burn_is_finished_by_the_retry() {
                 &rq.hash(),
                 rotor.current.epoch,
                 vec![hex::encode(n.0.nonce.0.serialize())],
+                blind_hex(&rq),
             )
             .unwrap();
         let (g, l) = rotor.previous.as_ref().unwrap();
@@ -1115,19 +1122,18 @@ fn outputs_naming_a_set_that_is_not_live_are_refused_and_nothing_is_burned() {
     );
 }
 
-/// A rollover of a generation-0 note, accepted and burned before the
-/// rotations (its answer lost), then retried after generation 0 is deleted.
-/// A rollover left pending across a retirement. `burn`: its input was burned
-/// before the crash; `flag`: the burn was also recorded under its hash;
-/// `later`: the retry comes after the set the outputs name is deleted too.
-/// Returns the ID of the set that should sign: the one the request names while
-/// it is live, else the current one.
-fn rollover_after_retirement(
+/// The state a crash leaves in a rollover, before any retirement: the runtime,
+/// the mint, the note and the request.
+fn stuck_rollover(
     name: &str,
     burn: bool,
     flag: bool,
-    later: bool,
-) -> (u16, Value, String) {
+) -> (
+    Runtime,
+    Mint,
+    (Note, Keypair),
+    esp_mint::rotation::RolloverRequest,
+) {
     let rt = Runtime::new().unwrap();
     let dir = scratch(name);
     let mint = start_rotating(&rt, &dir);
@@ -1143,6 +1149,7 @@ fn rollover_after_retirement(
                 &rq.hash(),
                 rotor.current.epoch,
                 vec![hex::encode(n.0.nonce.0.serialize())],
+                blind_hex(&rq),
             )
             .unwrap();
         if flag {
@@ -1160,6 +1167,24 @@ fn rollover_after_retirement(
             l.redeem_with_key(&sk, &rq.inputs[0], rq.digest()).unwrap();
         }
     }
+    (rt, mint, n, rq)
+}
+
+/// A rollover of a generation-0 note, accepted and burned before the
+/// rotations (its answer lost), then retried after generation 0 is deleted.
+/// A rollover left pending across a retirement. `burn`: its input was burned
+/// before the crash; `flag`: the burn was also recorded under its hash;
+/// `later`: the retry comes after the set the outputs name is deleted too.
+/// Returns the ID of the set that should sign: the one the request names while
+/// it is live, else the current one.
+fn rollover_after_retirement(
+    name: &str,
+    burn: bool,
+    flag: bool,
+    later: bool,
+) -> (u16, Value, String) {
+    let (rt, mint, _, rq) = stuck_rollover(name, burn, flag);
+    let id1 = rq.keyset.clone();
     set_clock(&mint, T0 + 2 * 3600);
     let w = esp_get_json(&mint, "/rotation");
     assert_eq!(
@@ -1208,6 +1233,140 @@ fn a_resumed_rollover_after_retirement_finishes_only_with_stored_proof_of_its_bu
     let (code, body, signer) = rollover_after_retirement("proof-late", true, true, true);
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["keyset"], signer.as_str(), "signed by the current set");
+}
+
+/// A rollover and a transfer of `n` that name a keyset the mint does not know
+/// are refused `unknown_keyset`, nothing is issued for them, and the mint
+/// still answers.
+fn forged_requests_are_refused(mint: &Mint, n: &(Note, Keypair)) {
+    let issued = get_json(&mint.esp, "/audit")["issued"].clone();
+    let mut forged = rollover_req(n, 1 << 50, 1 << 50);
+    forged.input_keysets = vec!["ab".repeat(8)];
+    let d = forged.digest();
+    forged.inputs[0].spend_signature = SECP256K1.sign_schnorr(&d, &n.1);
+    let (code, body) = esp_post_json(mint, "/rollover", &serde_json::to_value(&forged).unwrap());
+    assert_eq!((code, body["code"].as_str()), (400, Some("unknown_keyset")));
+    assert_eq!(get_json(&mint.esp, "/audit")["issued"], issued);
+    let mut tr = transfer_req(n, 1 << 50);
+    tr.input_keysets = vec!["ab".repeat(8)];
+    let (code, body) = esp_post_json(mint, "/transfer", &serde_json::to_value(&tr).unwrap());
+    assert_eq!((code, body["code"].as_str()), (400, Some("unknown_keyset")));
+    esp_get_json(mint, "/keysets"); // the mint still answers
+}
+
+#[test]
+fn a_burn_proof_left_on_file_serves_no_other_request() {
+    // Fails if the guard lets a request that is not resuming use a proof
+    // (P2-01), whatever the drop does: a crash between a request's finish and
+    // the drop of its proof leaves the proof behind.
+    let (rt, mint, n, rq) = stuck_rollover("proof-left", true, false);
+    set_clock(&mint, T0 + 2 * 3600);
+    esp_get_json(&mint, "/rotation");
+    // The request is gone from the store; its proof is still on file.
+    let store = esp_mint::rotation::Rollovers::open(&scratch("proof-left-store")).unwrap();
+    *mint.state.rollovers.lock().unwrap() = store;
+    let key = format!("rollovers:{}", rq.hash());
+    let nonce = hex::encode(n.0.nonce.0.serialize());
+    assert_eq!(retired_proofs(&mint), serde_json::json!({ key: [nonce] }));
+    forged_requests_are_refused(&mint, &n);
+    rt.shutdown_background();
+}
+
+#[test]
+fn a_burn_proof_serves_only_its_own_request_and_is_dropped_when_it_finishes() {
+    // Fails if retirement saves the proof where any request can use it (P2-01):
+    // once the stuck rollover is finished, a new rollover naming its proven note
+    // with a keyset the mint does not know is signed at a large amount; a new
+    // transfer panics under the mint lock (F4).
+    let (rt, mint, n, rq) = stuck_rollover("proof-forged", true, false);
+    set_clock(&mint, T0 + 2 * 3600);
+    esp_get_json(&mint, "/rotation");
+    let nonce = hex::encode(n.0.nonce.0.serialize());
+    let key = format!("rollovers:{}", rq.hash());
+    assert_eq!(retired_proofs(&mint), serde_json::json!({ key: [nonce] }));
+    let (code, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&rq).unwrap());
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(retired_proofs(&mint), serde_json::json!({}), "finished");
+    forged_requests_are_refused(&mint, &n);
+    rt.shutdown_background();
+}
+
+#[test]
+fn a_rollover_with_two_outputs_sharing_a_blind_nonce_is_refused_before_any_burn() {
+    // Fails if the outputs are checked after the burn (P1-07): the note is then
+    // burned and the rollover stays pending, holding it.
+    let rt = Runtime::new().unwrap();
+    let mint = start_rotating(&rt, &scratch("rollover-dup"));
+    let [a, b] = [(); 2].map(|_| esp_note(&mint, ONE, service(), PAST));
+    let (mut rq, second) = (rollover_req(&a, ONE, ONE), rollover_req(&b, ONE, ONE));
+    rq.inputs.extend(second.inputs);
+    rq.input_keysets.extend(second.input_keysets);
+    rq.outputs.push(rq.outputs[0].clone());
+    let d = rq.digest();
+    for (input, n) in rq.inputs.iter_mut().zip([&a, &b]) {
+        input.spend_signature = SECP256K1.sign_schnorr(&d, &n.1);
+    }
+    let (_, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&rq).unwrap());
+    assert_eq!(body["code"], "duplicate_blind_nonce", "{body}");
+    assert!(!is_spent(&mint, &a.0), "nothing burned");
+    assert!(!is_spent(&mint, &b.0));
+    assert_eq!(mint.state.rollovers.lock().unwrap().holds().count(), 0);
+    rt.shutdown_background();
+}
+
+/// A rollover of `n` recorded as pending, as a crash before its burn leaves it,
+/// holding the output blind nonce of `out`.
+fn pending_rollover(mint: &Mint, n: &(Note, Keypair), out: &MintOutput) {
+    let mut rq = rollover_req(n, ONE, ONE);
+    rq.outputs[0].blind_nonce = out.blind_nonce;
+    let epoch = mint.state.rotor.lock().unwrap().current.epoch;
+    let held = vec![hex::encode(n.0.nonce.0.serialize())];
+    let mut store = mint.state.rollovers.lock().unwrap();
+    store
+        .begin(&rq.hash(), epoch, held, blind_hex(&rq))
+        .unwrap();
+}
+
+#[test]
+fn an_output_held_by_a_pending_request_is_refused_to_a_rollover_and_the_other_way() {
+    // Fails if a pending rollover does not hold its output blind nonces, or if a
+    // rollover does not look at the ones other requests hold. Covered: a pending
+    // rollover against a transfer and a redemption (an exchange is in
+    // `exchange.rs`), and a pending transfer against a rollover; the exchange and
+    // redemption holds are read the same way (`Responses::held_by_all`).
+    let rt = Runtime::new().unwrap();
+    let mint = start_rotating(&rt, &scratch("out-holds"));
+    let [a, b, c, d, e] = [(); 5].map(|_| esp_note(&mint, ONE, service(), PAST));
+    let tr = transfer_req(&a, ONE);
+    pending_rollover(&mint, &b, &tr.outputs[0]);
+    let (code, body) = esp_post_json(&mint, "/transfer", &serde_json::to_value(&tr).unwrap());
+    assert!(code == 400 && body.to_string().contains("held"), "{body}");
+    let (req, _) = request(
+        &[(c.0, &c.1, ONE, PAST)],
+        &[(ONE, PAST)],
+        &service_keypair(),
+    );
+    pending_rollover(&mint, &d, &req.decline_outputs[0].output);
+    let (code, body) = esp_post_bytes(&mint, req.encode());
+    assert_eq!((code, body["code"].as_str()), (400, Some("note_held")));
+    // The other way: a pending transfer, then a rollover with its output.
+    let held = transfer_req(&c, ONE);
+    let entry = esp_mint::responses::Entry::TransferPending(esp_mint::responses::TransferPending {
+        inputs: vec![hex::encode(c.0.nonce.0.serialize())],
+        outputs: vec![hex::encode(held.outputs[0].blind_nonce.0.serialize())],
+        burned: false,
+    });
+    let hash = esp_mint::transfer::request_hash(&held);
+    let responses = &mint.state.responses;
+    responses.lock().unwrap().put(&hash, entry).unwrap();
+    let mut rq = rollover_req(&e, ONE, ONE);
+    rq.outputs = held.outputs.clone();
+    let dg = rq.digest();
+    rq.inputs[0].spend_signature = SECP256K1.sign_schnorr(&dg, &e.1);
+    let (code, body) = esp_post_json(&mint, "/rollover", &serde_json::to_value(&rq).unwrap());
+    assert_eq!((code, body["code"].as_str()), (400, Some("note_held")));
+    assert!(!is_spent(&mint, &a.0) && !is_spent(&mint, &e.0));
+    rt.shutdown_background();
 }
 
 /// A transfer left pending across a retirement. `burn`: its input was burned
@@ -1356,6 +1515,7 @@ fn a_note_held_by_a_pending_rollover_cannot_be_taken_by_a_transfer_or_another_ro
             &rq.hash(),
             mint.state.rotor.lock().unwrap().current.epoch,
             vec![hex::encode(n.0.nonce.0.serialize())],
+            blind_hex(&rq),
         )
         .unwrap();
     let (code, body) = esp_post_json(
@@ -1585,18 +1745,12 @@ fn a_resumed_redemption_after_retirement_finishes_only_with_stored_proof_of_its_
     );
 
     // (b) Burned, the flag lost to the crash: the retirement took the proof
-    // from the spent list and saved it in retired.json; the retry finishes.
-    let (code, body, mint, note) = redeem_after_retirement("rproof-crash", true, false);
-    let nonce = hex::encode(note.nonce.0.serialize());
-    assert!(
-        retired_proofs(&mint)
-            .as_array()
-            .is_some_and(|p| p.iter().any(|n| n == nonce.as_str())),
-        "proof saved: {}",
-        retired_proofs(&mint)
-    );
+    // from the spent list and saved it in retired.json; the retry finishes, and
+    // the proof is dropped with it.
+    let (code, body, mint, _) = redeem_after_retirement("rproof-crash", true, false);
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["entry"]["status"], "open", "{body}");
+    assert_eq!(retired_proofs(&mint), serde_json::json!({}), "{body}");
 
     // (c) Crashed before the burn: nothing proves it, refused, nothing signed.
     let (code, body, mint, note) = redeem_after_retirement("rproof-none", false, false);
@@ -1606,11 +1760,7 @@ fn a_resumed_redemption_after_retirement_finishes_only_with_stored_proof_of_its_
         "{body}"
     );
     let nonce = hex::encode(note.nonce.0.serialize());
-    assert!(
-        !retired_proofs(&mint)
-            .as_array()
-            .is_some_and(|p| p.iter().any(|n| n == nonce.as_str()))
-    );
+    assert!(!retired_proofs(&mint).to_string().contains(&nonce));
 }
 
 #[test]

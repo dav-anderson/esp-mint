@@ -63,7 +63,7 @@ use crate::exchange::MAX_ITEMS;
 use crate::fee;
 use crate::ledger::Movements;
 use crate::responses::{Entry, Responses, TransferPending};
-use crate::rotation::Gens;
+use crate::rotation::{Gens, Source};
 use crate::terms::Terms;
 use crate::units;
 
@@ -385,11 +385,14 @@ pub fn transfer_gens(
 
     let mut recovering = false;
     let mut proven = false;
+    // The notes this request holds itself, when it is picked up again.
+    let mut own: Vec<String> = Vec::new();
     match responses.get(&hash) {
         Some(Entry::Done(done)) => return Ok(done.clone()),
         Some(Entry::TransferPending(p)) => {
             recovering = true;
             proven = p.burned;
+            own = p.inputs.clone();
         }
         Some(Entry::Pending { .. }) => {
             return Err(internal("an exchange is stored under this request's hash"));
@@ -443,13 +446,31 @@ pub fn transfer_gens(
         }
         .into()
     };
+    let unresolved = |index: usize| -> TransferError {
+        TransferRejection::Keyset {
+            code: sp_wire::codes::UNKNOWN_KEYSET,
+            why: format!(
+                "note {index}: its keyset is not live, and this request is not one started before with its burn proven"
+            ),
+        }
+        .into()
+    };
     let mut in_keys = Vec::with_capacity(request.inputs.len());
     for (index, input) in request.inputs.iter().enumerate() {
         match gens.input_key(&request.input_keysets[index], input, &terms) {
             Ok(k) => in_keys.push(Some(k)),
             // Its keyset was deleted since the request was accepted: it may
             // finish without burning only if the stored state proves the burn.
-            Err(_) if proven || gens.burn_proven(input) => in_keys.push(None),
+            // Only a request picked up again, for a note it holds itself, and
+            // with a proof taken for this request, may skip a note.
+            Err(_)
+                if proven
+                    || (recovering
+                        && own.contains(&hex::encode(input.note.nonce.0.serialize()))
+                        && gens.burn_proven(Source::Responses, &hash, input)) =>
+            {
+                in_keys.push(None)
+            }
             Err(e) if recovering => {
                 return Err(TransferRejection::Keyset {
                     code: sp_wire::codes::BURN_NOT_PROVEN,
@@ -471,7 +492,9 @@ pub fn transfer_gens(
         // 1. Each input: genuine under the key derived for its amount and the
         //    terms, and a spend signature over the digest. Public keys only.
         for (index, input) in request.inputs.iter().enumerate() {
-            let (logic, sk) = in_keys[index].expect("resolved");
+            let Some((logic, sk)) = in_keys[index] else {
+                return Err(unresolved(index));
+            };
             logic
                 .verify_note_with_key(&sk, input)
                 .map_err(|_| TransferRejection::BadNote { index })?;
@@ -485,13 +508,10 @@ pub fn transfer_gens(
         //    truer answer.
         let mut spent_indexes = Vec::new();
         for (index, input) in request.inputs.iter().enumerate() {
-            if in_keys[index]
-                .as_ref()
-                .expect("resolved")
-                .0
-                .is_spent(input.note.nonce)
-                .map_err(internal)?
-            {
+            let Some((logic, _)) = in_keys[index] else {
+                return Err(unresolved(index));
+            };
+            if logic.is_spent(input.note.nonce).map_err(internal)? {
                 spent_indexes.push(index);
             }
         }
@@ -527,11 +547,15 @@ pub fn transfer_gens(
         // An unfinished redemption will burn ESP notes and sign output blind
         // nonces, and a finished one keeps its decline outputs' blind nonces for
         // a later decline.
-        // A pending rollover will burn the notes it holds.
+        // A pending rollover will burn the notes it holds and sign its outputs.
         if held
             .inputs
             .iter()
             .any(|n| responses.external_holds().contains(n))
+            || held
+                .outputs
+                .iter()
+                .any(|n| responses.external_out_holds().contains(n))
         {
             return Err(TransferRejection::NoteHeld.into());
         }

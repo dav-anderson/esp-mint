@@ -284,8 +284,22 @@ fn with_mint<T>(
         ));
     };
     let rot = rotor_of(state, &mut logic).map_err(ExchangeError::Internal)?;
+    hold_for_rollovers(state, &mut responses).map_err(ExchangeError::Internal)?;
     let gens = rot.gens(&logic);
     f(&gens, &mut responses)
+}
+
+/// Tell `responses` which notes and output blind nonces pending rollovers hold,
+/// so that no request stored there takes them. Locks the rollovers after the
+/// rotor, as everywhere (logic, responses, rotor, rollovers); the caller holds
+/// the first three.
+fn hold_for_rollovers(state: &EspState, responses: &mut Responses) -> Result<(), String> {
+    let store = state
+        .rollovers
+        .lock()
+        .map_err(|_| "the rollovers lock is poisoned".to_string())?;
+    responses.set_external_holds(store.held_nonces(""), store.held_outputs(""));
+    Ok(())
 }
 
 fn run_exchange_phases(
@@ -380,24 +394,29 @@ pub fn run_transfer(state: &EspState, request: &TransferRequest) -> (StatusCode,
             json!({"error": "the mint lock is poisoned"}),
         );
     };
-    let rot = match rotor_of(state, &mut logic) {
+    let mut rot = match rotor_of(state, &mut logic) {
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
     };
-    let gens = rot.gens(&logic);
-    // Notes pending rollovers hold (locked after the rotor, as everywhere).
-    match state.rollovers.lock() {
-        Ok(store) => responses.set_external_holds(store.held_nonces("")),
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": "the rollovers lock is poisoned"}),
-            );
-        }
+    // Notes and outputs pending rollovers hold (locked after the rotor).
+    if let Err(e) = hold_for_rollovers(state, &mut responses) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e}));
     }
+    let gens = rot.gens(&logic);
     match transfer::transfer_gens(&gens, &mut responses, request, &settings) {
         Ok(response) => match serde_json::to_value(&response) {
-            Ok(body) => (StatusCode::OK, body),
+            Ok(body) => {
+                // Finished: the burn proofs of this transfer (see
+                // `Retired::burn_proofs`) are of no use any more.
+                let id = transfer::request_hash(request);
+                if let Err(e) = rot.forget_proofs(crate::rotation::Source::Responses, &id) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": e.to_string()}),
+                    );
+                }
+                (StatusCode::OK, body)
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({"error": e.to_string()}),
@@ -462,21 +481,15 @@ pub fn run_redeem(state: &EspState, body: &[u8], now_unix: u64) -> (StatusCode, 
             json!({"error": "the mint lock is poisoned"}),
         );
     };
-    let rot = match rotor_of(state, &mut logic) {
+    let mut rot = match rotor_of(state, &mut logic) {
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
     };
-    let gens = rot.gens(&logic);
-    // Notes pending rollovers hold (locked after the rotor, as everywhere).
-    match state.rollovers.lock() {
-        Ok(store) => responses.set_external_holds(store.held_nonces("")),
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": "the rollovers lock is poisoned"}),
-            );
-        }
+    // Notes and outputs pending rollovers hold (locked after the rotor).
+    if let Err(e) = hold_for_rollovers(state, &mut responses) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e}));
     }
+    let gens = rot.gens(&logic);
     match redeem::redeem_gens(
         &gens,
         &mut responses,
@@ -486,7 +499,18 @@ pub fn run_redeem(state: &EspState, body: &[u8], now_unix: u64) -> (StatusCode, 
         now_unix,
     ) {
         Ok(response) => match serde_json::to_value(&response) {
-            Ok(body) => (StatusCode::OK, body),
+            Ok(body) => {
+                // Finished: the burn proofs of this redemption are of no use
+                // any more (see `Retired::burn_proofs`).
+                let id = redeem::request_hash(&request);
+                if let Err(e) = rot.forget_proofs(crate::rotation::Source::Responses, &id) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": e.to_string()}),
+                    );
+                }
+                (StatusCode::OK, body)
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({"error": e.to_string()}),
@@ -768,7 +792,7 @@ pub fn rollover_outcome(
             json!({"error": "the mint lock is poisoned"}),
         );
     };
-    let rot = match rotor_of(state, &mut logic) {
+    let mut rot = match rotor_of(state, &mut logic) {
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
     };
@@ -778,14 +802,26 @@ pub fn rollover_outcome(
             json!({"error": "the rollovers lock is poisoned"}),
         );
     };
-    // Notes an unfinished transfer or redemption will burn.
-    let (mut held, _) = responses.redeem_holds("");
-    for (_, p) in responses.pending_transfers() {
-        held.extend(p.inputs.iter().cloned());
-    }
-    let held: std::collections::HashSet<String> = held.into_iter().collect();
-    match crate::rotation::rollover(&rot.gens(&logic), &rot, &mut store, &held, req, max_items) {
-        Ok(a) => (StatusCode::OK, serde_json::to_value(a).unwrap_or_default()),
+    // What unfinished exchanges, transfers and redemptions hold.
+    let (notes, outputs) = responses.held_by_all();
+    let held = crate::rotation::Held { notes, outputs };
+    let result =
+        crate::rotation::rollover(&rot.gens(&logic), &rot, &mut store, &held, req, max_items);
+    match result {
+        Ok(a) => {
+            // Finished: its burn proofs (see `Retired::burn_proofs`) are of no
+            // use any more. A resend of the answer comes back here to try again.
+            if let Err(e) = rot.forget_proofs(crate::rotation::Source::Rollovers, &req.hash()) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": e.to_string()}),
+                );
+            }
+            (StatusCode::OK, serde_json::to_value(a).unwrap_or_default())
+        }
+        Err(crate::rotation::RolloverError::Coded(code, e)) => {
+            (StatusCode::BAD_REQUEST, json!({"error": e, "code": code}))
+        }
         Err(crate::rotation::RolloverError::Refused(e)) => {
             (StatusCode::BAD_REQUEST, json!({"error": e}))
         }

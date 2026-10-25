@@ -35,10 +35,11 @@
 //!    holder authorized exactly this request, because they cover the memo.
 //! 3. Write a `pending` entry under the request hash. It lists the PSP note
 //!    nonces and the output blind nonces, which reserves them.
-//! 4. Burn the PSP notes. If the PSP refuses (its `/melt` answers `400`) and
-//!    `/burns` shows none of the notes burned under this memo, nothing was
-//!    burned, and the `pending` entry is removed again (see `withdraw`) and the
-//!    request is answered `400`. A fault or a timeout leaves the entry.
+//! 4. Burn the PSP notes. If the PSP refuses (its `/melt` answers `400`),
+//!    nothing was burned, and the `pending` entry is removed again (see
+//!    `withdraw`) and the request is answered `400`; for a retry, only once
+//!    `/burns` shows none of the notes burned under this memo. A fault or a
+//!    timeout leaves the entry.
 //! 5. Sign the outputs and write a `done` entry.
 //!
 //! A retry of a done request returns the stored response. A retry of a pending
@@ -304,8 +305,9 @@ fn internal<E: ToString>(e: E) -> ExchangeError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeltError {
     /// The PSP refused the melt (its `400`). A refused melt burns nothing and
-    /// records nothing. (An earlier melt of the same exchange may have run since;
-    /// `burn` asks `/burns` before it takes the refusal as it stands.)
+    /// records nothing. (For a retry, an earlier melt of the same exchange may
+    /// have run since; `burn` asks `/burns` before it takes a retry's refusal as
+    /// it stands. A fresh request's refusal stands as it is.)
     Refused(String),
     /// The outcome is not known: the PSP could not be reached, timed out,
     /// answered with a fault or with something unreadable. The notes may or may
@@ -490,9 +492,10 @@ fn check_amounts(
 ///    the output blind nonces and records the terms. After this, a crash at any
 ///    point is picked up by a retry.
 /// 4. [`burn_phase`] (no lock): the PSP burns the notes, or on a retry says
-///    whether it already did. If the PSP refuses the burn and `/burns` shows
-///    none of the notes burned under this memo, [`withdraw`] (lock) takes the
-///    `pending` entry out again, and the request is answered `400`.
+///    whether it already did. If the PSP refuses the burn (for a retry, once
+///    `/burns` shows none of the notes burned under this memo), [`withdraw`]
+///    (lock) takes the `pending` entry out again, and the request is answered
+///    `400`.
 /// 5. [`finish_gens`] (lock): the entry is checked to still be the pending one
 ///    this request wrote, the outputs are signed and the `done` entry is written.
 ///
@@ -582,7 +585,32 @@ pub fn prepare_gens(
     }
     let resumed = matches!(stored, Some(Entry::Pending { .. }));
     let (logic, _, _) = signer_for(gens, request, resumed)?;
-    prepare(logic, responses, now_unix, request, settings)
+    let prepared = prepare(logic, responses, now_unix, request, settings)?;
+    if let Prepared::Go(plan) = &prepared
+        && !plan.recovering
+    {
+        unsigned_by_either(gens, request)?;
+    }
+    Ok(prepared)
+}
+
+/// The same outputs can be named under either live keyset, which makes two
+/// requests with different hashes and one memo. A blind nonce either live set
+/// has signed is used, whichever set this request names; else one burn would be
+/// signed for twice. A retry is not looked at: its entry is on file already.
+fn unsigned_by_either(
+    gens: &crate::rotation::Gens,
+    request: &ExchangeRequest,
+) -> Result<(), ExchangeError> {
+    for output in &request.outputs {
+        if gens
+            .is_blind_nonce_used(&output.blind_nonce)
+            .map_err(internal)?
+        {
+            return Err(Rejection::BlindNonceAlreadyUsed.into());
+        }
+    }
+    Ok(())
 }
 
 /// Phase 3 (hold the lock): check again and write the `pending` entry. Does
@@ -594,6 +622,9 @@ pub fn reserve_gens(
     plan: &Plan,
 ) -> Result<(), ExchangeError> {
     let (logic, _, _) = signer_for(gens, request, plan.recovering)?;
+    if !plan.recovering {
+        unsigned_by_either(gens, request)?;
+    }
     reserve(logic, responses, request, plan)
 }
 
@@ -776,6 +807,13 @@ fn check_free(
     if held_outputs.iter().any(|n| redeem_outputs.contains(n)) {
         return Err(Rejection::NoteHeld.into());
     }
+    // A pending rollover will sign its output blind nonces.
+    if held_outputs
+        .iter()
+        .any(|n| responses.external_out_holds().contains(n))
+    {
+        return Err(Rejection::NoteHeld.into());
+    }
     if blind_nonce_used {
         return Err(Rejection::BlindNonceAlreadyUsed.into());
     }
@@ -836,7 +874,7 @@ pub fn burn_phase(
     plan: &Plan,
 ) -> Result<(), ExchangeError> {
     if !plan.recovering {
-        return burn(psp, request, &plan.memo, plan.psp_total);
+        return burn(psp, request, &plan.memo, plan.psp_total, false);
     }
     let burns = psp_burns(psp, &plan.nonces)?;
     // A note that is spent counts as burned by this exchange only if the PSP
@@ -858,7 +896,7 @@ pub fn burn_phase(
             "some PSP notes are spent and some are not, which needs a person to look".into(),
         ))
     } else {
-        burn(psp, request, &plan.memo, plan.psp_total)
+        burn(psp, request, &plan.memo, plan.psp_total, true)
     }
 }
 
@@ -951,15 +989,22 @@ fn burn(
     request: &ExchangeRequest,
     memo: &str,
     expected_psp_units: u128,
+    recovering: bool,
 ) -> Result<(), ExchangeError> {
     let burned = match psp.melt_checked(&request.psp_inputs, &request.psp_input_keysets, memo) {
         Ok(burned) => burned,
         Err(MeltError::Unknown(e)) => return Err(ExchangeError::Psp(e)),
+        // A fresh request has never melted, so its `400` is a refusal: notes
+        // burned under its memo were burned by another request (the same
+        // outputs under the other live keyset have the same memo), not by it.
+        Err(MeltError::Refused(why)) if !recovering => {
+            return Err(Rejection::PspRefusedBurn { why }.into());
+        }
         Err(MeltError::Refused(why)) => {
-            // A `400` can be stale: an earlier attempt's melt that timed out here
-            // may have run at the PSP since the retry looked at the notes, and
-            // then this melt finds them spent. So before the entry goes, ask what
-            // became of the notes, as a retry does. All burned under this memo:
+            // A retry's `400` can be stale: an earlier attempt's melt that timed
+            // out here may have run at the PSP since the retry looked at the
+            // notes, and then this melt finds them spent. So before the entry
+            // goes, ask what became of the notes. All burned under this memo:
             // the earlier attempt's melt ran, so the exchange goes on. Some of
             // them: for a person. None: the refusal stands.
             let nonces: Vec<Nonce> = request.psp_inputs.iter().map(|i| i.note.nonce).collect();
@@ -1714,6 +1759,73 @@ mod tests {
         assert!(s.run(&request).is_ok());
         assert!(matches!(s.responses.get(&hash), Some(Entry::Done(_))));
         assert_eq!(s.esp_issued(), ONE_PSP);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    /// Two exchanges of one note with the same service and outputs, so one memo
+    /// and one set of spend signatures, that differ only in the keyset: the rival
+    /// names the previous live set, the first the current one. The first is
+    /// prepared and prechecked while the note is unspent; then the rival runs from
+    /// start to finish and burns the note. Returns the first and its plan.
+    fn rival_finishes_first(s: &mut Setup) -> (ExchangeRequest, Plan) {
+        use std::sync::atomic::Ordering;
+        s.rotor.first_issue = Some(NOW);
+        s.rotor.clock.store(NOW + 3600, Ordering::SeqCst);
+        s.rotor.refresh(&mut s.logic).unwrap();
+        let (note, keypair) = s.psp.note(1);
+        let (mut rival, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
+        rival.keyset = s.rotor.previous.as_ref().unwrap().0.id.clone();
+        let mut first = rival.clone();
+        first.keyset = s.rotor.current.id.clone();
+        assert_ne!(request_hash(&first).unwrap(), request_hash(&rival).unwrap());
+        let settings = ExchangeSettings::default();
+        let gens = s.rotor.gens(&s.logic);
+        let Ok(Prepared::Go(plan)) = prepare_gens(&gens, &s.responses, NOW, &first, &settings)
+        else {
+            panic!("the first exchange is not prepared");
+        };
+        precheck(&s.psp, &plan).unwrap();
+        exchange_gens(&gens, &s.psp, &mut s.responses, NOW, &rival, &settings).unwrap();
+        (first, plan)
+    }
+
+    /// Issued by both live sets.
+    fn issued_by_both(s: &Setup) -> u64 {
+        let previous = s.rotor.previous.as_ref().unwrap();
+        s.esp_issued() + previous.1.audit_totals().unwrap().0.units
+    }
+
+    #[test]
+    fn a_fresh_exchange_does_not_take_a_rivals_burn_for_its_own() {
+        // Fails if a refused melt of a request that has never melted is looked up
+        // in `/burns`: the note is burned under the same memo (by the rival), the
+        // request goes on, and signs the outputs a second time for one burn.
+        let mut s = setup("rival-burn");
+        let (first, plan) = rival_finishes_first(&mut s);
+        assert!(matches!(
+            burn_phase(&s.psp, &first, &plan),
+            Err(ExchangeError::Rejected(Rejection::PspRefusedBurn { .. }))
+        ));
+        assert_eq!(issued_by_both(&s), ONE_PSP);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn an_output_the_other_live_set_signed_is_used_for_an_exchange_too() {
+        // Fails if the check for a used blind nonce looks only at the set the
+        // request names: the first exchange is reserved and stays pending, and a
+        // retry takes the note burned under the memo as burned by itself.
+        let mut s = setup("rival-reserve");
+        let (first, plan) = rival_finishes_first(&mut s);
+        let reserved = reserve_gens(&s.rotor.gens(&s.logic), &mut s.responses, &first, &plan);
+        assert!(matches!(
+            reserved,
+            Err(ExchangeError::Rejected(Rejection::BlindNonceAlreadyUsed))
+        ));
+        assert_eq!(s.responses.pending_exchanges().count(), 0);
+        // Sent again, it is refused in the first phase.
+        assert_eq!(rejection(s.run(&first)), Rejection::BlindNonceAlreadyUsed);
+        assert_eq!(issued_by_both(&s), ONE_PSP);
         fs::remove_dir_all(&s.dir).unwrap();
     }
 

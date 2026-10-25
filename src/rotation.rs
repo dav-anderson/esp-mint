@@ -184,14 +184,17 @@ struct Retired {
     /// Written, and synced, before the generation is deleted.
     #[serde(default)]
     ids: Vec<String>,
-    /// Burn proofs taken from a spent list just before it is deleted: the
-    /// nonces (hex) that an unfinished request held and that were spent in
-    /// the retiring set. Only the request holding a note can burn it, so each
-    /// was burned by its holder. Written in the same save as the retired ID,
-    /// before anything is deleted, so no crash can lose the proof with the
-    /// list. Trimmed at each retirement to notes still held.
-    #[serde(default)]
-    burn_proofs: std::collections::BTreeSet<String>,
+    /// Burn proofs taken from a spent list just before it is deleted, by the
+    /// request that held the note: `Source::key` of the request -> the nonces
+    /// (hex) it held that were spent in the retiring set. Only the request
+    /// holding a note can burn it, so each was burned by its holder, and only
+    /// that request may use the proof (`Gens::burn_proven`). Written in the
+    /// same save as the retired ID, before anything is deleted, so no crash can
+    /// lose the proof with the list. Dropped when the request finishes
+    /// (`Rotor::forget_proofs`) and trimmed at each retirement to the notes
+    /// still held. A file written before this shape (a flat list of nonces, or
+    /// no `burn_proofs`) does not open, and the mint stops naming the file.
+    burn_proofs: BTreeMap<String, std::collections::BTreeSet<String>>,
     issued: u64,
     redeemed: u64,
 }
@@ -205,6 +208,25 @@ pub fn load_first_issue(base: &Path) -> Result<Option<u64>, Box<dyn Error>> {
     Ok(load_json::<FirstIssue>(&base.join(FIRST_ISSUE_FILE))?.map(|f| f.first_issue))
 }
 
+/// The store an unfinished request is kept in. A request hash is unique within
+/// a store only: transfers and redemptions are in `responses.json`, rollovers
+/// in `rollovers.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Responses,
+    Rollovers,
+}
+
+impl Source {
+    /// The key of request `id` in `Retired::burn_proofs`.
+    fn key(self, id: &str) -> String {
+        match self {
+            Source::Responses => format!("responses:{id}"),
+            Source::Rollovers => format!("rollovers:{id}"),
+        }
+    }
+}
+
 /// The two live generations, both with their databases open.
 pub struct Gens<'a> {
     pub current: (&'a MintLogic, &'a MasterSecret),
@@ -213,17 +235,21 @@ pub struct Gens<'a> {
     pub previous_id: Option<String>,
     /// The retired keyset IDs, oldest first (see [`RETIRED_KEYSETS_CAP`]).
     pub retired: &'a [String],
-    /// Notes (nonce hex) proven burned when their keyset was deleted.
-    pub burn_proofs: Option<&'a std::collections::BTreeSet<String>>,
+    /// Notes (nonce hex) proven burned when their keyset was deleted, by the
+    /// request that held them (see `Retired::burn_proofs`).
+    pub burn_proofs: Option<&'a BTreeMap<String, std::collections::BTreeSet<String>>>,
 }
 
 impl<'a> Gens<'a> {
-    /// Whether `input` was proven burned (by the request holding it) when its
-    /// keyset was deleted: read from the deleted set's spent list just before
-    /// the deletion, see `Retired::burn_proofs`.
-    pub fn burn_proven(&self, input: &MintInput) -> bool {
-        self.burn_proofs
-            .is_some_and(|p| p.contains(&hex::encode(input.note.nonce.0.serialize())))
+    /// Whether `input` was proven burned by request `id` of `source`, the one
+    /// that held it, when its keyset was deleted: read from the deleted set's
+    /// spent list just before the deletion, see `Retired::burn_proofs`. A
+    /// proof taken for another request does not count.
+    pub fn burn_proven(&self, source: Source, id: &str, input: &MintInput) -> bool {
+        self.burn_proofs.is_some_and(|p| {
+            p.get(&source.key(id))
+                .is_some_and(|n| n.contains(&hex::encode(input.note.nonce.0.serialize())))
+        })
     }
 
     /// Which live generation `id` names; `keyset_retired` for a deleted one on
@@ -245,13 +271,12 @@ impl<'a> Gens<'a> {
         &self,
         id: &str,
     ) -> Result<(&'a MintLogic, &'a MasterSecret, String), KeysetError> {
-        Ok(match self.resolve(id)? {
-            Side::Current => (self.current.0, self.current.1, self.current_id.clone()),
-            Side::Previous => {
-                let (l, m) = self.previous.expect("resolved");
-                (l, m, id.to_string())
-            }
-        })
+        match (self.resolve(id)?, self.previous) {
+            (Side::Previous, Some((l, m))) => Ok((l, m, id.to_string())),
+            // `resolve` names the previous set only when there is one.
+            (Side::Previous, None) => Err(KeysetError::Unknown(id.to_string())),
+            (Side::Current, _) => Ok((self.current.0, self.current.1, self.current_id.clone())),
+        }
     }
 
     /// The generation and key to check `input` with, by the keyset it names.
@@ -283,6 +308,12 @@ impl<'a> Gens<'a> {
             Err(_) if resumed => Ok((self.current.0, self.current.1, self.current_id.clone())),
             Err(e) => Err(e),
         }
+    }
+
+    /// Signed by either live generation.
+    pub fn is_blind_nonce_used(&self, nonce: &mint_types::BlindNonce) -> Result<bool, String> {
+        let used = |l: &MintLogic| l.is_blind_nonce_used(nonce).map_err(|e| e.to_string());
+        Ok(used(self.current.0)? || self.previous.map_or(Ok(false), |(p, _)| used(p))?)
     }
 
     /// Spent in either live generation.
@@ -421,36 +452,73 @@ impl Rotor {
         }
     }
 
-    /// The ESP notes (nonce hex) unfinished requests hold, read from their
-    /// stores on disk (every pending entry is written before its burn):
-    /// transfers and redemptions in `responses.json`, rollovers in
-    /// `rollovers.json`.
-    fn held_on_disk(&self) -> Result<std::collections::HashSet<String>, Box<dyn Error>> {
-        let mut held = std::collections::HashSet::new();
+    /// The ESP notes (nonce hex) unfinished requests hold, by request
+    /// (`Source::key`), read from their stores on disk (every pending entry is
+    /// written before its burn): transfers and redemptions in `responses.json`,
+    /// rollovers in `rollovers.json`.
+    fn held_on_disk(
+        &self,
+    ) -> Result<BTreeMap<String, std::collections::BTreeSet<String>>, Box<dyn Error>> {
+        let mut held = BTreeMap::new();
         let responses = crate::responses::Responses::open(&self.base.join(RESPONSES_FILE))
             .map_err(|e| e.to_string())?;
-        held.extend(responses.redeem_holds("").0);
-        for (_, p) in responses.pending_transfers() {
-            held.extend(p.inputs.iter().cloned());
+        for (id, p) in responses.pending_redemptions() {
+            held.insert(
+                Source::Responses.key(id),
+                p.inputs.iter().cloned().collect(),
+            );
         }
-        held.extend(Rollovers::open(&self.base)?.held_nonces(""));
+        for (id, p) in responses.pending_transfers() {
+            held.insert(
+                Source::Responses.key(id),
+                p.inputs.iter().cloned().collect(),
+            );
+        }
+        for (id, nonces) in Rollovers::open(&self.base)?.holds() {
+            held.insert(Source::Rollovers.key(id), nonces.iter().cloned().collect());
+        }
         Ok(held)
     }
 
-    fn retire(&mut self, g: Generation, logic: MintLogic) -> Result<(), Box<dyn Error>> {
-        if !self.retired.epochs.contains(&g.epoch) {
-            // Burn proofs from this set's spent list, the last moment it exists.
-            let held = self.held_on_disk()?;
-            self.retired.burn_proofs.retain(|n| held.contains(n));
+    /// Burn proofs from this set's spent list, the last moment it exists: for
+    /// each unfinished request, the notes it holds that are spent here were
+    /// burned by that request (no other request may take them). Each proof is
+    /// kept under the request that held the note; a proof of a note its request
+    /// no longer holds (it finished) is dropped.
+    fn take_proofs(&mut self, logic: &MintLogic) -> Result<(), Box<dyn Error>> {
+        let mut proofs = BTreeMap::new();
+        for (key, held) in self.held_on_disk()? {
+            let mut got = self.retired.burn_proofs.remove(&key).unwrap_or_default();
+            got.retain(|n| held.contains(n));
             for n in &held {
                 let Ok(bytes) = hex::decode(n) else { continue };
                 let Ok(pk) = secp256k1::PublicKey::from_slice(&bytes) else {
                     continue;
                 };
                 if logic.is_spent(Nonce(pk)).map_err(|e| e.to_string())? {
-                    self.retired.burn_proofs.insert(n.clone());
+                    got.insert(n.clone());
                 }
             }
+            if !got.is_empty() {
+                proofs.insert(key, got);
+            }
+        }
+        self.retired.burn_proofs = proofs;
+        Ok(())
+    }
+
+    /// Drop the burn proofs of request `id` of `source`, which has finished.
+    /// Saved at once. The caller holds the rotor.
+    pub fn forget_proofs(&mut self, source: Source, id: &str) -> Result<(), Box<dyn Error>> {
+        if self.retired.burn_proofs.remove(&source.key(id)).is_some() {
+            save_json(&self.base.join(RETIRED_FILE), &self.retired)?;
+        }
+        Ok(())
+    }
+
+    fn retire(&mut self, g: Generation, logic: MintLogic) -> Result<(), Box<dyn Error>> {
+        if !self.retired.epochs.contains(&g.epoch) {
+            self.take_proofs(&logic)?;
             let (i, d) = logic.audit_totals().map_err(|e| e.to_string())?;
             self.retired.epochs.push(g.epoch);
             self.retired.ids.push(g.id.clone());
@@ -676,6 +744,11 @@ pub struct Rollovers {
     /// transfer, redemption) may take them meanwhile.
     #[serde(default)]
     holds: BTreeMap<String, Vec<String>>,
+    /// The output blind nonces (hex) each pending rollover will sign, written
+    /// with the pending entry before anything is burned and dropped when the
+    /// rollover finishes. No other request may sign them meanwhile. A file
+    /// without this field (written by 0.8.1 or earlier) does not open.
+    out_holds: BTreeMap<String, Vec<String>>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -692,12 +765,20 @@ impl Rollovers {
     }
 
     /// Record the rollover `id` as started under `epoch`, holding the notes
-    /// (nonce hex) it is about to burn, and write the file. Done before anything
-    /// is burned, so that no other request takes the notes meanwhile and a retry
-    /// after a crash knows the rollover was begun.
-    pub fn begin(&mut self, id: &str, epoch: u64, nonces: Vec<String>) -> Result<(), String> {
+    /// (nonce hex) it is about to burn and the blind nonces (hex) of the outputs
+    /// it will sign, and write the file. Done before anything is burned, so that
+    /// no other request takes them meanwhile and a retry after a crash knows the
+    /// rollover was begun.
+    pub fn begin(
+        &mut self,
+        id: &str,
+        epoch: u64,
+        nonces: Vec<String>,
+        outputs: Vec<String>,
+    ) -> Result<(), String> {
         self.pending.insert(id.to_string(), epoch);
         self.holds.insert(id.to_string(), nonces);
+        self.out_holds.insert(id.to_string(), outputs);
         self.save()
     }
 
@@ -717,11 +798,28 @@ impl Rollovers {
             .flat_map(|(_, n)| n.iter().cloned())
             .collect()
     }
+
+    /// The output blind nonces (hex) pending rollovers other than `except` hold.
+    pub fn held_outputs(&self, except: &str) -> std::collections::HashSet<String> {
+        self.out_holds
+            .iter()
+            .filter(|(h, _)| h.as_str() != except)
+            .flat_map(|(_, n)| n.iter().cloned())
+            .collect()
+    }
+
+    /// The notes each pending rollover holds, by request hash.
+    pub fn holds(&self) -> impl Iterator<Item = (&String, &Vec<String>)> + '_ {
+        self.holds.iter()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RolloverError {
     Refused(String),
+    /// Refused with a code of its own (`duplicate_blind_nonce`, `note_held`),
+    /// with why. Nothing was burned.
+    Coded(&'static str, String),
     /// `missing_keyset`, `keyset_retired` or `unknown_keyset`, with why.
     Keyset(&'static str, String),
     /// These inputs are already spent: every one of them, in order. The body
@@ -731,13 +829,25 @@ pub enum RolloverError {
     Internal(String),
 }
 
+/// What unfinished exchanges, transfers and redemptions hold (stored in
+/// `responses.json`), as hex: ESP notes they will burn, and blind nonces they
+/// will sign.
+#[derive(Default)]
+pub struct Held {
+    pub notes: std::collections::HashSet<String>,
+    pub outputs: std::collections::HashSet<String>,
+}
+
 /// Run a rollover. The caller holds the mint lock, the rotor and the store.
-/// A note held by an unfinished transfer or redemption is refused.
+/// A note held by an unfinished transfer or redemption is refused, and so is an
+/// output blind nonce one holds or the signing set has signed; a blind nonce
+/// twice in the request is refused `duplicate_blind_nonce`. All of that is
+/// checked before anything is written or burned, for a new request only.
 pub fn rollover(
     gens: &Gens,
     rotor: &Rotor,
     store: &mut Rollovers,
-    held: &std::collections::HashSet<String>,
+    held: &Held,
     req: &RolloverRequest,
     max_notes: usize,
 ) -> Result<RolloverResponse, RolloverError> {
@@ -773,22 +883,40 @@ pub fn rollover(
     // retired meanwhile were burned before, and its outputs are signed with
     // the current set if theirs retired (the reply names the keyset).
     let resumed = store.pending.get(&id).copied();
-    // Notes other pending rollovers hold.
+    // Notes other pending rollovers hold, and the notes this one holds itself.
     let others = store.held_nonces(&id);
+    let own = store.holds.get(&id).cloned().unwrap_or_default();
+    // A note twice in the request is refused first, as the keyset is looked up
+    // note by note below.
+    let mut seen = std::collections::HashSet::new();
+    for (i, input) in req.inputs.iter().enumerate() {
+        if !seen.insert(input.note.nonce) {
+            return Err(Refused(format!("input {i} is in the request twice")));
+        }
+    }
     let proven = resumed.is_some() && store.burned.contains(&id);
     let terms = Terms {
         service: req.service,
         redeemable_after_day: req.redeemable_after_day,
     };
     let digest = req.digest();
-    let mut seen = std::collections::HashSet::new();
     let mut plan = Vec::new();
     for (i, input) in req.inputs.iter().enumerate() {
+        let nonce_hex = hex::encode(input.note.nonce.0.serialize());
         let (logic, sk) = match gens.input_key(&req.input_keysets[i], input, &terms) {
             Ok(k) => k,
             // Its keyset was deleted since the request was accepted: finished
-            // without burning only if the stored state proves the burn.
-            Err(_) if proven || gens.burn_proven(input) => continue,
+            // without burning only if the stored state proves the burn. Only a
+            // request resumed, for a note it holds itself, and with a proof
+            // taken for this request, may skip a note.
+            Err(_)
+                if proven
+                    || (resumed.is_some()
+                        && own.contains(&nonce_hex)
+                        && gens.burn_proven(Source::Rollovers, &id, input)) =>
+            {
+                continue;
+            }
             Err(e) if resumed.is_some() => return Err(burn_not_proven(i, &e)),
             Err(e) => return Err(Keyset(e.code(), e.why(&format!("input {i}")))),
         };
@@ -800,11 +928,7 @@ pub fn rollover(
         logic
             .verify_spend_authorization(input, digest)
             .map_err(|_| Refused(format!("input {i}: bad spend signature")))?;
-        if !seen.insert(input.note.nonce) {
-            return Err(Refused(format!("input {i} is in the request twice")));
-        }
-        let nonce_hex = hex::encode(input.note.nonce.0.serialize());
-        if held.contains(&nonce_hex) || others.contains(&nonce_hex) {
+        if held.notes.contains(&nonce_hex) || others.contains(&nonce_hex) {
             return Err(Refused(format!(
                 "input {i} is held by an unfinished request"
             )));
@@ -835,13 +959,36 @@ pub fn rollover(
     let (out_logic, master, out_id) = gens
         .signer(&req.keyset, resumed.is_some())
         .map_err(|e| Keyset(e.code(), e.why("the outputs")))?;
+    let out_nonces: Vec<String> = req
+        .outputs
+        .iter()
+        .map(|o| hex::encode(o.blind_nonce.0.serialize()))
+        .collect();
     if resumed.is_none() {
-        for o in &req.outputs {
+        let mut once = std::collections::HashSet::new();
+        for (o, n) in out_nonces.iter().enumerate() {
+            if !once.insert(n) {
+                return Err(Coded(
+                    sp_wire::codes::DUPLICATE_BLIND_NONCE,
+                    format!("output {o} repeats a blind nonce. Nothing was burned"),
+                ));
+            }
+        }
+        let held_out = store.held_outputs(&id);
+        for (o, output) in req.outputs.iter().enumerate() {
             if out_logic
-                .is_blind_nonce_used(&o.blind_nonce)
+                .is_blind_nonce_used(&output.blind_nonce)
                 .map_err(|e| Internal(e.to_string()))?
             {
                 return Err(Refused("an output's blind nonce was used before".into()));
+            }
+            if held.outputs.contains(&out_nonces[o]) || held_out.contains(&out_nonces[o]) {
+                return Err(Coded(
+                    sp_wire::codes::NOTE_HELD,
+                    format!(
+                        "output {o}: the blind nonce is held by an unfinished request. Nothing was burned"
+                    ),
+                ));
             }
         }
         store
@@ -852,6 +999,7 @@ pub fn rollover(
                     .iter()
                     .map(|i| hex::encode(i.note.nonce.0.serialize()))
                     .collect(),
+                out_nonces,
             )
             .map_err(Internal)?;
     }
@@ -896,6 +1044,7 @@ pub fn rollover(
     store.pending.remove(&id);
     store.burned.remove(&id);
     store.holds.remove(&id);
+    store.out_holds.remove(&id);
     store.save().map_err(Internal)?;
     Ok(answer)
 }
@@ -1149,19 +1298,29 @@ mod retired_list_tests {
             r.refresh(&mut cur).unwrap();
         }
         let saved: Retired = load_json(&d.join(RETIRED_FILE)).unwrap().unwrap();
-        assert!(saved.burn_proofs.contains(&hex_of(&redeemed)));
-        assert!(saved.burn_proofs.contains(&hex_of(&transferred)));
-        assert!(!saved.burn_proofs.contains(&hex_of(&unburned)));
+        let proofs = &saved.burn_proofs;
+        assert!(proofs["responses:r1"].contains(&hex_of(&redeemed)));
+        assert!(proofs["responses:t1"].contains(&hex_of(&transferred)));
+        assert!(!proofs.contains_key("rollovers:o1"), "never burned");
+        // A proof serves its own request, in its own store, and no other.
         let g = r.gens(&cur);
-        assert!(g.burn_proven(&redeemed) && g.burn_proven(&transferred));
-        assert!(!g.burn_proven(&unburned));
+        assert!(g.burn_proven(Source::Responses, "r1", &redeemed));
+        assert!(g.burn_proven(Source::Responses, "t1", &transferred));
+        assert!(!g.burn_proven(Source::Responses, "t1", &redeemed));
+        assert!(!g.burn_proven(Source::Rollovers, "r1", &redeemed));
         // Restart: the proofs are read back.
         drop(g);
         drop(cur);
         drop(r);
-        let (r2, cur2) = Rotor::open_at(&d, 1, 1, t + 2 * 3600).unwrap();
-        assert!(r2.gens(&cur2).burn_proven(&redeemed));
-        // Once the requests are finished, the next retirement drops the proofs.
+        let (mut r2, cur2) = Rotor::open_at(&d, 1, 1, t + 2 * 3600).unwrap();
+        let proven = |r: &Rotor, id: &str, i: &MintInput| {
+            r.gens(&cur2).burn_proven(Source::Responses, id, i)
+        };
+        assert!(proven(&r2, "r1", &redeemed));
+        // A request that finishes drops its proofs at once, and only its own.
+        r2.forget_proofs(Source::Responses, "r1").unwrap();
+        assert!(!proven(&r2, "r1", &redeemed) && proven(&r2, "t1", &transferred));
+        // Once the other is finished too, the next retirement trims its proofs.
         let mut responses = crate::responses::Responses::open(&d.join(RESPONSES_FILE)).unwrap();
         responses
             .put(

@@ -90,7 +90,7 @@ use sp_wire::ServiceDid;
 use crate::ledger::Movements;
 use crate::queue::{self, Queue, QueueError, SignedOutput, Status, dec};
 use crate::responses::{Entry, Responses};
-use crate::rotation::Gens;
+use crate::rotation::{Gens, Source};
 use crate::terms::Terms;
 
 // The canonical request, its encoding and the reply types live in sp-wire; they
@@ -713,6 +713,8 @@ pub fn redeem_gens(
 
     let mut stored_plan: Option<Plan> = None;
     let mut proven = false;
+    // The notes this request holds itself (burns), when it is picked up again.
+    let mut own: Vec<String> = Vec::new();
     match responses.get(&hash) {
         Some(Entry::RedeemDone(done)) => {
             let done = done.clone();
@@ -721,6 +723,7 @@ pub fn redeem_gens(
         Some(Entry::RedeemPending(pending)) => {
             stored_plan = Some(pending.plan.clone());
             proven = pending.burned;
+            own = pending.inputs.clone();
         }
         Some(_) => {
             return Err(internal(
@@ -760,6 +763,7 @@ pub fn redeem_gens(
             let (mut held_inputs, mut held_outputs) = responses.redeem_holds(&hash);
             // Notes pending rollovers will burn.
             held_inputs.extend(responses.external_holds().iter().cloned());
+            held_outputs.extend(responses.external_out_holds().iter().cloned());
             for (other, pending) in responses.pending_transfers() {
                 if other != &hash {
                     held_inputs.extend(pending.inputs.iter().cloned());
@@ -827,8 +831,15 @@ pub fn redeem_gens(
             };
             let (logic, sk) = match gens.input_key(&ri.keyset, &ri.input, &claimed) {
                 Ok(k) => k,
-                // Proven burned when its keyset was deleted.
-                Err(_) if recovering && gens.burn_proven(&ri.input) => continue,
+                // Proven burned when its keyset was deleted: only for a note
+                // this request holds itself, with a proof taken for it.
+                Err(_)
+                    if recovering
+                        && own.contains(&nonce_hex(&ri.input))
+                        && gens.burn_proven(Source::Responses, &hash, &ri.input) =>
+                {
+                    continue;
+                }
                 Err(e) => {
                     return Err(RedeemRejection::Keyset {
                         code: sp_wire::codes::BURN_NOT_PROVEN,
@@ -1004,9 +1015,10 @@ pub fn decline_gens(
         }
     };
 
+    // A resumed signer falls back to the current set, so this does not fail.
     let (logic, master, keyset) = gens
         .signer(&record.output_keyset, true)
-        .expect("a resumed signer falls back to the current keyset");
+        .map_err(|e| DeclineError::Internal(e.why("the decline outputs")))?;
     let mut signatures = Vec::with_capacity(record.decline_outputs.len());
     let mut reissued: u128 = 0;
     for o in &record.decline_outputs {

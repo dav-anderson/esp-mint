@@ -22,6 +22,7 @@ use axum::{Json, Router};
 use esp_mint::exchange::{self, ExchangeRequest, ExchangeResponse};
 use esp_mint::psp_client::HttpPsp;
 use esp_mint::responses::{Entry, Responses};
+use esp_mint::rotation::Rollovers;
 use esp_mint::server::{self, EspState};
 use esp_mint::terms::Terms;
 use mint_core::MintLogic;
@@ -468,6 +469,26 @@ fn a_note_burned_elsewhere_during_a_pending_exchange_is_a_400_and_signs_nothing(
     assert_eq!(body["code"], "note_spent_elsewhere");
     assert_eq!(body["spent"], serde_json::json!([0]));
     assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
+    rt.shutdown_background();
+}
+
+#[test]
+fn an_output_a_pending_rollover_holds_is_refused_to_an_exchange_and_the_psp_note_survives() {
+    // Fails if the exchange does not look at the output blind nonces pending
+    // rollovers hold.
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("rollover-holds");
+    let (psp_url, psp, _) = start_psp(&rt, &dir);
+    let (note, keypair) = psp_note(&psp, 1);
+    preset_ks(&dir);
+    let (req, _) = request(note, &keypair, 1, &[ONE_PSP]);
+    let mut rollovers = Rollovers::open(&dir.join("esp")).unwrap();
+    rollovers.begin("pending", 0, vec![], held(&req).1).unwrap();
+    let esp = start_esp(&rt, &dir, &psp_url);
+    let (code, body) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 400, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("held"), "{body}");
+    assert!(!psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
     rt.shutdown_background();
 }
 

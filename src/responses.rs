@@ -123,8 +123,10 @@ pub struct Responses {
     rows: BTreeMap<String, Entry>,
     ledger: Ledger,
     /// Notes (nonce hex) held by unfinished requests stored elsewhere (pending
-    /// rollovers), set by the server before a transfer or redemption. Not saved.
+    /// rollovers), set by the server before a request. Not saved.
     external_holds: HashSet<String>,
+    /// The blind nonces (hex) the same rollovers will sign. Not saved.
+    external_out_holds: HashSet<String>,
 }
 
 impl Responses {
@@ -143,16 +145,24 @@ impl Responses {
             rows,
             ledger,
             external_holds: HashSet::new(),
+            external_out_holds: HashSet::new(),
         })
     }
 
-    /// Set the notes pending rollovers hold (see `external_holds`).
-    pub fn set_external_holds(&mut self, held: HashSet<String>) {
-        self.external_holds = held;
+    /// Set the notes and the output blind nonces pending rollovers hold (see
+    /// `external_holds`).
+    pub fn set_external_holds(&mut self, notes: HashSet<String>, outputs: HashSet<String>) {
+        self.external_holds = notes;
+        self.external_out_holds = outputs;
     }
 
     pub fn external_holds(&self) -> &HashSet<String> {
         &self.external_holds
+    }
+
+    /// The blind nonces pending rollovers will sign.
+    pub fn external_out_holds(&self) -> &HashSet<String> {
+        &self.external_out_holds
     }
 
     pub fn get(&self, hash: &str) -> Option<&Entry> {
@@ -190,6 +200,30 @@ impl Responses {
             Entry::TransferPending(pending) => Some((hash, pending)),
             _ => None,
         })
+    }
+
+    /// The redemptions that are validated and not finished, by request hash.
+    pub fn pending_redemptions(&self) -> impl Iterator<Item = (&String, &RedeemPending)> + '_ {
+        self.rows.iter().filter_map(|(hash, entry)| match entry {
+            Entry::RedeemPending(pending) => Some((hash, pending)),
+            _ => None,
+        })
+    }
+
+    /// What every request stored here holds, as hex, for a rollover: the ESP
+    /// notes unfinished transfers and redemptions will burn, and the blind
+    /// nonces unfinished exchanges, transfers and redemptions will sign (and
+    /// the decline outputs of finished redemptions).
+    pub fn held_by_all(&self) -> (HashSet<String>, HashSet<String>) {
+        let (mut notes, mut outputs) = self.redeem_holds("");
+        for (_, pending) in self.pending_transfers() {
+            notes.extend(pending.inputs.iter().cloned());
+            outputs.extend(pending.outputs.iter().cloned());
+        }
+        for (_, _, out) in self.pending_exchanges() {
+            outputs.extend(out.iter().cloned());
+        }
+        (notes, outputs)
     }
 
     /// The exchanges that are validated and not finished, by request hash, with
