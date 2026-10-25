@@ -13,7 +13,7 @@ use mint_types::{Amount, MintInput, Nonce};
 use serde::{Deserialize, Serialize};
 use sp_wire::melt::{MeltRequest, MeltResponse};
 
-use crate::exchange::{Burn, Psp};
+use crate::exchange::{Burn, MeltError, Psp};
 
 /// Body of the PSP's `POST /melt`: the melt and the keyset of each note
 /// (sp-wire's `psp::PspMeltRequest`).
@@ -39,6 +39,22 @@ struct BurnsResponse {
 struct WireBurn {
     spent: bool,
     memo: Option<String>,
+}
+
+/// Why a POST to the PSP failed: the PSP answered `400`, or anything else (the
+/// request did not get there, timed out, a `5xx`, a body that cannot be read).
+enum Failure {
+    /// The PSP's `400`. For `/melt` this means nothing was burned.
+    Refused(String),
+    Other(String),
+}
+
+impl Failure {
+    fn into_message(self) -> String {
+        match self {
+            Failure::Refused(why) | Failure::Other(why) => why,
+        }
+    }
 }
 
 /// How many times a read is tried when the connection is lost before the PSP
@@ -127,6 +143,17 @@ impl HttpPsp {
         body: &Q,
         idempotent: bool,
     ) -> Result<R, String> {
+        self.post_checked(path, body, idempotent)
+            .map_err(Failure::into_message)
+    }
+
+    /// [`post`](Self::post), with a `400` told apart from the other failures.
+    fn post_checked<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Q,
+        idempotent: bool,
+    ) -> Result<R, Failure> {
         let send = || {
             self.client
                 .post(format!("{}{path}", self.base))
@@ -135,13 +162,20 @@ impl HttpPsp {
                 .send()
         };
         let response = if idempotent { self.read(send) } else { send() }
-            .map_err(|e| format!("psp {path}: {e}"))?;
+            .map_err(|e| Failure::Other(format!("psp {path}: {e}")))?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().unwrap_or_default();
-            return Err(format!("psp {path} returned {status}: {text}"));
+            let why = format!("psp {path} returned {status}: {text}");
+            return Err(if status == reqwest::StatusCode::BAD_REQUEST {
+                Failure::Refused(why)
+            } else {
+                Failure::Other(why)
+            });
         }
-        response.json().map_err(|e| format!("psp {path}: {e}"))
+        response
+            .json()
+            .map_err(|e| Failure::Other(format!("psp {path}: {e}")))
     }
 }
 
@@ -156,17 +190,35 @@ impl Psp for HttpPsp {
         keysets: &[String],
         memo: &str,
     ) -> Result<Amount, String> {
-        let melted: MeltResponse = self.post(
-            "/melt",
-            &PspMelt {
-                melt: MeltRequest {
-                    inputs: inputs.to_vec(),
-                    memo: memo.to_string(),
+        self.melt_checked(inputs, keysets, memo)
+            .map_err(|e| e.to_string())
+    }
+
+    /// `400` from `/melt` is a refusal: the PSP checks everything before it
+    /// records or burns anything, so nothing was burned. Every other failure is
+    /// not known.
+    fn melt_checked(
+        &self,
+        inputs: &[MintInput],
+        keysets: &[String],
+        memo: &str,
+    ) -> Result<Amount, MeltError> {
+        let melted: MeltResponse = self
+            .post_checked(
+                "/melt",
+                &PspMelt {
+                    melt: MeltRequest {
+                        inputs: inputs.to_vec(),
+                        memo: memo.to_string(),
+                    },
+                    keysets,
                 },
-                keysets,
-            },
-            false,
-        )?;
+                false,
+            )
+            .map_err(|f| match f {
+                Failure::Refused(why) => MeltError::Refused(why),
+                Failure::Other(why) => MeltError::Unknown(why),
+            })?;
         Ok(melted.burned)
     }
 

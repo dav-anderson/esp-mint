@@ -35,7 +35,10 @@
 //!    holder authorized exactly this request, because they cover the memo.
 //! 3. Write a `pending` entry under the request hash. It lists the PSP note
 //!    nonces and the output blind nonces, which reserves them.
-//! 4. Burn the PSP notes.
+//! 4. Burn the PSP notes. If the PSP refuses (its `/melt` answers `400`) and
+//!    `/burns` shows none of the notes burned under this memo, nothing was
+//!    burned, and the `pending` entry is removed again (see `withdraw`) and the
+//!    request is answered `400`. A fault or a timeout leaves the entry.
 //! 5. Sign the outputs and write a `done` entry.
 //!
 //! A retry of a done request returns the stored response. A retry of a pending
@@ -158,6 +161,11 @@ pub enum Rejection {
     /// A PSP note or an output blind nonce is held by another request that is
     /// not finished.
     NoteHeld,
+    /// The PSP refused to burn the notes (its `/melt` answered `400`). Nothing
+    /// was burned, so the request's entry is gone and it can be built again.
+    PspRefusedBurn {
+        why: String,
+    },
     /// `psp_input_keysets` does not name one keyset per PSP note.
     MissingKeyset,
     /// The output keyset is missing, retired or not this mint's. Nothing was
@@ -238,6 +246,10 @@ impl fmt::Display for Rejection {
                 f,
                 "a PSP note or an output blind nonce is held by another request that is not finished. Nothing was burned"
             ),
+            Rejection::PspRefusedBurn { why } => write!(
+                f,
+                "the PSP refused to burn the notes: {why}. Nothing was burned or issued"
+            ),
         }
     }
 }
@@ -246,7 +258,10 @@ impl fmt::Display for Rejection {
 pub enum ExchangeError {
     /// The request is refused. Nothing was burned.
     Rejected(Rejection),
-    /// The PSP could not be reached or refused the burn. A retry is safe.
+    /// The PSP could not be reached, or its answer is not known or not usable
+    /// (a fault, a timeout, a burn of another size than asked). Something may
+    /// be burned, and the entry stays: a retry is safe. (A burn the PSP refused
+    /// is a [`Rejection::PspRefusedBurn`] instead.)
     Psp(String),
     /// A fault in the mint. A retry is safe.
     Internal(String),
@@ -264,6 +279,17 @@ impl fmt::Display for ExchangeError {
 
 impl Error for ExchangeError {}
 
+impl ExchangeError {
+    /// The PSP refused to burn the notes, so nothing was burned and the pending
+    /// entry can go (see [`withdraw`]).
+    pub fn is_burn_refusal(&self) -> bool {
+        matches!(
+            self,
+            ExchangeError::Rejected(Rejection::PspRefusedBurn { .. })
+        )
+    }
+}
+
 impl From<Rejection> for ExchangeError {
     fn from(r: Rejection) -> Self {
         ExchangeError::Rejected(r)
@@ -272,6 +298,27 @@ impl From<Rejection> for ExchangeError {
 
 fn internal<E: ToString>(e: E) -> ExchangeError {
     ExchangeError::Internal(e.to_string())
+}
+
+/// Why the PSP's `/melt` did not burn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeltError {
+    /// The PSP refused the melt (its `400`). A refused melt burns nothing and
+    /// records nothing. (An earlier melt of the same exchange may have run since;
+    /// `burn` asks `/burns` before it takes the refusal as it stands.)
+    Refused(String),
+    /// The outcome is not known: the PSP could not be reached, timed out,
+    /// answered with a fault or with something unreadable. The notes may or may
+    /// not be burned.
+    Unknown(String),
+}
+
+impl fmt::Display for MeltError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MeltError::Refused(e) | MeltError::Unknown(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 /// What the PSP says about one note.
@@ -298,6 +345,19 @@ pub trait Psp {
     ) -> Result<Amount, String> {
         let _ = keysets;
         self.melt(inputs, memo)
+    }
+    /// [`Psp::melt_named`], with a refusal told apart from "not known" (see
+    /// [`MeltError`]). The default says every error is unknown, which keeps the
+    /// entry: an implementation that can tell that nothing was burned overrides
+    /// it (`HttpPsp` does, for a `400`).
+    fn melt_checked(
+        &self,
+        inputs: &[MintInput],
+        keysets: &[String],
+        memo: &str,
+    ) -> Result<Amount, MeltError> {
+        self.melt_named(inputs, keysets, memo)
+            .map_err(MeltError::Unknown)
     }
     /// For each nonce, in order: whether it is spent, and the memo it was
     /// burned under.
@@ -430,7 +490,9 @@ fn check_amounts(
 ///    the output blind nonces and records the terms. After this, a crash at any
 ///    point is picked up by a retry.
 /// 4. [`burn_phase`] (no lock): the PSP burns the notes, or on a retry says
-///    whether it already did.
+///    whether it already did. If the PSP refuses the burn and `/burns` shows
+///    none of the notes burned under this memo, [`withdraw`] (lock) takes the
+///    `pending` entry out again, and the request is answered `400`.
 /// 5. [`finish_gens`] (lock): the entry is checked to still be the pending one
 ///    this request wrote, the outputs are signed and the `done` entry is written.
 ///
@@ -535,6 +597,17 @@ pub fn reserve_gens(
     reserve(logic, responses, request, plan)
 }
 
+/// Phase 4, after the PSP refused the burn (hold the lock): take the request's
+/// `pending` entry out again, which releases the PSP notes and the blind nonces
+/// it held. Only a `pending` entry goes; if the hash holds anything else (a
+/// finished answer), it stays. A refused melt burns nothing, so nothing is
+/// owed for this entry, and the request, sent again, is a new one with every
+/// check.
+pub fn withdraw(responses: &mut Responses, plan: &Plan) -> Result<(), ExchangeError> {
+    responses.remove_pending(&plan.hash).map_err(internal)?;
+    Ok(())
+}
+
 /// Phase 5 (hold the lock): sign the outputs and write the `done` entry. An
 /// exchange accepted before a rotation and finished after it, whose keyset
 /// retired in between, is signed with the current set; the reply names the
@@ -567,7 +640,12 @@ pub fn exchange_gens(
     };
     precheck(psp, &plan)?;
     reserve_gens(gens, responses, request, &plan)?;
-    burn_phase(psp, request, &plan)?;
+    if let Err(e) = burn_phase(psp, request, &plan) {
+        if e.is_burn_refusal() {
+            withdraw(responses, &plan)?;
+        }
+        return Err(e);
+    }
     finish_gens(gens, responses, request, &plan)
 }
 
@@ -874,9 +952,31 @@ fn burn(
     memo: &str,
     expected_psp_units: u128,
 ) -> Result<(), ExchangeError> {
-    let burned = psp
-        .melt_named(&request.psp_inputs, &request.psp_input_keysets, memo)
-        .map_err(ExchangeError::Psp)?;
+    let burned = match psp.melt_checked(&request.psp_inputs, &request.psp_input_keysets, memo) {
+        Ok(burned) => burned,
+        Err(MeltError::Unknown(e)) => return Err(ExchangeError::Psp(e)),
+        Err(MeltError::Refused(why)) => {
+            // A `400` can be stale: an earlier attempt's melt that timed out here
+            // may have run at the PSP since the retry looked at the notes, and
+            // then this melt finds them spent. So before the entry goes, ask what
+            // became of the notes, as a retry does. All burned under this memo:
+            // the earlier attempt's melt ran, so the exchange goes on. Some of
+            // them: for a person. None: the refusal stands.
+            let nonces: Vec<Nonce> = request.psp_inputs.iter().map(|i| i.note.nonce).collect();
+            let burns = psp_burns(psp, &nonces)?;
+            let ours = burns
+                .iter()
+                .filter(|b| b.spent && b.memo.as_deref() == Some(memo))
+                .count();
+            return match ours {
+                0 => Err(Rejection::PspRefusedBurn { why }.into()),
+                n if n == burns.len() => Ok(()),
+                _ => Err(ExchangeError::Psp(format!(
+                    "the PSP refused the burn ({why}) but some of the notes are burned under this exchange's memo, which needs a person to look at"
+                ))),
+            };
+        }
+    };
     if u128::from(burned.units) != expected_psp_units {
         return Err(ExchangeError::Psp(format!(
             "the PSP burned {burned} units, expected {expected_psp_units}"
@@ -933,6 +1033,10 @@ mod tests {
         fail_after_burn: Cell<bool>,
         /// The PSP cannot be asked about the notes (`/burns`).
         fail_burns: Cell<bool>,
+        /// The next melt is held: it gets no answer, and the PSP runs it just
+        /// before the melt that follows (a slow `/melt` that times out here).
+        hold_melt: Cell<bool>,
+        held: RefCell<Option<(Vec<MintInput>, String)>>,
     }
 
     impl FakePsp {
@@ -946,11 +1050,13 @@ mod tests {
                 fail_before_burn: Cell::new(false),
                 fail_after_burn: Cell::new(false),
                 fail_burns: Cell::new(false),
+                hold_melt: Cell::new(false),
+                held: RefCell::new(None),
             }
         }
 
         /// Record the memo for the notes that are not spent yet, as the real PSP
-        /// does just before it burns.
+        /// does after its checks and just before it burns.
         fn record(&self, inputs: &[MintInput], memo: &str) {
             for input in inputs {
                 if !self.logic.is_spent(input.note.nonce).unwrap() {
@@ -977,9 +1083,11 @@ mod tests {
             self.logic.melt(&[input], memo.as_bytes()).unwrap();
         }
 
-        /// A note spent with no memo on record, as one spent before the PSP kept
-        /// memos would be.
+        /// A note spent with no memo on record: one spent before the PSP kept
+        /// memos, or burned by a rollover or a spend, which clear any memo an
+        /// earlier melt left on it.
         fn burn_unrecorded(&self, note: Note, keypair: &Keypair, units: u64) {
+            self.memos.borrow_mut().remove(&nonce_key(&note.nonce));
             let unsigned = MintInput {
                 amount: Amount::from_units(units),
                 note,
@@ -1017,17 +1125,48 @@ mod tests {
 
     impl Psp for FakePsp {
         fn melt(&self, inputs: &[MintInput], memo: &str) -> Result<Amount, String> {
+            self.melt_checked(inputs, &[], memo)
+                .map_err(|e| e.to_string())
+        }
+
+        /// The real PSP's `/melt`: every check first (a refusal records and burns
+        /// nothing), then the record, then the burn.
+        fn melt_checked(
+            &self,
+            inputs: &[MintInput],
+            _keysets: &[String],
+            memo: &str,
+        ) -> Result<Amount, MeltError> {
             if self.fail_before_burn.get() {
-                return Err("unreachable".into());
+                return Err(MeltError::Unknown("unreachable".into()));
+            }
+            let held = self.held.borrow_mut().take();
+            if let Some((inputs, memo)) = held {
+                self.record(&inputs, &memo);
+                self.logic.melt(&inputs, memo.as_bytes()).unwrap();
+            }
+            if self.hold_melt.replace(false) {
+                *self.held.borrow_mut() = Some((inputs.to_vec(), memo.to_string()));
+                return Err(MeltError::Unknown("timed out".into()));
             }
             self.melts.set(self.melts.get() + 1);
+            let sighash = melt_sighash(inputs, memo.as_bytes());
+            for input in inputs {
+                self.logic
+                    .verify_note(input)
+                    .and_then(|()| self.logic.verify_spend_authorization(input, sighash))
+                    .map_err(|e| MeltError::Refused(e.to_string()))?;
+                if self.logic.is_spent(input.note.nonce).unwrap() {
+                    return Err(MeltError::Refused("a note is spent".into()));
+                }
+            }
             self.record(inputs, memo);
             let burned = self
                 .logic
                 .melt(inputs, memo.as_bytes())
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| MeltError::Unknown(e.to_string()))?;
             if self.fail_after_burn.get() {
-                return Err("timed out".into());
+                return Err(MeltError::Unknown("timed out".into()));
             }
             Ok(burned)
         }
@@ -1513,6 +1652,68 @@ mod tests {
         assert!(s.run(&request).is_ok());
         assert_eq!(s.psp.melts.get(), 1);
         assert_eq!(s.responses.pending_exchanges().count(), 0);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_burn_drops_the_entry_so_a_rolled_over_note_cannot_pay_twice() {
+        let mut s = setup("refused-burn");
+        let (two, k2) = s.psp.note(2);
+        let (one, k1) = s.psp.note(1);
+        // The notes are worth 3 PSP, but the first is claimed as 4: 5 PSP in all.
+        let (request, _) = build(&[(two, &k2, 4), (one, &k1, 1)], &[5 * ONE_PSP], None);
+        let hash = request_hash(&request).unwrap();
+        assert!(matches!(
+            rejection(s.run(&request)),
+            Rejection::PspRefusedBurn { .. }
+        ));
+        assert!(s.responses.get(&hash).is_none());
+        assert!(!s.psp.logic.is_spent(two.nonce).unwrap());
+        // The holder rolls both notes over at their true amounts. The PSP burns
+        // them and leaves no memo on them.
+        s.psp.burn_unrecorded(two, &k2, 2);
+        s.psp.burn_unrecorded(one, &k1, 1);
+        // Sent again, the request is a new one and meets every check.
+        assert_eq!(rejection(s.run(&request)), Rejection::PspNoteSpent);
+        assert_eq!(s.esp_issued(), 0);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_retry_whose_burn_is_refused_drops_the_entry_it_kept_after_a_lost_reply() {
+        let mut s = setup("refused-retry");
+        let (two, k2) = s.psp.note(2);
+        let (request, _) = build(&[(two, &k2, 4)], &[4 * ONE_PSP], None);
+        let hash = request_hash(&request).unwrap();
+        s.psp.fail_before_burn.set(true);
+        assert!(matches!(s.run(&request), Err(ExchangeError::Psp(_))));
+        assert!(s.responses.get(&hash).is_some());
+        // No note is spent, so the retry burns, and the PSP refuses.
+        s.psp.fail_before_burn.set(false);
+        assert!(matches!(
+            rejection(s.run(&request)),
+            Rejection::PspRefusedBurn { .. }
+        ));
+        assert!(s.responses.get(&hash).is_none());
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_that_a_late_melt_of_this_exchange_caused_is_not_a_refusal() {
+        let mut s = setup("late-melt");
+        let (note, keypair) = s.psp.note(1);
+        let (request, _) = build(&[(note, &keypair, 1)], &[ONE_PSP], None);
+        let hash = request_hash(&request).unwrap();
+        // The first melt times out here, and the PSP runs it later.
+        s.psp.hold_melt.set(true);
+        assert!(matches!(s.run(&request), Err(ExchangeError::Psp(_))));
+        assert!(!s.psp.logic.is_spent(note.nonce).unwrap());
+        // The retry looks at the note, finds it unspent, and sends its melt. The
+        // PSP runs the first one just before it, so the second finds the note
+        // spent and answers 400. The note was burned under this memo.
+        assert!(s.run(&request).is_ok());
+        assert!(matches!(s.responses.get(&hash), Some(Entry::Done(_))));
+        assert_eq!(s.esp_issued(), ONE_PSP);
         fs::remove_dir_all(&s.dir).unwrap();
     }
 

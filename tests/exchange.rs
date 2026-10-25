@@ -76,12 +76,29 @@ fn nonce_key(nonce: &Nonce) -> String {
     hex::encode(nonce.0.serialize())
 }
 
-/// `/melt`, which keeps the memo of the burn before it burns, as the real PSP's does.
+/// `/melt`, as the real PSP's: every check first (a `400` records and burns
+/// nothing), then the memo of the burn, then the burn.
 async fn melt_recording(
     State((state, memos)): State<(Arc<AppState>, Memos)>,
     Json(req): Json<MeltRequest>,
 ) -> Result<Json<MeltResponse>, (StatusCode, Json<serde_json::Value>)> {
     let logic = state.logic.lock().unwrap();
+    let refused = |why: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": why})),
+        )
+    };
+    let sighash = melt_sighash(&req.inputs, req.memo.as_bytes());
+    for input in &req.inputs {
+        logic
+            .verify_note(input)
+            .and_then(|()| logic.verify_spend_authorization(input, sighash))
+            .map_err(|e| refused(e.to_string()))?;
+        if logic.is_spent(input.note.nonce).unwrap() {
+            return Err(refused("a note is spent".into()));
+        }
+    }
     for input in &req.inputs {
         if !logic.is_spent(input.note.nonce).unwrap() {
             memos
@@ -95,7 +112,7 @@ async fn melt_recording(
         .map(|burned| Json(MeltResponse { burned }))
         .map_err(|e| {
             (
-                StatusCode::BAD_REQUEST,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": e.to_string()})),
             )
         })
@@ -507,6 +524,35 @@ fn an_unreachable_psp_is_a_503_and_leaves_nothing_behind() {
     assert_eq!(code, 503, "{body}");
     assert!(!psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
     assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
+    rt.shutdown_background();
+}
+
+/// The entry stored under this exchange, if any.
+fn entry_of(state: &EspState, req: &ExchangeRequest) -> Option<Entry> {
+    let hash = exchange::request_hash(req).unwrap();
+    state.responses.lock().unwrap().get(&hash).cloned()
+}
+
+#[test]
+fn a_melt_the_psp_refuses_is_a_400_that_drops_the_entry() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("refused");
+    let (psp_url, psp, memos) = start_psp(&rt, &dir);
+    let (esp, state) = start_esp_with(&rt, &dir, &psp_url, Default::default());
+
+    // A note of 2 claimed as 4: the PSP's `/melt` answers 400.
+    let (note, keypair) = psp_note(&psp, 2);
+    let (req, _) = request(note, &keypair, 4, &[4 * ONE_PSP]);
+    let (code, body) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 400, "{body}");
+    let why = body["error"].as_str().unwrap();
+    assert!(
+        why.starts_with("the PSP refused to burn the notes: psp /melt returned 400 Bad Request: ")
+    );
+    assert!(why.ends_with(". Nothing was burned or issued"), "{why}");
+    assert_eq!(entry_of(&state, &req), None);
+    assert!(memos.lock().unwrap().is_empty());
+    assert!(!psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
     rt.shutdown_background();
 }
 

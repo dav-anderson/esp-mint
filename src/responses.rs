@@ -9,9 +9,11 @@
 //! earlier wrote, does not open.
 //!
 //! An entry is `pending` from just before the PSP notes are burned until the
-//! ESP signatures are made, and `done` after that. A request that is retried
-//! gets the stored response if it is done, and is carried on from where it
-//! stopped if it is pending, so a crash after the burn never loses the notes.
+//! ESP signatures are made, and `done` after that. A pending exchange whose burn
+//! the PSP refused is removed again (`remove_pending`), since nothing was
+//! burned. A request that is retried gets the stored response if it is done, and
+//! is carried on from where it stopped if it is pending, so a crash after the
+//! burn never loses the notes.
 //!
 //! A pending entry also lists the notes it will burn and the blind nonces it
 //! will sign, so that no other request can take those notes or nonces while it
@@ -244,6 +246,21 @@ impl Responses {
         self.write(&next, &self.ledger)?;
         self.rows = next;
         Ok(())
+    }
+
+    /// Remove the entry under `hash` if it is an exchange's `pending` one, and
+    /// write the whole file. Any other entry (a finished answer, a transfer's or
+    /// a redemption's), and a missing one, is left alone. Returns whether an
+    /// entry went. Removing it lets go of the notes and nonces it reserved.
+    pub fn remove_pending(&mut self, hash: &str) -> Result<bool, ResponsesError> {
+        if !matches!(self.rows.get(hash), Some(Entry::Pending { .. })) {
+            return Ok(false);
+        }
+        let mut next = self.rows.clone();
+        next.remove(hash);
+        self.write(&next, &self.ledger)?;
+        self.rows = next;
+        Ok(true)
     }
 
     /// [`put`](Self::put) the entry that finishes a request, and in the same

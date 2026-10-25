@@ -307,8 +307,15 @@ fn run_exchange_phases(
     with_mint(state, |gens, responses| {
         exchange::reserve_gens(gens, responses, request, &plan)
     })?;
-    // 4. The burn, with no lock held. The reservation is on file.
-    exchange::burn_phase(state.psp.as_ref(), request, &plan)?;
+    // 4. The burn, with no lock held. The reservation is on file. If the PSP
+    // refuses the burn, nothing was burned: the entry is taken out again, under
+    // the lock, and the request is answered 400. A fault or a timeout keeps it.
+    if let Err(e) = exchange::burn_phase(state.psp.as_ref(), request, &plan) {
+        if e.is_burn_refusal() {
+            with_mint(state, |_, responses| exchange::withdraw(responses, &plan))?;
+        }
+        return Err(e);
+    }
     // 5. Sign and finish, under the lock.
     with_mint(state, |gens, responses| {
         exchange::finish_gens(gens, responses, request, &plan)
