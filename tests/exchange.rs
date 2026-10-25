@@ -41,6 +41,11 @@ use tokio::runtime::Runtime;
 const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 const ONE_PSP: u64 = 100_000_000_000;
 
+/// A total of `/audit`, which is a decimal string.
+fn audit_units(total: &serde_json::Value) -> u64 {
+    total.as_str().unwrap().parse().unwrap()
+}
+
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("esp-mint-http-{}-{name}", {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -348,14 +353,17 @@ fn an_exchange_over_air_burns_the_psp_and_issues_verifiable_esp() {
     assert!(psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
     let (code, audit) = get_json(&esp, "/audit");
     assert_eq!(code, 200);
-    assert_eq!(audit["issued"], 4 * ONE_PSP);
-    assert_eq!(audit["outstanding"], 4 * ONE_PSP);
+    assert_eq!(audit["issued"], (4 * ONE_PSP).to_string());
+    assert_eq!(audit["outstanding"], (4 * ONE_PSP).to_string());
 
     // the same request again returns the same response and issues nothing more
     let (code, again) = post_json(&esp, "/exchange", &req);
     assert_eq!(code, 200);
     assert_eq!(again, body);
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 4 * ONE_PSP);
+    assert_eq!(
+        get_json(&esp, "/audit").1["issued"],
+        (4 * ONE_PSP).to_string()
+    );
 
     assert_eq!(get_json(&esp, "/health").0, 200);
     assert_eq!(get_json(&esp, "/health").1["network"], "main");
@@ -426,7 +434,7 @@ fn a_retry_after_this_exchanges_own_burn_is_finished_over_air() {
     let response: ExchangeResponse = serde_json::from_value(body).unwrap();
     assert_eq!(response.redeemable_after_day, 21_000);
     assert_eq!(response.signatures.len(), wanted.len());
-    assert_eq!(get_json(&esp, "/audit").1["issued"], ONE_PSP);
+    assert_eq!(get_json(&esp, "/audit").1["issued"], ONE_PSP.to_string());
     rt.shutdown_background();
 }
 
@@ -468,7 +476,7 @@ fn a_note_burned_elsewhere_during_a_pending_exchange_is_a_400_and_signs_nothing(
     );
     assert_eq!(body["code"], "note_spent_elsewhere");
     assert_eq!(body["spent"], serde_json::json!([0]));
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
+    assert_eq!(get_json(&esp, "/audit").1["issued"], "0");
     rt.shutdown_background();
 }
 
@@ -510,7 +518,7 @@ fn a_badly_formed_or_underpaid_exchange_is_a_400_and_the_psp_note_survives() {
         "output 0: ESP amounts are powers of two. Nothing was burned"
     );
     assert!(!psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
+    assert_eq!(get_json(&esp, "/audit").1["issued"], "0");
 
     // outputs worth more than the PSP note
     let (under, under_key) = psp_note(&psp, 1);
@@ -519,14 +527,14 @@ fn a_badly_formed_or_underpaid_exchange_is_a_400_and_the_psp_note_survives() {
     assert_eq!(code, 400);
     assert!(body["error"].as_str().unwrap().contains("worth"));
     assert!(!psp.logic.lock().unwrap().is_spent(under.nonce).unwrap());
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
+    assert_eq!(get_json(&esp, "/audit").1["issued"], "0");
 
     // the same total as the first, split into powers of two, goes through
     let (req, _) = request(note, &keypair, 1, &[ONE_PSP]);
     assert!(req.outputs.len() > 1);
     let (code, body) = post_json(&esp, "/exchange", &req);
     assert_eq!(code, 200, "{body}");
-    assert_eq!(get_json(&esp, "/audit").1["issued"], ONE_PSP);
+    assert_eq!(get_json(&esp, "/audit").1["issued"], ONE_PSP.to_string());
     rt.shutdown_background();
 }
 
@@ -544,7 +552,7 @@ fn an_unreachable_psp_is_a_503_and_leaves_nothing_behind() {
     // over AIR a signed "cannot answer now", which the HTTP route called a 502
     assert_eq!(code, 503, "{body}");
     assert!(!psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
+    assert_eq!(get_json(&esp, "/audit").1["issued"], "0");
     rt.shutdown_background();
 }
 
@@ -621,14 +629,13 @@ fn split_of(esp: &Esp) -> (u64, u64, u64) {
     let (code, audit) = get_json(esp, "/audit");
     assert_eq!(code, 200, "{audit}");
     assert_eq!(
-        audit["outstanding_matured"].as_u64().unwrap()
-            + audit["outstanding_unmatured"].as_u64().unwrap(),
-        audit["outstanding"].as_u64().unwrap(),
+        audit_units(&audit["outstanding_matured"]) + audit_units(&audit["outstanding_unmatured"]),
+        audit_units(&audit["outstanding"]),
         "the parts add up: {audit}"
     );
     (
-        audit["outstanding_matured"].as_u64().unwrap(),
-        audit["outstanding_unmatured"].as_u64().unwrap(),
+        audit_units(&audit["outstanding_matured"]),
+        audit_units(&audit["outstanding_unmatured"]),
         audit["requests_unfinished"].as_u64().unwrap(),
     )
 }

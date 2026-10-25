@@ -362,7 +362,7 @@ fn an_exchange_stuck_at_the_psp_does_not_block_an_unrelated_request() {
     // exchange of other notes.
     let started = Instant::now();
     assert_eq!(get_json(&esp, "/health").0, 200);
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 0);
+    assert_eq!(get_json(&esp, "/audit").1["issued"], "0");
     assert_eq!(common::served_call(&state, "/keysets", b"").0, 200);
     let (code, body) = exchange_now(&state, &other);
     assert_eq!(code, 200, "{body}");
@@ -372,7 +372,10 @@ fn an_exchange_stuck_at_the_psp_does_not_block_an_unrelated_request() {
     );
     assert!(psp.logic.lock().unwrap().is_spent(b.nonce).unwrap());
     assert!(!psp.logic.lock().unwrap().is_spent(a.nonce).unwrap());
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 2 * ONE_PSP);
+    assert_eq!(
+        get_json(&esp, "/audit").1["issued"],
+        (2 * ONE_PSP).to_string()
+    );
 
     // The stuck one finishes when the PSP answers.
     gate.release();
@@ -380,7 +383,10 @@ fn an_exchange_stuck_at_the_psp_does_not_block_an_unrelated_request() {
     assert_eq!(code, 200, "{body}");
     let response: ExchangeResponse = serde_json::from_value(body).unwrap();
     assert_eq!(response.signatures.len(), first.outputs.len());
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 3 * ONE_PSP);
+    assert_eq!(
+        get_json(&esp, "/audit").1["issued"],
+        (3 * ONE_PSP).to_string()
+    );
     assert!(state.in_flight.is_empty());
     assert!(!is_pending(&state, &first));
     rt.shutdown_background();
@@ -424,7 +430,7 @@ fn the_same_request_sent_again_while_it_is_in_progress_is_not_processed_twice() 
     assert_eq!(code, 200);
     assert_eq!(again, done);
     assert_eq!(gate.arrived.load(Ordering::SeqCst), 1);
-    assert_eq!(get_json(&esp, "/audit").1["issued"], ONE_PSP);
+    assert_eq!(get_json(&esp, "/audit").1["issued"], ONE_PSP.to_string());
     assert!(state.in_flight.is_empty());
     rt.shutdown_background();
 }
@@ -467,7 +473,10 @@ fn a_psp_timeout_leaves_nothing_stuck_and_the_retry_finishes() {
     let (code, body) = air.post_json("/exchange", &first);
     assert_eq!(code, 200, "{body}");
     assert!(psp.logic.lock().unwrap().is_spent(a.nonce).unwrap());
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 2 * ONE_PSP);
+    assert_eq!(
+        get_json(&esp, "/audit").1["issued"],
+        (2 * ONE_PSP).to_string()
+    );
     // Nothing is left reserved or running.
     assert!(state.in_flight.is_empty());
     assert_eq!(

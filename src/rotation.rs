@@ -195,8 +195,30 @@ struct Retired {
     /// still held. A file written before this shape (a flat list of nonces, or
     /// no `burn_proofs`) does not open, and the mint stops naming the file.
     burn_proofs: BTreeMap<String, std::collections::BTreeSet<String>>,
-    issued: u64,
-    redeemed: u64,
+    /// The issued and redeemed totals of the deleted generations, in units, as
+    /// decimal strings (a `u128` is more than a JSON number can hold). A file
+    /// with these as numbers (written before 0.9.0) does not open, and the mint
+    /// stops naming the file.
+    #[serde(with = "decimal")]
+    issued: u128,
+    #[serde(with = "decimal")]
+    redeemed: u128,
+}
+
+/// A `u128` written to JSON as a decimal string.
+mod decimal {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -520,11 +542,19 @@ impl Rotor {
         if !self.retired.epochs.contains(&g.epoch) {
             self.take_proofs(&logic)?;
             let (i, d) = logic.audit_totals().map_err(|e| e.to_string())?;
+            // Both sums first: an overflow stops the retirement with nothing
+            // changed.
+            let issued = (self.retired.issued)
+                .checked_add(i)
+                .ok_or("the issued total of the deleted generations would overflow")?;
+            let redeemed = (self.retired.redeemed)
+                .checked_add(d)
+                .ok_or("the redeemed total of the deleted generations would overflow")?;
             self.retired.epochs.push(g.epoch);
             self.retired.ids.push(g.id.clone());
             self.trim_retired();
-            self.retired.issued = self.retired.issued.saturating_add(i.units);
-            self.retired.redeemed = self.retired.redeemed.saturating_add(d.units);
+            self.retired.issued = issued;
+            self.retired.redeemed = redeemed;
             save_json(&self.base.join(RETIRED_FILE), &self.retired)?;
         }
         drop(logic);
@@ -537,7 +567,7 @@ impl Rotor {
         let now = self.now();
         if self.first_issue.is_none() {
             let issued = current.audit_totals().map_err(|e| e.to_string())?.0;
-            if issued.units > 0 || self.current.epoch > 0 {
+            if issued > 0 || self.current.epoch > 0 {
                 save_json(
                     &self.base.join(FIRST_ISSUE_FILE),
                     &FirstIssue { first_issue: now },
@@ -613,7 +643,7 @@ impl Rotor {
         }
     }
 
-    pub fn retired_totals(&self) -> (u64, u64) {
+    pub fn retired_totals(&self) -> (u128, u128) {
         (self.retired.issued, self.retired.redeemed)
     }
 
@@ -1204,6 +1234,38 @@ mod retired_list_tests {
         let saved: Retired = load_json(&d.join(RETIRED_FILE)).unwrap().unwrap();
         assert_eq!(saved.ids, vec![g0.id.clone()], "listed once");
         assert_eq!(r.resolve(&g0.id).unwrap_err().code(), "keyset_retired");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_retired_totals_are_decimal_strings_and_a_file_with_number_totals_does_not_open() {
+        // Fails if the totals are u64 or JSON numbers (before 0.9.0): a total
+        // above u64::MAX is clamped or lost, and a file with number totals is read.
+        let d = scratch("retired-wide");
+        fs::create_dir_all(&d).unwrap();
+        let path = d.join(RETIRED_FILE);
+        let wide = Retired {
+            epochs: vec![0],
+            ids: vec![],
+            burn_proofs: Default::default(),
+            issued: 18_446_744_073_709_551_621,
+            redeemed: 3,
+        };
+        save_json(&path, &wide).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["issued"], "18446744073709551621");
+        assert_eq!(on_disk["redeemed"], "3");
+        let back: Retired = load_json(&path).unwrap().unwrap();
+        assert_eq!((back.issued, back.redeemed), (wide.issued, wide.redeemed));
+        // The totals as numbers, which is how 0.8.x wrote them.
+        fs::write(
+            &path,
+            r#"{"epochs":[0],"ids":[],"burn_proofs":{},"issued":5,"redeemed":3}"#,
+        )
+        .unwrap();
+        let why = load_json::<Retired>(&path).err().unwrap().to_string();
+        assert!(why.contains("retired.json is damaged"), "{why}");
+        assert!(why.contains("expected a string"), "{why}");
         let _ = fs::remove_dir_all(&d);
     }
 

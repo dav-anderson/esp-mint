@@ -38,6 +38,11 @@ const PAST2: u64 = 200;
 const RATE: u128 = 1_000_000;
 const MEMO: &str = "btc:bc1qpayhere";
 
+/// A total of `/audit`, which is a decimal string.
+fn audit_units(total: &serde_json::Value) -> u64 {
+    total.as_str().unwrap().parse().unwrap()
+}
+
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("esp-mint-rdhttp-{}-{name}", {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -901,7 +906,7 @@ fn rotation_keeps_previous_esp_for_one_period_then_it_is_lost() {
     );
     // The audit counts the deleted generation too.
     let audit = get_json(&mint.esp, "/audit");
-    assert!(audit["issued"].as_u64().unwrap() >= 5 * ONE, "{audit}");
+    assert!(audit_units(&audit["issued"]) >= 5 * ONE, "{audit}");
 }
 
 #[test]
@@ -995,9 +1000,9 @@ fn a_decline_after_the_requested_keyset_retires_is_signed_by_the_current_set_and
     // redeemed by the request, and ONE came back with the decline, so ONE is
     // outstanding, under a day that has come.
     let audit = get_json(&mint.esp, "/audit");
-    assert_eq!(audit["outstanding"], ONE, "{audit}");
-    assert_eq!(audit["outstanding_matured"], ONE, "{audit}");
-    assert_eq!(audit["outstanding_unmatured"], 0, "{audit}");
+    assert_eq!(audit["outstanding"], ONE.to_string(), "{audit}");
+    assert_eq!(audit["outstanding_matured"], ONE.to_string(), "{audit}");
+    assert_eq!(audit["outstanding_unmatured"], "0", "{audit}");
     assert_eq!(audit["requests_unfinished"], 0, "{audit}");
     let (code, after) = esp_post_bytes(&mint, bytes);
     assert_eq!(code, 200, "{after}");
@@ -1040,6 +1045,56 @@ fn rotate_once(mint: &Mint) -> (String, String) {
         w["previous"]["id"].as_str().unwrap().to_string(),
         w["current"]["id"].as_str().unwrap().to_string(),
     )
+}
+
+/// Issue `units` into the current generation of `mint`, as a long-lived mint
+/// has done by the time its totals are large.
+fn issue_into_current(mint: &Mint, units: u64) {
+    let blind = SecretKey::new(&mut OsRng).public_key(SECP256K1);
+    let output = MintOutput {
+        amount: Amount::from_units(units),
+        blind_nonce: BlindNonce(blind),
+    };
+    let logic = mint.state.logic.lock().unwrap();
+    logic
+        .issue_with_key(&SecretKey::new(&mut OsRng), &output)
+        .unwrap();
+}
+
+#[test]
+fn the_audit_adds_the_current_previous_and_retired_totals_past_u64_max_exactly() {
+    // Fails with the audit sum of 0.8.x (`Amount +=`, unchecked): in a debug build
+    // the sum panics under the `logic` and `responses` locks and poisons them, in
+    // a release build it wraps.
+    let rt = Runtime::new().unwrap();
+    let mint = start_rotating(&rt, &scratch("audit-wide"));
+    let half = 1 << 63;
+    issue_into_current(&mint, half);
+    esp_get_json(&mint, "/rotation");
+    set_clock(&mint, T0 + 3600);
+    esp_get_json(&mint, "/rotation");
+    issue_into_current(&mint, half);
+    set_clock(&mint, T0 + 7200);
+    esp_get_json(&mint, "/rotation");
+    issue_into_current(&mint, half);
+    // generation 0 is retired, 1 is previous, 2 is current: 3 * 2^63 in all
+    let retired = mint
+        .queue_path
+        .parent()
+        .unwrap()
+        .join(esp_mint::rotation::RETIRED_FILE);
+    let on_disk: Value = serde_json::from_slice(&std::fs::read(retired).unwrap()).unwrap();
+    assert_eq!(on_disk["issued"], "9223372036854775808");
+    for _ in 0..2 {
+        let audit = get_json(&mint.esp, "/audit");
+        assert_eq!(audit["issued"], "27670116110564327424", "{audit}");
+        assert_eq!(audit["redeemed"], "0");
+        assert_eq!(audit["outstanding"], "27670116110564327424");
+        assert_eq!(audit["outstanding_matured"], "0");
+        assert_eq!(audit["outstanding_unmatured"], "0");
+    }
+    assert!(!mint.state.logic.is_poisoned() && !mint.state.responses.is_poisoned());
+    rt.shutdown_background();
 }
 
 #[test]

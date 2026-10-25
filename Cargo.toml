@@ -1,19 +1,19 @@
 [package]
 name = "esp-mint"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
 
 [dependencies]
 # mint-core is pinned to its release tag.
-mint-core = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.2.0" }
-mint-types = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.2.0" }
-bdhke = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.2.0" }
+mint-core = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.3.0" }
+mint-types = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.3.0" }
+bdhke = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.3.0" }
 # The wire types, shared with the other mints and the wallet.
 # `seal` and `air-client` are for the AIR listener (the mint's own DID key, the
 # requests it opens and the replies it signs); see the README, "The AIR listener".
-sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.5.1", features = ["seal", "air-client"] }
+sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.5.2", features = ["seal", "air-client"] }
 secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "rand", "serde"] }
 sha2 = "0.10"
 hex = "0.4.3"
@@ -32,9 +32,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal
 # sp-wire = { path = "../sp-wire" }
 #
 # [patch."https://github.com/dav-anderson/mint-core.git"]
-# mint-core = { path = "../mint-core-v0.2.0/crates/mint-core" }
-# mint-types = { path = "../mint-core-v0.2.0/crates/mint-types" }
-# bdhke = { path = "../mint-core-v0.2.0/crypto/bdhke" }
+# mint-core = { path = "../mint-core-v0.3.0/crates/mint-core" }
+# mint-types = { path = "../mint-core-v0.3.0/crates/mint-types" }
+# bdhke = { path = "../mint-core-v0.3.0/crypto/bdhke" }
 
 # sp-wire's `air-client` builds air_server 1.0.1, which takes `air` 3.0.0 from
 # crates.io. This points that at the AIR sp-wire pins (3.0.0 plus the `SecretKey`

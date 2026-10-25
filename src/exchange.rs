@@ -1421,7 +1421,7 @@ mod tests {
         }
 
         fn esp_issued(&self) -> u64 {
-            self.logic.audit_totals().unwrap().0.units
+            u64::try_from(self.logic.audit_totals().unwrap().0).unwrap()
         }
     }
 
@@ -1792,7 +1792,7 @@ mod tests {
     /// Issued by both live sets.
     fn issued_by_both(s: &Setup) -> u64 {
         let previous = s.rotor.previous.as_ref().unwrap();
-        s.esp_issued() + previous.1.audit_totals().unwrap().0.units
+        s.esp_issued() + u64::try_from(previous.1.audit_totals().unwrap().0).unwrap()
     }
 
     #[test]

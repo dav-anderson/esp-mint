@@ -453,7 +453,7 @@ fn a_snapshot_is_taken_while_serving_and_restores_to_a_mint_with_the_same_audit(
         value
     };
     let before = audit(&mint.api);
-    assert_eq!(before["outstanding_unmatured"], 12_345, "{before}");
+    assert_eq!(before["outstanding_unmatured"], "12345", "{before}");
 
     mint.signal("USR1");
     let latest = base.join("main").join("snapshots").join("LATEST");

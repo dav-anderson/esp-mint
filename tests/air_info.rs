@@ -724,7 +724,7 @@ fn a_resent_request_of_each_kind_is_answered_with_the_stored_answer_and_applied_
     assert_eq!(response.service, service());
     assert_eq!(response.signatures.len(), req.outputs.len());
     assert!(esp.psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
-    assert_eq!(esp.audit()["issued"], 4 * ONE_PSP);
+    assert_eq!(esp.audit()["issued"], (4 * ONE_PSP).to_string());
 
     // The same request handed straight to the mint is the stored answer, byte for
     // byte what AIR said.
@@ -735,7 +735,7 @@ fn a_resent_request_of_each_kind_is_answered_with_the_stored_answer_and_applied_
     let again = ask_body(&cfg, KIND_EXCHANGE, &body).unwrap();
     assert_ne!(again.request_id, first.request_id);
     assert_eq!(again.body(), first.body());
-    assert_eq!(esp.audit()["issued"], 4 * ONE_PSP);
+    assert_eq!(esp.audit()["issued"], (4 * ONE_PSP).to_string());
     assert!(esp.state.in_flight.is_empty());
     wait_for_next(&dir, 2);
 
@@ -746,8 +746,8 @@ fn a_resent_request_of_each_kind_is_answered_with_the_stored_answer_and_applied_
     air_listener::write_next(&dir, 0).unwrap();
     let listener = start_serving(&server, &key, &dir, esp.serve());
     wait_for_next(&dir, 2);
-    assert_eq!(esp.audit()["issued"], 4 * ONE_PSP);
-    assert_eq!(esp.audit()["redeemed"], 0);
+    assert_eq!(esp.audit()["issued"], (4 * ONE_PSP).to_string());
+    assert_eq!(esp.audit()["redeemed"], "0");
     // and the reply cell kept the first answer
     let third = ask_body(&cfg, KIND_EXCHANGE, &body).unwrap();
     assert_eq!(third.body(), first.body());
@@ -756,7 +756,7 @@ fn a_resent_request_of_each_kind_is_answered_with_the_stored_answer_and_applied_
 
     let (a, ka) = esp.esp_note(2 * ONE, service(), DAY);
     let (b, kb) = esp.esp_note(ONE, service(), DAY);
-    assert_eq!(esp.audit()["issued"], 4 * ONE_PSP + 3 * ONE);
+    assert_eq!(esp.audit()["issued"], (4 * ONE_PSP + 3 * ONE).to_string());
     let req = esp.transfer_of(&[(a, &ka, 2 * ONE), (b, &kb, ONE)], &[ONE, 2 * ONE], DAY);
     let body = json_bytes(&req);
 
@@ -772,16 +772,16 @@ fn a_resent_request_of_each_kind_is_answered_with_the_stored_answer_and_applied_
     assert_eq!(response.signatures.len(), 2);
     assert!(esp.is_spent(&a) && esp.is_spent(&b));
     // the notes are burned (redeemed) and issued again in their place
-    assert_eq!(esp.audit()["redeemed"], 3 * ONE);
-    assert_eq!(esp.audit()["issued"], 4 * ONE_PSP + 6 * ONE);
+    assert_eq!(esp.audit()["redeemed"], (3 * ONE).to_string());
+    assert_eq!(esp.audit()["issued"], (4 * ONE_PSP + 6 * ONE).to_string());
 
     esp.assert_served(KIND_TRANSFER, &body, first.body());
     let again = ask_body(&cfg, KIND_TRANSFER, &body).unwrap();
     assert_ne!(again.request_id, first.request_id);
     assert_eq!(again.body(), first.body());
     // only the first moved the totals
-    assert_eq!(esp.audit()["issued"], 4 * ONE_PSP + 6 * ONE);
-    assert_eq!(esp.audit()["redeemed"], 3 * ONE);
+    assert_eq!(esp.audit()["issued"], (4 * ONE_PSP + 6 * ONE).to_string());
+    assert_eq!(esp.audit()["redeemed"], (3 * ONE).to_string());
 
     // The redemption, in its binary encoding.
 
@@ -800,13 +800,13 @@ fn a_resent_request_of_each_kind_is_answered_with_the_stored_answer_and_applied_
     let answer: serde_json::Value = first.json().unwrap();
     assert_eq!(answer["notes"][0]["accepted"], true);
     assert!(esp.is_spent(&a));
-    assert_eq!(esp.audit()["redeemed"], 4 * ONE);
+    assert_eq!(esp.audit()["redeemed"], (4 * ONE).to_string());
 
     esp.assert_served(KIND_REDEEM, &bytes, first.body());
     let again = ask_body(&cfg, KIND_REDEEM, &bytes).unwrap();
     assert_ne!(again.request_id, first.request_id);
     assert_eq!(again.body(), first.body());
-    assert_eq!(esp.audit()["redeemed"], 4 * ONE);
+    assert_eq!(esp.audit()["redeemed"], (4 * ONE).to_string());
     // one queue entry, not two
     assert_eq!(
         esp_mint::queue::Queue::open(&esp.state.queue_path)
@@ -939,11 +939,11 @@ fn the_state_serve_builds_answers_an_exchange_and_the_answer_ledger_and_audit_ag
     // The audit (which `serve` serves on `server.bind`) says the same, and the
     // days ahead are unmatured.
     let audit = esp.audit();
-    assert_eq!(audit["issued"], 4 * ONE_PSP);
-    assert_eq!(audit["redeemed"], 0);
-    assert_eq!(audit["outstanding"], 4 * ONE_PSP);
-    assert_eq!(audit["outstanding_matured"], 0);
-    assert_eq!(audit["outstanding_unmatured"], 4 * ONE_PSP);
+    assert_eq!(audit["issued"], (4 * ONE_PSP).to_string());
+    assert_eq!(audit["redeemed"], "0");
+    assert_eq!(audit["outstanding"], (4 * ONE_PSP).to_string());
+    assert_eq!(audit["outstanding_matured"], "0");
+    assert_eq!(audit["outstanding_unmatured"], (4 * ONE_PSP).to_string());
     assert_eq!(audit["requests_unfinished"], 0);
 }
 
@@ -1151,7 +1151,7 @@ fn a_psp_that_cannot_be_reached_is_a_signed_unavailable_and_a_retry_is_safe() {
     ));
     // Nothing was burned or issued, so the wallet may send it again.
     assert!(!esp.psp.logic.lock().unwrap().is_spent(note.nonce).unwrap());
-    assert_eq!(esp.audit()["issued"], 0);
+    assert_eq!(esp.audit()["issued"], "0");
     listener.stop().unwrap();
 }
 

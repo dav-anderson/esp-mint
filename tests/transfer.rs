@@ -29,6 +29,11 @@ const G_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81
 const ONE_PSP: u64 = 1 << 36;
 const NOW: u64 = 1_791_571_184;
 
+/// A total of `/audit`, which is a decimal string.
+fn audit_units(total: &serde_json::Value) -> u64 {
+    total.as_str().unwrap().parse().unwrap()
+}
+
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("esp-mint-trhttp-{}-{name}", {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -250,8 +255,8 @@ fn a_transfer_over_air_swaps_the_notes_and_the_supply_does_not_change() {
     let (a, ka) = esp_note(&state, 2 * ONE_PSP, service());
     let (b, kb) = esp_note(&state, ONE_PSP, service());
     let audit = get_json(&esp, "/audit").1;
-    assert_eq!(audit["issued"], 3 * ONE_PSP);
-    assert_eq!(audit["outstanding"], 3 * ONE_PSP);
+    assert_eq!(audit["issued"], (3 * ONE_PSP).to_string());
+    assert_eq!(audit["outstanding"], (3 * ONE_PSP).to_string());
 
     let (req, wanted) = request(
         &[(a, &ka, 2 * ONE_PSP), (b, &kb, ONE_PSP)],
@@ -288,15 +293,18 @@ fn a_transfer_over_air_swaps_the_notes_and_the_supply_does_not_change() {
     // the old notes are spent, and nothing was created or destroyed
     assert!(is_spent(&state, &a) && is_spent(&state, &b));
     let audit = get_json(&esp, "/audit").1;
-    assert_eq!(audit["issued"], 6 * ONE_PSP);
-    assert_eq!(audit["redeemed"], 3 * ONE_PSP);
-    assert_eq!(audit["outstanding"], 3 * ONE_PSP);
+    assert_eq!(audit["issued"], (6 * ONE_PSP).to_string());
+    assert_eq!(audit["redeemed"], (3 * ONE_PSP).to_string());
+    assert_eq!(audit["outstanding"], (3 * ONE_PSP).to_string());
 
     // the same request again returns the same response and changes nothing
     let (code, again) = post_json(&esp, "/transfer", &req);
     assert_eq!(code, 200);
     assert_eq!(again, body);
-    assert_eq!(get_json(&esp, "/audit").1["issued"], 6 * ONE_PSP);
+    assert_eq!(
+        get_json(&esp, "/audit").1["issued"],
+        (6 * ONE_PSP).to_string()
+    );
 
     assert_eq!(get_json(&esp, "/health").0, 200);
     rt.shutdown_background();
@@ -316,8 +324,8 @@ fn every_transfer_refusal_is_a_400_and_burns_nothing() {
     assert!(body["error"].as_str().unwrap().contains("must be exact"));
     assert!(!is_spent(&state, &a));
     let audit = get_json(&esp, "/audit").1;
-    assert_eq!(audit["issued"], ONE_PSP);
-    assert_eq!(audit["redeemed"], 0);
+    assert_eq!(audit["issued"], ONE_PSP.to_string());
+    assert_eq!(audit["redeemed"], "0");
 
     // An output that is not a power of two, though the total is exact.
     let (b, kb) = esp_note(&state, 2 * ONE_PSP, service());
@@ -348,7 +356,7 @@ fn every_transfer_refusal_is_a_400_and_burns_nothing() {
     );
     assert!(!is_spent(&state, &c));
     let audit = get_json(&esp, "/audit").1;
-    assert_eq!(audit["redeemed"], 0);
+    assert_eq!(audit["redeemed"], "0");
 
     // A request the service did not sign: the app holds the note's spend key
     // but not the service's key.
@@ -390,12 +398,12 @@ fn every_transfer_refusal_is_a_400_and_burns_nothing() {
     // issued), was burned (ONE_PSP redeemed) and came back (ONE_PSP issued)
     let after = get_json(&esp, "/audit").1;
     assert_eq!(
-        after["issued"].as_u64().unwrap(),
-        before["issued"].as_u64().unwrap() + 2 * ONE_PSP
+        audit_units(&after["issued"]),
+        audit_units(&before["issued"]) + 2 * ONE_PSP
     );
     assert_eq!(
-        after["redeemed"].as_u64().unwrap(),
-        before["redeemed"].as_u64().unwrap() + ONE_PSP
+        audit_units(&after["redeemed"]),
+        audit_units(&before["redeemed"]) + ONE_PSP
     );
     rt.shutdown_background();
 }
@@ -430,8 +438,8 @@ fn one_spent_input_among_several_leaves_the_others_unburned() {
     assert!(!is_spent(&state, &b));
     assert!(!is_spent(&state, &c));
     let audit = get_json(&esp, "/audit").1;
-    assert_eq!(audit["issued"], 4 * ONE_PSP);
-    assert_eq!(audit["redeemed"], ONE_PSP);
+    assert_eq!(audit["issued"], (4 * ONE_PSP).to_string());
+    assert_eq!(audit["redeemed"], ONE_PSP.to_string());
     rt.shutdown_background();
 }
 
@@ -532,9 +540,9 @@ fn a_transfer_moves_nothing_between_the_parts_of_the_audit_split() {
     // has come depends on the date the test runs, so only the sum is fixed.
     let split = |audit: &serde_json::Value| {
         (
-            audit["outstanding"].as_u64().unwrap(),
-            audit["outstanding_matured"].as_u64().unwrap()
-                + audit["outstanding_unmatured"].as_u64().unwrap(),
+            audit_units(&audit["outstanding"]),
+            audit_units(&audit["outstanding_matured"])
+                + audit_units(&audit["outstanding_unmatured"]),
             audit["requests_unfinished"].as_u64().unwrap(),
         )
     };
@@ -555,12 +563,12 @@ fn a_transfer_moves_nothing_between_the_parts_of_the_audit_split() {
     assert_eq!(split(&after), (2 * ONE_PSP, 2 * ONE_PSP, 0));
     assert_eq!(
         (
-            after["outstanding_matured"].as_u64().unwrap(),
-            after["outstanding_unmatured"].as_u64().unwrap()
+            audit_units(&after["outstanding_matured"]),
+            audit_units(&after["outstanding_unmatured"])
         ),
         (
-            before["outstanding_matured"].as_u64().unwrap(),
-            before["outstanding_unmatured"].as_u64().unwrap()
+            audit_units(&before["outstanding_matured"]),
+            audit_units(&before["outstanding_unmatured"])
         ),
         "the parts did not move"
     );

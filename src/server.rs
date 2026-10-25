@@ -652,32 +652,38 @@ async fn audit_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     };
     // Every generation: the current, the previous and the deleted ones.
-    let totals = logic.audit_totals().and_then(|(mut i, mut d)| {
-        if let Some((_, p)) = &rot.previous {
-            let (pi, pd) = p.audit_totals()?;
-            i += pi;
-            d += pd;
-        }
-        let (ri, rd) = rot.retired_totals();
-        i += mint_types::Amount::from_units(ri);
-        d += mint_types::Amount::from_units(rd);
-        Ok((i, d))
-    });
+    let totals = (|| -> Result<(u128, u128), String> {
+        let current = logic.audit_totals().map_err(|e| e.to_string())?;
+        let previous = match &rot.previous {
+            Some((_, p)) => p.audit_totals().map_err(|e| e.to_string())?,
+            None => (0, 0),
+        };
+        sum_generations([current, previous, rot.retired_totals()])
+    })();
     match totals {
         Ok((issued, redeemed)) => (
             StatusCode::OK,
-            Json(audit_body(
-                issued.units,
-                redeemed.units,
-                &responses,
-                now_secs(),
-            )),
+            Json(audit_body(issued, redeemed, &responses, now_secs())),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     }
+}
+
+/// The (issued, redeemed) totals of all the generations added up, each add
+/// checked. An overflow is an error, never a wrapped or a clamped figure.
+fn sum_generations(parts: [(u128, u128); 3]) -> Result<(u128, u128), String> {
+    let mut sums = (0u128, 0u128);
+    for (issued, redeemed) in parts {
+        sums.0 = sums
+            .0
+            .checked_add(issued)
+            .ok_or("the issued totals of the generations add up to more than a u128")?;
+        sums.1 = sums
+            .1
+            .checked_add(redeemed)
+            .ok_or("the redeemed totals of the generations add up to more than a u128")?;
+    }
+    Ok(sums)
 }
 
 /// The body of `GET /audit`: mint-core's counters, and the split of what is
@@ -692,16 +698,19 @@ async fn audit_handler(State(state): State<Arc<EspState>>) -> (StatusCode, Json<
 ///   matured + unmatured by that much while any are unfinished, and by nothing
 ///   when none are.
 /// - `as_of_day`: the day (since the Unix epoch) that "has come" is measured at.
-pub fn audit_body(issued: u64, redeemed: u64, responses: &Responses, now_unix: u64) -> Value {
+///
+/// `issued`, `redeemed`, `outstanding`, `outstanding_matured` and
+/// `outstanding_unmatured` are decimal strings: they are `u128` and a JSON
+/// number cannot hold one. The other fields are numbers.
+pub fn audit_body(issued: u128, redeemed: u128, responses: &Responses, now_unix: u64) -> Value {
     let outstanding = issued.saturating_sub(redeemed);
     let split = responses.ledger().split(now_unix);
-    let as_units = |v: u128| u64::try_from(v).unwrap_or(u64::MAX);
     json!({
-        "issued": issued,
-        "redeemed": redeemed,
-        "outstanding": outstanding,
-        "outstanding_matured": as_units(split.matured),
-        "outstanding_unmatured": as_units(split.unmatured),
+        "issued": issued.to_string(),
+        "redeemed": redeemed.to_string(),
+        "outstanding": outstanding.to_string(),
+        "outstanding_matured": split.matured.to_string(),
+        "outstanding_unmatured": split.unmatured.to_string(),
         "requests_unfinished": responses.unfinished(),
         "as_of_day": now_unix / crate::terms::SECONDS_PER_DAY,
     })
@@ -1064,9 +1073,11 @@ mod tests {
         let dir = scratch("empty");
         let r = Responses::open(&dir.join("responses.json")).unwrap();
         let body = audit_body(0, 0, &r, 10 * DAY);
-        assert_eq!(body["outstanding"], 0);
-        assert_eq!(body["outstanding_matured"], 0);
-        assert_eq!(body["outstanding_unmatured"], 0);
+        for field in ["issued", "redeemed", "outstanding"] {
+            assert_eq!(body[field], "0", "{field}");
+        }
+        assert_eq!(body["outstanding_matured"], "0");
+        assert_eq!(body["outstanding_unmatured"], "0");
         assert_eq!(body["requests_unfinished"], 0);
         assert_eq!(body["as_of_day"], 10);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1081,27 +1092,31 @@ mod tests {
 
         let before = at(10 * DAY - 1);
         assert_eq!(before["as_of_day"], 9);
-        assert_eq!(before["outstanding"], 115);
-        assert_eq!(before["outstanding_matured"], 0);
-        assert_eq!(before["outstanding_unmatured"], 115);
+        assert_eq!(before["issued"], "140");
+        assert_eq!(before["redeemed"], "25");
+        assert_eq!(before["outstanding"], "115");
+        assert_eq!(before["outstanding_matured"], "0");
+        assert_eq!(before["outstanding_unmatured"], "115");
 
         // the first second of day 10: what was issued for day 10 has matured
         let day10 = at(10 * DAY);
         assert_eq!(day10["as_of_day"], 10);
-        assert_eq!(day10["outstanding_matured"], 75);
-        assert_eq!(day10["outstanding_unmatured"], 40);
+        assert_eq!(day10["outstanding_matured"], "75");
+        assert_eq!(day10["outstanding_unmatured"], "40");
 
         // and the next day, the rest
         let day11 = at(11 * DAY);
-        assert_eq!(day11["outstanding_matured"], 115);
-        assert_eq!(day11["outstanding_unmatured"], 0);
+        assert_eq!(day11["outstanding_matured"], "115");
+        assert_eq!(day11["outstanding_unmatured"], "0");
 
         // the parts always add up to the outstanding total
         for now in [9 * DAY, 10 * DAY, 10 * DAY + 5, 11 * DAY, 400 * DAY] {
             let b = at(now);
-            let sum = b["outstanding_matured"].as_u64().unwrap()
-                + b["outstanding_unmatured"].as_u64().unwrap();
-            assert_eq!(sum, b["outstanding"].as_u64().unwrap());
+            let part = |f: &str| b[f].as_str().unwrap().parse::<u64>().unwrap();
+            assert_eq!(
+                part("outstanding_matured") + part("outstanding_unmatured"),
+                part("outstanding")
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1114,12 +1129,31 @@ mod tests {
         // A transfer burned its inputs (the counters say 20 redeemed more) and
         // has not been counted yet, so the counters are below the ledger.
         let body = audit_body(140, 45, &r, 11 * DAY);
-        assert_eq!(body["outstanding"], 95);
+        assert_eq!(body["outstanding"], "95");
         // The ledger has not seen the transfer yet, so its split is still the
         // 115 it knew; the unfinished request is what tells the two apart.
-        assert_eq!(body["outstanding_matured"], 115);
-        assert_eq!(body["outstanding_unmatured"], 0);
+        assert_eq!(body["outstanding_matured"], "115");
+        assert_eq!(body["outstanding_unmatured"], "0");
         assert_eq!(body["requests_unfinished"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_totals_are_decimal_strings_and_the_sum_across_generations_is_checked() {
+        // Fails if the totals go back to u64 or to JSON numbers: 2^64 + 5 issued
+        // is clamped or wrapped, and a JSON number loses it.
+        let dir = scratch("wide");
+        let r = Responses::open(&dir.join("responses.json")).unwrap();
+        let body = audit_body(18_446_744_073_709_551_621, 6, &r, 10 * DAY);
+        assert_eq!(body["issued"], "18446744073709551621");
+        assert_eq!(body["redeemed"], "6");
+        assert_eq!(body["outstanding"], "18446744073709551615");
+        assert_eq!(body["requests_unfinished"], 0);
+        let sum = sum_generations([(1 << 63, 1), (1 << 63, 2), (5, 3)]);
+        assert_eq!(sum, Ok((18_446_744_073_709_551_621, 6)));
+        // an overflow is an error, not a wrapped figure
+        assert!(sum_generations([(u128::MAX, 0), (1, 0), (0, 0)]).is_err());
+        assert!(sum_generations([(0, 1), (0, u128::MAX), (0, 0)]).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
