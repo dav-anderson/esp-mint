@@ -2,6 +2,10 @@
 
 esp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.10.0 (2026-10-26): sp-wire v0.6.0, wire version 4 (PSP claim rework, pass 2)
+
+**Pins and docs only; no code changed.** `sp-wire` is `v0.6.0` (it was `v0.5.2`), whose `WIRE_VERSION` is 4: the PSP's purchase is now a claim (pass 1, psp-mint 0.8.0), and esp-mint has no part in it. Its mint info and `GET /health` now report `wire_version` 4 (they follow `sp_wire::WIRE_VERSION`), which a wallet of wire version 3 refuses: that is why this is a minor version. README: the pins (mint-core `v0.3.0`, sp-wire `v0.6.0`, wire version 4) and the `/health` example (`"wire_version": 4`). DESIGN: a "Wire version 4" paragraph beside "Wire version 3" (kept as history), and the note about the PSP's price tolerance and reconciliation target (psp-mint 0.8.0 has neither) now says what the PSP mint does instead.
+
 ## 0.9.0 (2026-10-25): u128 issued and redeemed totals; /audit totals as decimal strings (ROADMAP item 31, P1-02 and P1-03)
 
 Old data does not open (clean break; no reader or migration): the sled databases of 0.8.x keep their totals as 8 bytes, which mint-core v0.3.0 refuses, and a `retired.json` whose `issued` and `redeemed` are JSON numbers makes `serve` refuse to start and name the file. Start on a new data folder.
