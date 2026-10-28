@@ -1,6 +1,6 @@
 [package]
 name = "esp-mint"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -13,7 +13,7 @@ bdhke = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.3.0" 
 # The wire types, shared with the other mints and the wallet.
 # `seal` and `air-client` are for the AIR listener (the mint's own DID key, the
 # requests it opens and the replies it signs); see the README, "The AIR listener".
-sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.6.0", features = ["seal", "air-client"] }
+sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.7.0", features = ["seal", "air-client"] }
 secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "rand", "serde"] }
 sha2 = "0.10"
 hex = "0.4.3"

@@ -1846,3 +1846,182 @@ fn a_rollover_over_the_configured_note_count_is_refused_and_nothing_is_burned() 
     assert_eq!(code, 200, "{body}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---- the key stream ---------------------------------------------------------
+
+/// A key-set ID as the stream's records carry it.
+fn id8(id: &str) -> [u8; 8] {
+    hex::decode(id).unwrap().try_into().unwrap()
+}
+
+/// Fails if the days a decline is signed for are not published, or are published
+/// with other keys than the decline was signed with: the wallet checks each
+/// signature of the entry against the day it names.
+#[test]
+fn the_days_a_decline_is_signed_for_are_published_with_the_keys_it_was_signed_with() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("stream-decline");
+    let mint = start(&rt, &dir, 64 * 1024 * 1024);
+    let generation = id8(&in_ks());
+    let (a, ka) = esp_note(&mint, 4 * ONE, service(), PAST);
+    let (b, kb) = esp_note(&mint, 2 * ONE, service(), PAST2);
+    let (req, wanted) = request(
+        &[(a, &ka, 4 * ONE, PAST), (b, &kb, 2 * ONE, PAST2)],
+        &[(2 * ONE, PAST), (2 * ONE, PAST2)],
+        &service_keypair(),
+    );
+    let id = redeem::request_hash(&req);
+    let bytes = req.encode();
+    let (code, body) = esp_post_bytes(&mint, bytes.clone());
+    assert_eq!(code, 200, "{body}");
+
+    // The two decline days and the two days a new exchange would get (the
+    // system clock's today + 365 and the day after): four parts of one service.
+    assert_eq!(
+        air(&mint).publish().as_deref(),
+        Some(
+            "key stream: wrote 1 control record(s) and 4 day record part(s) (8716 bytes); 1 service(s) known"
+        )
+    );
+    for day in [PAST, PAST2] {
+        let record = air(&mint).day(generation, day, 0, 0).expect("the day");
+        assert_eq!(record.services.len(), 1);
+        assert_eq!(record.services[0].service, service());
+    }
+    assert!(air(&mint).day(generation, PAST + 1, 0, 0).is_none());
+
+    let (code, declined) = post_json(
+        &mint.admin,
+        "/payouts/decline",
+        &serde_json::json!({"entry_id": id, "reason": "uptime terms were not met"}),
+    );
+    assert_eq!(code, 200, "{declined}");
+    let (code, after) = esp_post_bytes(&mint, bytes);
+    assert_eq!(code, 200, "{after}");
+    let sigs = after["entry"]["decline_signatures"].as_array().unwrap();
+    assert_eq!(sigs.len(), 2);
+    for (w, sig) in wanted.iter().zip(sigs) {
+        let key: secp256k1::PublicKey = serde_json::from_value(sig["key"].clone()).unwrap();
+        let record = air(&mint).day(generation, w.day, 0, 0).unwrap();
+        assert_eq!(
+            record.services[0].key_for(Amount::from_units(w.amount)),
+            Some(&key),
+            "the key {} was signed with, on day {}",
+            w.amount,
+            w.day
+        );
+    }
+    // The decline added nothing that was not published.
+    assert_eq!(air(&mint).publish(), None);
+    rt.shutdown_background();
+}
+
+/// Fails if a rotation is not a new control record naming both live key sets, or
+/// if the new key set's keys for the days of the old notes (a decline and a
+/// transfer, both signed by the new key set) are not published, or are the old
+/// key set's.
+#[test]
+fn a_rotation_is_a_control_record_and_the_new_key_sets_days_are_published() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("stream-rotation");
+    let mint = start_rotating(&rt, &dir);
+    let a = esp_note(&mint, 2 * ONE, service(), PAST);
+    let b = esp_note(&mint, ONE, service(), PAST);
+    let w = esp_get_json(&mint, "/rotation");
+    let id0 = w["current"]["id"].as_str().unwrap().to_string();
+
+    // At T0 (day 20,833) there is one control record and no service yet.
+    assert_eq!(
+        air(&mint).publish().as_deref(),
+        Some(
+            "key stream: wrote 1 control record(s) and 0 day record part(s) (0 bytes); 0 service(s) known"
+        )
+    );
+    set_clock(&mint, T0 + 3600);
+    let w = esp_get_json(&mint, "/rotation");
+    assert_eq!(w["previous"]["id"], id0.as_str());
+    let id1 = w["current"]["id"].as_str().unwrap().to_string();
+    set_keysets(&id0, &id1);
+
+    let (req, wanted) = request(
+        &[(a.0, &a.1, 2 * ONE, PAST)],
+        &[(ONE, PAST)],
+        &service_keypair(),
+    );
+    let (code, body) = esp_post_bytes(&mint, req.encode());
+    assert_eq!(code, 200, "{body}");
+    let id = redeem::request_hash(&req);
+
+    // Control record 1 has both key sets. Each has days 21,198 and 21,199 (T0's
+    // day + 365 and the next) and day 100: six parts of one service.
+    assert_eq!(
+        air(&mint).publish().as_deref(),
+        Some(
+            "key stream: wrote 1 control record(s) and 6 day record part(s) (13074 bytes); 1 service(s) known"
+        )
+    );
+    let control = air(&mint).control(1).expect("control record 1");
+    assert_eq!(control.index, 1);
+    assert_eq!(control.maturity_days, 365);
+    assert_eq!((control.current.epoch, control.current.id), (1, id8(&id1)));
+    let previous = control.previous.expect("the previous key set is live");
+    assert_eq!((previous.epoch, previous.id), (0, id8(&id0)));
+    assert_eq!(air(&mint).control(0).unwrap().previous, None);
+    for generation in [id8(&id0), id8(&id1)] {
+        for day in [PAST, 21_198, 21_199] {
+            assert!(
+                air(&mint).day(generation, day, 0, 0).is_some(),
+                "{generation:?} day {day}"
+            );
+        }
+    }
+
+    // The decline is signed with the current key set: its keys are the new key
+    // set's keys for day 100, and not the old key set's.
+    let (code, declined) = post_json(
+        &mint.admin,
+        "/payouts/decline",
+        &serde_json::json!({"entry_id": id, "reason": "terms"}),
+    );
+    assert_eq!(code, 200, "{declined}");
+    let (code, after) = esp_post_bytes(&mint, req.encode());
+    assert_eq!(code, 200, "{after}");
+    let sig = &after["entry"]["decline_signatures"][0];
+    let key: secp256k1::PublicKey = serde_json::from_value(sig["key"].clone()).unwrap();
+    let new_day = air(&mint).day(id8(&id1), PAST, 0, 0).unwrap();
+    let old_day = air(&mint).day(id8(&id0), PAST, 0, 0).unwrap();
+    let amount = Amount::from_units(wanted[0].amount);
+    assert_eq!(new_day.services[0].key_for(amount), Some(&key));
+    assert_ne!(old_day.services[0].key_for(amount), Some(&key));
+
+    // A transfer of a previous-set note is signed with the current set, for the
+    // note's own day.
+    let (o, _, _) = blinded(ONE);
+    let inputs = vec![MintInput {
+        amount: Amount::from_units(ONE),
+        note: b.0,
+        spend_signature: Signature::from_slice(&[0u8; 64]).unwrap(),
+    }];
+    let outputs = vec![o];
+    let dg = esp_mint::transfer::digest(&service(), PAST, &inputs, &outputs);
+    let mut inputs = inputs;
+    inputs[0].spend_signature = SECP256K1.sign_schnorr(&dg, &b.1);
+    let tr = esp_mint::transfer::TransferRequest {
+        service: service(),
+        redeemable_after_day: PAST,
+        input_keysets: vec![in_ks()],
+        inputs,
+        keyset: out_ks(),
+        outputs,
+        service_signature: SECP256K1.sign_schnorr(&dg, &service_keypair()),
+    };
+    let (code, body) = esp_post_json(&mint, "/transfer", &serde_json::to_value(&tr).unwrap());
+    assert_eq!(code, 200, "{body}");
+    let key: secp256k1::PublicKey = serde_json::from_value(body["keys"][0].clone()).unwrap();
+    assert_eq!(
+        new_day.services[0].key_for(Amount::from_units(ONE)),
+        Some(&key)
+    );
+    assert_eq!(air(&mint).publish(), None);
+    rt.shutdown_background();
+}

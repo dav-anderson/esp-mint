@@ -298,6 +298,28 @@ async fn decline_handler(
         // redemption asked for; the signatures name it (see decline_gens).
         let rot = crate::server::rotor_of(esp, &mut logic)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        // The keys the decline outputs are signed with are noted in the key
+        // stream before they are signed, for both live key sets.
+        if let Some(stream) = esp.stream.get()
+            && let Some(crate::responses::Entry::RedeemDone(record)) = responses.get(&body.entry_id)
+        {
+            let terms: Vec<crate::terms::Terms> = record
+                .decline_outputs
+                .iter()
+                .map(|o| crate::terms::Terms {
+                    service: o.service,
+                    redeemable_after_day: o.redeemable_after_day,
+                })
+                .collect();
+            let live = crate::stream::Live::of(&rot)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            stream.note(&live, &terms).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("the key stream could not be updated: {e}"),
+                )
+            })?;
+        }
         let gens = rot.gens(&logic);
         redeem::decline_gens(
             &gens,

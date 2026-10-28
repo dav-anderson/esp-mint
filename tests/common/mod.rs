@@ -34,6 +34,7 @@ use sp_wire::WIRE_VERSION;
 use sp_wire::air_request::addr;
 use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Verified, ask};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
+use sp_wire::air_request::stream::{Cell, ControlRecord, DayCell, DayRecord, read_cell};
 use sp_wire::air_request::{
     KIND_EXCHANGE, KIND_FEES, KIND_KEYSETS, KIND_MINT_INFO, KIND_REDEEM, KIND_ROLLOVER,
     KIND_ROTATION, KIND_TRANSFER, STATUS_UNAVAILABLE, Served, VerifyError, local_server,
@@ -118,6 +119,9 @@ pub struct Air {
     cfg: AskConfig,
     /// Dropped before `server`, so the listener has stopped when the turn ends.
     _listener: Listener,
+    /// The mint this listener answers for. Dropped after the listener and before
+    /// `server`, so that the mint's data is let go before the turn ends.
+    pub state: Arc<EspState>,
     pub server: Server,
 }
 
@@ -219,10 +223,19 @@ impl Air {
         let server = server();
         let key = DidKey::new();
         let did = addr::key_to_did(&key.public_key());
-        let state = Arc::clone(state);
-        let serve: Arc<Serve> =
-            Arc::new(move |kind: u8, body: &[u8]| server::air_served(&state, kind, body));
         std::fs::create_dir_all(&dir).unwrap();
+        // The key stream of this mint, under the listener's DID, on the same
+        // AIR server, as `serve` sets it up (its writer is not run: a test calls
+        // `publish`).
+        let stream = esp_mint::stream::Stream::open(&dir, server.server.clone(), 10, &key)
+            .expect("the stream opens");
+        assert!(
+            state.stream.set(stream).is_ok(),
+            "the mint already has a key stream"
+        );
+        let answering = Arc::clone(state);
+        let serve: Arc<Serve> =
+            Arc::new(move |kind: u8, body: &[u8]| server::air_served(&answering, kind, body));
         let listener = start_serving(&server, &key, &dir, serve);
         let cfg = AskConfig {
             server: server.server.clone(),
@@ -238,8 +251,45 @@ impl Air {
             did,
             cfg,
             _listener: listener,
+            state: Arc::clone(state),
             server,
         }
+    }
+
+    /// One pass of the key stream's writer, as the thread `serve` runs does it:
+    /// what the mint noted and the days ahead are written to AIR. Returns what it
+    /// wrote, in words (`None` when nothing was missing).
+    pub fn publish(&self) -> Option<String> {
+        server::stream_pass(&self.state).expect("the key stream publishes")
+    }
+
+    /// The control record at `index` of this mint's stream, read from AIR the way
+    /// a wallet reads it: `None` when the cell is empty.
+    pub fn control(&self, index: u32) -> Option<ControlRecord> {
+        self.read(&Cell::Control { index })
+            .map(|b| ControlRecord::decode(&b).expect("a control record decodes"))
+    }
+
+    /// The part of an ESP day record at this place, read from AIR: `None` when the
+    /// cell is empty.
+    pub fn day(&self, generation: [u8; 8], day: u64, bucket: u32, part: u32) -> Option<DayRecord> {
+        self.read(&Cell::Day(DayCell {
+            generation,
+            day,
+            bucket,
+            part,
+        }))
+        .map(|b| DayRecord::decode(&b).expect("a day record decodes"))
+    }
+
+    fn read(&self, cell: &Cell) -> Option<Vec<u8>> {
+        let (server, did, cell) = (self.server.server.clone(), self.did, *cell);
+        block_on_new_runtime(move || async move {
+            let client = client::connect(&server).await?;
+            read_cell(&client, &did, &cell, 10).await
+        })
+        .expect("a runtime")
+        .expect("the cell reads")
     }
 
     /// Send one request of `kind` with `body` and return the verified reply.

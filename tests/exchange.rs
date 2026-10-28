@@ -199,13 +199,24 @@ fn start_esp_with(
     psp_url: &str,
     config: esp_mint::config::Config,
 ) -> (Esp, Arc<EspState>) {
-    // The state `serve` builds, on the system clock, with this PSP and config.
+    start_esp_at(rt, dir, psp_url, config, 0)
+}
+
+/// Like `start_esp_with`, on this clock (`0` is the system clock).
+fn start_esp_at(
+    rt: &Runtime,
+    dir: &Path,
+    psp_url: &str,
+    config: esp_mint::config::Config,
+    clock: u64,
+) -> (Esp, Arc<EspState>) {
+    // The state `serve` builds, on this clock, with this PSP and config.
     let state = Arc::new(
         EspState::open(
             &dir.join("esp"),
             Box::new(HttpPsp::new(psp_url).unwrap()),
             config,
-            0,
+            clock,
         )
         .unwrap(),
     );
@@ -267,6 +278,17 @@ fn request_exact(
     units: u64,
     esp_amounts: &[u64],
 ) -> (ExchangeRequest, Vec<Wanted>) {
+    request_for_service(service(), note, keypair, units, esp_amounts)
+}
+
+/// Like `request_exact`, for this service.
+fn request_for_service(
+    service: ServiceDid,
+    note: Note,
+    keypair: &Keypair,
+    units: u64,
+    esp_amounts: &[u64],
+) -> (ExchangeRequest, Vec<Wanted>) {
     let mut wanted = Vec::new();
     let mut outputs = Vec::new();
     for &amount in esp_amounts {
@@ -290,12 +312,12 @@ fn request_exact(
     };
     let sighash = melt_sighash(
         std::slice::from_ref(&input),
-        exchange::memo(&service(), &outputs).as_bytes(),
+        exchange::memo(&service, &outputs).as_bytes(),
     );
     input.spend_signature = SECP256K1.sign_schnorr(&sighash, keypair);
     (
         ExchangeRequest {
-            service: service(),
+            service,
             psp_inputs: vec![input],
             psp_input_keysets: vec!["00".repeat(8)],
             keyset: ks(),
@@ -683,4 +705,268 @@ fn the_audit_splits_the_outstanding_esp_by_maturity_and_keeps_the_split_across_a
     drop(rt2);
     rt_psp.shutdown_background();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- the key stream ---------------------------------------------------------
+
+/// 1,800,000,000 s is day 20,833 (20,833 x 86,400 = 1,799,971,200). With the
+/// default `terms.maturity_days` of 365 a new exchange on this clock is
+/// redeemable after day 21,198, and with 30 after day 20,863.
+const T0: u64 = 1_800_000_000;
+
+/// A key-set ID as the stream's records carry it.
+fn id8(id: &str) -> [u8; 8] {
+    hex::decode(id).unwrap().try_into().unwrap()
+}
+
+/// A service nobody else uses.
+fn other_service() -> ServiceDid {
+    let key = Keypair::new(SECP256K1, &mut OsRng);
+    ServiceDid::from_slice(&key.public_key().serialize()).unwrap()
+}
+
+/// Fails if the control record, the day it publishes or the keys in it are not
+/// what a wallet will look for: m and the live key set in control record 0, then,
+/// once a service has exchanged, its 64 keys for day (today + m) and the next
+/// day, and no other day. The keys must be the very keys the exchange was
+/// signed with, so a mint that signed with other keys than it published, or
+/// published a day other than the one it gave, fails here.
+#[test]
+fn a_finished_exchange_is_published_on_the_stream_for_the_days_a_wallet_will_look_at() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("stream-e1");
+    let (psp_url, psp, _memos) = start_psp(&rt, &dir);
+    let (esp, _state) = start_esp_at(&rt, &dir, &psp_url, esp_mint::config::Config::default(), 0);
+    let generation = id8(&ks());
+    // The exchange is dated by the system clock, so the days follow it.
+    let today = esp_mint::server::now_secs() / 86_400;
+
+    // Before any exchange there is a control record and no day.
+    assert_eq!(
+        esp.air.publish().as_deref(),
+        Some(
+            "key stream: wrote 1 control record(s) and 0 day record part(s) (0 bytes); 0 service(s) known"
+        )
+    );
+    let control = esp.air.control(0).expect("control record 0");
+    assert_eq!(control.index, 0);
+    assert_eq!(control.maturity_days, 365);
+    assert_eq!(control.current.epoch, 0);
+    assert_eq!(control.current.id, generation);
+    assert_eq!(control.previous, None);
+    assert!(esp.air.control(1).is_none());
+    assert!(esp.air.day(generation, today + 365, 0, 0).is_none());
+
+    let (note, keypair) = psp_note(&psp, 4);
+    let (req, wanted) = request(note, &keypair, 4, &[3 * ONE_PSP, ONE_PSP]);
+    let (code, body) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 200, "{body}");
+    let response: ExchangeResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(response.redeemable_after_day, today + 365);
+
+    // Two days (today + 365 and today + 366) of one service: 2 x (34 + 2,145) bytes.
+    assert_eq!(
+        esp.air.publish().as_deref(),
+        Some(
+            "key stream: wrote 0 control record(s) and 2 day record part(s) (4358 bytes); 1 service(s) known"
+        )
+    );
+    for day in [today + 365, today + 366] {
+        let record = esp.air.day(generation, day, 0, 0).expect("the day");
+        assert_eq!((record.day, record.bucket, record.buckets), (day, 0, 1));
+        assert_eq!(record.part, 0);
+        assert_eq!(record.services.len(), 1);
+        assert_eq!(record.services[0].service, service());
+    }
+    let day = esp.air.day(generation, today + 365, 0, 0).unwrap();
+    for (i, w) in wanted.iter().enumerate() {
+        assert_eq!(
+            day.services[0].key_for(Amount::from_units(w.amount)),
+            Some(&response.keys[i]),
+            "the published key of {} is the key it was signed with",
+            w.amount
+        );
+    }
+    // The next day has other keys than the first.
+    let next = esp.air.day(generation, today + 366, 0, 0).unwrap();
+    assert_ne!(next.services[0].keys, day.services[0].keys);
+    // No other day is published, and no second part of these.
+    assert!(esp.air.day(generation, today + 364, 0, 0).is_none());
+    assert!(esp.air.day(generation, today + 367, 0, 0).is_none());
+    assert!(esp.air.day(generation, today + 365, 0, 1).is_none());
+    assert!(esp.air.day([0xAA; 8], today + 365, 0, 0).is_none());
+
+    // The same request again, and a pass with nothing new, write nothing.
+    assert_eq!(post_json(&esp, "/exchange", &req).0, 200);
+    assert_eq!(esp.air.publish(), None);
+    rt.shutdown_background();
+}
+
+/// Fails if a change of m is not a new control record, or if the days move
+/// without following m, or if a second exchange after the change is signed for a
+/// day that was not published.
+#[test]
+fn a_change_of_the_maturity_rule_is_a_new_control_record_and_moves_the_days() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("stream-e2");
+    let (psp_url, psp, _memos) = start_psp(&rt, &dir);
+    let (esp, state) = start_esp_at(&rt, &dir, &psp_url, esp_mint::config::Config::default(), 0);
+    let generation = id8(&ks());
+    // The exchange is dated by the system clock, so the days follow it.
+    let today = esp_mint::server::now_secs() / 86_400;
+
+    let (note, keypair) = psp_note(&psp, 1);
+    let (req, _) = request(note, &keypair, 1, &[ONE_PSP]);
+    let (code, body) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 200, "{body}");
+    assert!(esp.air.publish().is_some());
+    assert!(esp.air.control(1).is_none());
+    assert!(esp.air.day(generation, today + 30, 0, 0).is_none());
+
+    // The operator makes the rule 30 days and the mint reloads.
+    let data = dir.join("esp");
+    std::fs::write(
+        data.join(esp_mint::config::FILE_NAME),
+        "[terms]\nmaturity_days = 30\n",
+    )
+    .unwrap();
+    state.config.reload(&data, &|_: &str| None).unwrap();
+    assert_eq!(
+        esp.air.publish().as_deref(),
+        Some(
+            "key stream: wrote 1 control record(s) and 2 day record part(s) (4358 bytes); 1 service(s) known"
+        )
+    );
+    let control = esp.air.control(1).expect("control record 1");
+    assert_eq!(control.index, 1);
+    assert_eq!(control.maturity_days, 30);
+    assert_eq!(control.current.id, generation);
+    // Record 0 is as it was.
+    assert_eq!(esp.air.control(0).unwrap().maturity_days, 365);
+    assert!(esp.air.control(2).is_none());
+    for day in [today + 30, today + 31] {
+        assert!(esp.air.day(generation, day, 0, 0).is_some(), "day {day}");
+    }
+    // The days the first exchange needs stay.
+    assert!(esp.air.day(generation, today + 365, 0, 0).is_some());
+
+    // An exchange now is for day today + 30, and was signed with the keys that are
+    // already published for it.
+    let (note, keypair) = psp_note(&psp, 1);
+    let (req, wanted) = request(note, &keypair, 1, &[ONE_PSP]);
+    let (code, body) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 200, "{body}");
+    let response: ExchangeResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(response.redeemable_after_day, today + 30);
+    let record = esp.air.day(generation, today + 30, 0, 0).unwrap();
+    for (i, w) in wanted.iter().enumerate() {
+        assert_eq!(
+            record.services[0].key_for(Amount::from_units(w.amount)),
+            Some(&response.keys[i])
+        );
+    }
+    // Nothing is left to write: no new record for the same m.
+    assert_eq!(esp.air.publish(), None);
+    assert!(esp.air.control(2).is_none());
+    rt.shutdown_background();
+}
+
+/// Fails if an exchange made after a reload of `terms.maturity_days` but
+/// before the writer has published the new m in a control record is dated with
+/// the new m: a wallet reads the old m on the stream and would refuse that day
+/// as a key mismatch. Until the control record is written the old m (and its
+/// published days) is used; after it, the new one.
+#[test]
+fn a_reloaded_maturity_rule_is_used_only_once_its_control_record_is_published() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("stream-e2b");
+    let (psp_url, psp, _memos) = start_psp(&rt, &dir);
+    let (esp, state) = start_esp_at(&rt, &dir, &psp_url, esp_mint::config::Config::default(), 0);
+    let generation = id8(&ks());
+    let today = esp_mint::server::now_secs() / 86_400;
+    // Control record 0 (m = 365) is written.
+    assert!(esp.air.publish().is_some());
+    assert_eq!(esp.air.control(0).unwrap().maturity_days, 365);
+
+    // The operator makes the rule 30 days and the mint reloads; the writer has
+    // not run yet.
+    let data = dir.join("esp");
+    std::fs::write(
+        data.join(esp_mint::config::FILE_NAME),
+        "[terms]\nmaturity_days = 30\n",
+    )
+    .unwrap();
+    state.config.reload(&data, &|_: &str| None).unwrap();
+    assert!(esp.air.control(1).is_none());
+
+    // An exchange in between still gets today + 365, the day the published m gives.
+    let (note, keypair) = psp_note(&psp, 1);
+    let (req, wanted) = request(note, &keypair, 1, &[ONE_PSP]);
+    let (code, body) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 200, "{body}");
+    let response: ExchangeResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(response.redeemable_after_day, today + 365);
+
+    // The writer's pass publishes m = 30, and the day the exchange was signed for.
+    assert!(esp.air.publish().is_some());
+    assert_eq!(
+        esp.air.control(1).expect("control record 1").maturity_days,
+        30
+    );
+    let record = esp
+        .air
+        .day(generation, today + 365, 0, 0)
+        .expect("day + 365");
+    for (i, w) in wanted.iter().enumerate() {
+        assert_eq!(
+            record.services[0].key_for(Amount::from_units(w.amount)),
+            Some(&response.keys[i])
+        );
+    }
+
+    // From now on a new exchange gets today + 30.
+    let (note, keypair) = psp_note(&psp, 1);
+    let (req, _) = request(note, &keypair, 1, &[ONE_PSP]);
+    let (code, body) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 200, "{body}");
+    let response: ExchangeResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(response.redeemable_after_day, today + 30);
+    rt.shutdown_background();
+}
+
+/// Fails if a service over `stream.max_services` is not refused before its PSP
+/// note is burned, or if a service the mint knows is refused too.
+#[test]
+fn a_new_service_over_the_cap_is_refused_before_anything_is_burned() {
+    let rt = Runtime::new().unwrap();
+    let dir = scratch("stream-e3");
+    let (psp_url, psp, _memos) = start_psp(&rt, &dir);
+    let config = esp_mint::config::Config {
+        stream_max_services: 1,
+        ..esp_mint::config::Config::default()
+    };
+    let (esp, _state) = start_esp_at(&rt, &dir, &psp_url, config, T0);
+
+    let (note, keypair) = psp_note(&psp, 1);
+    let (req, _) = request(note, &keypair, 1, &[ONE_PSP]);
+    let (code, first) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 200, "{first}");
+
+    // A second service is refused, and its note is not burned.
+    let (note_b, key_b) = psp_note(&psp, 1);
+    let (req_b, _) = request_for_service(other_service(), note_b, &key_b, 1, &[ONE_PSP]);
+    let (code, body) = post_json(&esp, "/exchange", &req_b);
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(body["code"], "service_limit");
+    assert!(!psp.logic.lock().unwrap().is_spent(note_b.nonce).unwrap());
+
+    // The service it knows goes on, with a new note and with the old request.
+    let (note_c, key_c) = psp_note(&psp, 1);
+    let (req_c, _) = request(note_c, &key_c, 1, &[ONE_PSP]);
+    assert_eq!(post_json(&esp, "/exchange", &req_c).0, 200);
+    let (code, again) = post_json(&esp, "/exchange", &req);
+    assert_eq!(code, 200);
+    assert_eq!(again, first);
+    assert!(esp.air.publish().unwrap().ends_with("; 1 service(s) known"));
+    rt.shutdown_background();
 }

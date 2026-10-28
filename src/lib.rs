@@ -17,6 +17,7 @@ pub mod responses;
 pub mod rotation;
 pub mod server;
 pub mod snapshot;
+pub mod stream;
 pub mod terms;
 pub mod transfer;
 pub mod units;

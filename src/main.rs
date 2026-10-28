@@ -287,6 +287,16 @@ fn run_once(ctx: &mut Ctx) -> Result<Outcome, Box<dyn Error>> {
         println!("{line}");
     }
 
+    // The key stream: the keys the mint signs with, published on AIR so that
+    // every wallet can check a reply against them. Its writer thread starts
+    // with the listener (`Running`).
+    let stream =
+        esp_mint::stream::Stream::open(&data_dir, air.server.clone(), air.timeout_secs, &did_key)?;
+    state
+        .stream
+        .set(stream)
+        .map_err(|_| "the key stream was set twice")?;
+
     // Dropped (stopped and joined) before `state`, on every way out.
     let mut running = Running::start(air, did_key, &state)?;
 
@@ -316,6 +326,7 @@ fn run_once(ctx: &mut Ctx) -> Result<Outcome, Box<dyn Error>> {
     // waits in its mailbox slot), then the HTTP servers (they finish the requests
     // they have, for at most DRAIN_SECS, and the kernel queues the connections
     // that arrive), then the watch thread.
+    running.stop_stream();
     running.stop_air();
     if !matches!(decision, Decision::ServersEnded(_)) {
         // Fails only if the servers already ended, which the join below reports.
@@ -526,6 +537,8 @@ struct Running {
     air: Option<JoinHandle<()>>,
     watch_stop: Option<std::sync::mpsc::Sender<()>>,
     watch: Option<JoinHandle<()>>,
+    stream_stop: Option<esp_mint::stream::Control>,
+    stream: Option<JoinHandle<()>>,
 }
 
 impl Running {
@@ -582,11 +595,45 @@ impl Running {
                 }
             }
         })?;
+        // The key stream's writer: publishes the keys of the days in use and of
+        // the days ahead, and the control records (`stream`). It never stops the
+        // mint: a failed pass is printed and tried again.
+        let (stream_stop, stream_thread) = match state.stream.get() {
+            Some(stream) => {
+                let control = stream.control();
+                let writing = Arc::clone(state);
+                let thread = thread::Builder::new().name("stream".into()).spawn(move || {
+                    use esp_mint::stream::{RETRY_SECS, TICK_SECS};
+                    loop {
+                        let wait = match server::stream_pass(&writing) {
+                            Ok(said) => {
+                                if let Some(said) = said {
+                                    println!("{said}");
+                                }
+                                TICK_SECS
+                            }
+                            Err(e) => {
+                                eprintln!("key stream: not published, will retry in {RETRY_SECS} s: {e}");
+                                RETRY_SECS
+                            }
+                        };
+                        match writing.stream.get() {
+                            Some(stream) if !stream.wait(Duration::from_secs(wait)) => {}
+                            _ => return,
+                        }
+                    }
+                })?;
+                (Some(control), Some(thread))
+            }
+            None => (None, None),
+        };
         Ok(Running {
             air_stop: Some(air_stop),
             air: Some(air_thread),
             watch_stop: Some(watch_stop),
             watch: Some(watch_thread),
+            stream_stop,
+            stream: stream_thread,
         })
     }
 
@@ -601,6 +648,18 @@ impl Running {
             && thread.join().is_err()
         {
             eprintln!("esp-mint: the AIR listener thread ended in a panic");
+        }
+    }
+
+    /// Stop the key stream's writer and wait until its thread has ended.
+    fn stop_stream(&mut self) {
+        if let Some(stop) = self.stream_stop.take() {
+            stop.stop();
+        }
+        if let Some(thread) = self.stream.take()
+            && thread.join().is_err()
+        {
+            eprintln!("esp-mint: the key stream thread ended in a panic");
         }
     }
 
@@ -619,6 +678,7 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
+        self.stop_stream();
         self.stop_air();
         self.stop_watch();
     }

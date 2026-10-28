@@ -61,6 +61,7 @@ use crate::fee;
 use crate::keys::MasterSecret;
 use crate::redeem::{self, RedeemError, RedeemRejection};
 use crate::responses::Responses;
+use crate::terms::Terms;
 use crate::transfer::{self, TransferError, TransferRejection, TransferRequest};
 
 pub struct EspState {
@@ -84,6 +85,10 @@ pub struct EspState {
     pub rollovers: Mutex<crate::rotation::Rollovers>,
     /// The exchanges this process is in the middle of (see [`InFlight`]).
     pub in_flight: InFlight,
+    /// The key stream (see [`crate::stream`]), set by `serve` once the AIR server
+    /// and the DID key are known; empty in a mint that does not publish (a test
+    /// that does not read the stream).
+    pub stream: std::sync::OnceLock<crate::stream::Stream>,
 }
 
 /// The queue file in a network's data folder.
@@ -127,6 +132,7 @@ impl EspState {
             rotor: Mutex::new(rotor),
             rollovers: Mutex::new(rollovers),
             in_flight: Default::default(),
+            stream: std::sync::OnceLock::new(),
         })
     }
 }
@@ -256,7 +262,17 @@ pub fn run_exchange(
     request: &ExchangeRequest,
     now_unix: u64,
 ) -> (StatusCode, Value) {
-    let settings = state.config.current().exchange_settings();
+    let mut settings = state.config.current().exchange_settings();
+    // A new m is used once the stream has published it in a control record
+    // (the writer's next pass): until then the exchange keeps the published m,
+    // so the day it gives is always one a wallet can check on the stream.
+    if let Some(m) = state
+        .stream
+        .get()
+        .and_then(|stream| stream.published_maturity_days())
+    {
+        settings.maturity_days = m;
+    }
     let hash = match exchange::request_hash(request) {
         Ok(hash) => hash,
         Err(e) => return exchange_outcome(Err(e)),
@@ -270,7 +286,79 @@ pub fn run_exchange(
             }),
         );
     };
-    exchange_outcome(run_exchange_phases(state, request, now_unix, &settings))
+    // A service the mint does not know and has no room for is refused before
+    // anything is burned. A request that is already stored (pending or done) is
+    // never refused: its notes may be burned.
+    if let Some(stream) = state.stream.get() {
+        let max = state.config.current().stream_max_services;
+        let stored = state
+            .responses
+            .lock()
+            .map(|responses| responses.get(&hash).is_some())
+            .unwrap_or(false);
+        if !stored && !stream.has_room_for(&request.service, max) {
+            return (
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": format!(
+                        "this mint publishes the keys of at most {max} services (stream.max_services) and already has them, so a new service cannot be added. Nothing was burned or charged"
+                    ),
+                    "code": crate::stream::SERVICE_LIMIT,
+                }),
+            );
+        }
+    }
+    let result = run_exchange_phases(state, request, now_unix, &settings);
+    if let Ok(response) = &result
+        && let Err(e) = note_terms(
+            state,
+            &[Terms {
+                service: response.service,
+                redeemable_after_day: response.redeemable_after_day,
+            }],
+        )
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e}));
+    }
+    exchange_outcome(result)
+}
+
+/// Note in the key stream that a request finished for `terms`, so that the
+/// writer publishes their services and days (see [`crate::stream`]). Locks the
+/// mint and then the rotor, so no lock of the request may be held.
+fn note_terms(state: &EspState, terms: &[Terms]) -> Result<(), String> {
+    let Some(stream) = state.stream.get() else {
+        return Ok(());
+    };
+    if terms.is_empty() {
+        return Ok(());
+    }
+    let live = {
+        let mut logic = state
+            .logic
+            .lock()
+            .map_err(|_| "the mint lock is poisoned".to_string())?;
+        let rot = rotor_of(state, &mut logic)?;
+        crate::stream::Live::of(&rot)?
+    };
+    stream.note(&live, terms).map_err(|e| {
+        format!(
+            "the key stream could not be updated: {e}. Nothing is lost: send the same request again"
+        )
+    })
+}
+
+/// `out`, unless it is a success and its `terms` cannot be noted in the key
+/// stream: then a `500`, so that the wallet sends the request again and gets
+/// the stored answer (the request is finished; the note is idempotent).
+fn noted(state: &EspState, out: (StatusCode, Value), terms: &[Terms]) -> (StatusCode, Value) {
+    if !out.0.is_success() {
+        return out;
+    }
+    match note_terms(state, terms) {
+        Ok(()) => out,
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
+    }
 }
 
 /// Take the locks, build the key sets and run `f` on them.
@@ -387,6 +475,19 @@ fn exchange_outcome(
 
 /// Run one transfer and map the outcome to a status and a body.
 pub fn run_transfer(state: &EspState, request: &TransferRequest) -> (StatusCode, Value) {
+    let out = transfer_locked(state, request);
+    noted(
+        state,
+        out,
+        &[Terms {
+            service: request.service,
+            redeemable_after_day: request.redeemable_after_day,
+        }],
+    )
+}
+
+/// A transfer, under the mint's locks.
+fn transfer_locked(state: &EspState, request: &TransferRequest) -> (StatusCode, Value) {
     let settings = state.config.current().transfer_settings();
     let (Ok(mut logic), Ok(mut responses)) = (state.logic.lock(), state.responses.lock()) else {
         return (
@@ -471,6 +572,27 @@ pub fn run_redeem(state: &EspState, body: &[u8], now_unix: u64) -> (StatusCode, 
             );
         }
     };
+    let out = redeem_locked(state, &request, &settings, now_unix);
+    // The refund and decline outputs are signed under their own terms.
+    let terms: Vec<Terms> = request
+        .refund_outputs
+        .iter()
+        .chain(request.decline_outputs.iter())
+        .map(|o| Terms {
+            service: o.service,
+            redeemable_after_day: o.redeemable_after_day,
+        })
+        .collect();
+    noted(state, out, &terms)
+}
+
+/// A redemption, under the mint's locks.
+fn redeem_locked(
+    state: &EspState,
+    request: &redeem::RedeemRequest,
+    settings: &redeem::RedeemSettings,
+    now_unix: u64,
+) -> (StatusCode, Value) {
     let (Ok(mut logic), Ok(mut responses), Ok(_queue)) = (
         state.logic.lock(),
         state.responses.lock(),
@@ -494,15 +616,15 @@ pub fn run_redeem(state: &EspState, body: &[u8], now_unix: u64) -> (StatusCode, 
         &gens,
         &mut responses,
         &state.queue_path,
-        &request,
-        &settings,
+        request,
+        settings,
         now_unix,
     ) {
         Ok(response) => match serde_json::to_value(&response) {
             Ok(body) => {
                 // Finished: the burn proofs of this redemption are of no use
                 // any more (see `Retired::burn_proofs`).
-                let id = redeem::request_hash(&request);
+                let id = redeem::request_hash(request);
                 if let Err(e) = rot.forget_proofs(crate::rotation::Source::Responses, &id) {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -795,6 +917,23 @@ pub fn rollover_outcome(
     req: &crate::rotation::RolloverRequest,
     max_items: usize,
 ) -> (StatusCode, Value) {
+    let out = rollover_locked(state, req, max_items);
+    noted(
+        state,
+        out,
+        &[Terms {
+            service: req.service,
+            redeemable_after_day: req.redeemable_after_day,
+        }],
+    )
+}
+
+/// A rollover, under the mint's locks.
+fn rollover_locked(
+    state: &EspState,
+    req: &crate::rotation::RolloverRequest,
+    max_items: usize,
+) -> (StatusCode, Value) {
     let (Ok(mut logic), Ok(responses)) = (state.logic.lock(), state.responses.lock()) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -865,6 +1004,35 @@ fn spent_inputs_text(spent: &[usize]) -> String {
     } else {
         format!("inputs {list}: the notes are already spent")
     }
+}
+
+/// One pass of the key stream's writer: bring the mint up to date (a rotation
+/// that is due is made), then publish what is missing (see [`crate::stream`]).
+/// `Ok(None)` when nothing was written. The mint's locks are let go before the
+/// network is used.
+pub fn stream_pass(state: &EspState) -> Result<Option<String>, String> {
+    let Some(stream) = state.stream.get() else {
+        return Ok(None);
+    };
+    let settings = state.config.current().stream_settings();
+    let (live, now) = {
+        let mut logic = state
+            .logic
+            .lock()
+            .map_err(|_| "the mint lock is poisoned".to_string())?;
+        let rot = rotor_of(state, &mut logic)?;
+        (crate::stream::Live::of(&rot)?, rot.now())
+    };
+    let done = stream.publish(&settings, &live, now)?;
+    Ok((!done.is_empty()).then(|| {
+        format!(
+            "key stream: wrote {} control record(s) and {} day record part(s) ({} bytes); {} service(s) known",
+            done.control,
+            done.parts,
+            done.bytes,
+            stream.service_count()
+        )
+    }))
 }
 
 // ---- over AIR ---------------------------------------------------------------

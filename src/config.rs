@@ -87,6 +87,18 @@ pub const MAX_OUTPUTS_ONE_AMOUNT: u64 = 64;
 /// The least `exchange.max_items` and `transfer.max_items` may be: the outputs
 /// one amount can need, so that a one-note request always fits.
 pub const MIN_ITEMS: u64 = MAX_OUTPUTS_ONE_AMOUNT;
+
+/// The smallest `stream.record_max_bytes`: 1 MiB, which holds a bucket of 256
+/// services (34 + 256 x 2,145 = 549,154 bytes) with room for a bucket that
+/// the hash filled past the average.
+pub const MIN_STREAM_RECORD_BYTES: u64 = 1024 * 1024;
+
+/// The largest `stream.record_max_bytes`: AIR's 16 MiB message cap less the
+/// 1 MiB the mint keeps free (`sp_wire::air_request::stream::RECORD_MAX_BYTES`).
+pub const MAX_STREAM_RECORD_BYTES: u64 = sp_wire::air_request::stream::RECORD_MAX_BYTES as u64;
+
+/// The largest `stream.max_services`.
+pub const MAX_STREAM_SERVICES: u64 = 100_000;
 /// The most `*.max_items` may be: 25,000. At about 500 bytes for a note and an
 /// output in JSON (the widest pair is 501) a request of that many is 12.5 MB,
 /// which fits [`MAX_REQUEST_BYTES_CAP`]; a higher count could not.
@@ -238,6 +250,30 @@ pub const SPECS: &[Spec] = &[
         units: "days",
         reload: true,
         what: "How long after the day of issue a new exchange's ESP notes become redeemable. Fixed into each exchange when it is first accepted; notes already issued keep theirs.",
+    },
+    Spec {
+        key: "stream.days_ahead",
+        env: "ESP_STREAM_DAYS_AHEAD",
+        default: "2",
+        units: "days",
+        reload: true,
+        what: "How many days of per-service keys the mint publishes ahead on its AIR stream, for the current key set: the day a new exchange gets (today + terms.maturity_days) and the days after it, so a wallet finds the keys it checks a reply against before the reply needs them. 1 to 30. A day costs 2,145 bytes for each service (the DID and 64 keys), in every record of the stream, and the mint keeps no more than stream.max_services services; the days a request signed under stay published for as long as their key set is live, whatever this says. A wallet reads only the day of its own exchange and the days of its own notes.",
+    },
+    Spec {
+        key: "stream.record_max_bytes",
+        env: "ESP_STREAM_RECORD_MAX_BYTES",
+        default: "4194304",
+        units: "bytes",
+        reload: true,
+        what: "The most bytes of one record of the per-service key stream (4 MiB): 34 bytes of header and 2,145 for each service, so 1,955 services at the default. While every service fits one record for a day, one record holds them all; past it the services are grouped into buckets of about 256 by a hash of the service ID, and a wallet reads its service's bucket. 1,048,576 (1 MiB; a bucket of 256 services is 549,154 bytes) to 15,728,640 (15 MiB: AIR carries at most 16 MiB in one message and the mint keeps 1 MiB free for the envelope, the seal and the framing). A change applies to days the mint starts publishing afterwards; a record already written is never changed.",
+    },
+    Spec {
+        key: "stream.max_services",
+        env: "ESP_STREAM_MAX_SERVICES",
+        default: "1000",
+        units: "services",
+        reload: true,
+        what: "The most services whose keys the mint publishes. The mint learns a service from its first exchange; once it knows this many, an exchange for a service it does not know is refused (`400`, code `service_limit`) before anything is burned, and the services it has go on as before. 1 to 100,000. The keys of one service for one day are 2,145 bytes, so 1,000 services are 2.1 MB a day for each key set the mint is publishing, and 100,000 services 214.5 MB. Making a day's keys for a service is 64 key derivations.",
     },
     Spec {
         key: "rotation.activation_hours",
@@ -426,6 +462,12 @@ pub struct Config {
     pub psp_timeout_secs: u64,
     pub psp_startup_retry_secs: u64,
     pub maturity_days: u64,
+    /// Days of per-service keys published ahead (`stream.days_ahead`).
+    pub stream_days_ahead: u64,
+    /// The most bytes of one stream record (`stream.record_max_bytes`).
+    pub stream_record_max_bytes: usize,
+    /// The most services whose keys are published (`stream.max_services`).
+    pub stream_max_services: usize,
     pub rotation_activation_hours: u64,
     pub rotation_period_hours: u64,
     pub exchange_max_items: usize,
@@ -463,6 +505,9 @@ impl Default for Config {
             psp_timeout_secs: 30,
             psp_startup_retry_secs: 5,
             maturity_days: REDEEM_WINDOW_DAYS,
+            stream_days_ahead: 2,
+            stream_record_max_bytes: 4 * 1024 * 1024,
+            stream_max_services: 1000,
             rotation_activation_hours: 8760,
             rotation_period_hours: 87600,
             exchange_max_items: exchange::MAX_ITEMS,
@@ -507,6 +552,9 @@ impl Config {
             "psp.timeout_secs" => self.psp_timeout_secs.to_string(),
             "psp.startup_retry_secs" => self.psp_startup_retry_secs.to_string(),
             "terms.maturity_days" => self.maturity_days.to_string(),
+            "stream.days_ahead" => self.stream_days_ahead.to_string(),
+            "stream.record_max_bytes" => self.stream_record_max_bytes.to_string(),
+            "stream.max_services" => self.stream_max_services.to_string(),
             "rotation.activation_hours" => self.rotation_activation_hours.to_string(),
             "rotation.period_hours" => self.rotation_period_hours.to_string(),
             "exchange.max_items" => self.exchange_max_items.to_string(),
@@ -544,6 +592,9 @@ impl Config {
             "psp.timeout_secs" => self.psp_timeout_secs = whole(key, value)?,
             "psp.startup_retry_secs" => self.psp_startup_retry_secs = whole(key, value)?,
             "terms.maturity_days" => self.maturity_days = whole(key, value)?,
+            "stream.days_ahead" => self.stream_days_ahead = whole(key, value)?,
+            "stream.record_max_bytes" => self.stream_record_max_bytes = whole(key, value)?,
+            "stream.max_services" => self.stream_max_services = whole(key, value)?,
             "rotation.activation_hours" => self.rotation_activation_hours = whole(key, value)?,
             "rotation.period_hours" => self.rotation_period_hours = whole(key, value)?,
             "exchange.max_items" => self.exchange_max_items = whole(key, value)?,
@@ -612,6 +663,27 @@ impl Config {
             0,
             3650,
             "days; 0 makes notes redeemable the day they are issued",
+        );
+        range(
+            "stream.days_ahead",
+            self.stream_days_ahead,
+            1,
+            30,
+            "days; at least the day a new exchange gets",
+        );
+        range(
+            "stream.record_max_bytes",
+            self.stream_record_max_bytes as u64,
+            MIN_STREAM_RECORD_BYTES,
+            MAX_STREAM_RECORD_BYTES,
+            "bytes; a bucket of 256 services must fit, and 15 MiB is the most one AIR message carries with 1 MiB kept free",
+        );
+        range(
+            "stream.max_services",
+            self.stream_max_services as u64,
+            1,
+            MAX_STREAM_SERVICES,
+            "services",
         );
         range(
             "exchange.max_items",
@@ -775,6 +847,16 @@ impl Config {
             Ok(())
         } else {
             Err(problems)
+        }
+    }
+
+    /// What the key stream reads (`stream`).
+    pub fn stream_settings(&self) -> crate::stream::Settings {
+        crate::stream::Settings {
+            days_ahead: self.stream_days_ahead,
+            record_max_bytes: self.stream_record_max_bytes,
+            max_services: self.stream_max_services,
+            maturity_days: self.maturity_days,
         }
     }
 
@@ -1288,6 +1370,14 @@ mod tests {
     fn the_defaults_are_the_ones_the_design_sets() {
         let c = Config::default();
         assert_eq!(c.maturity_days, 365);
+        assert_eq!(
+            (
+                c.stream_days_ahead,
+                c.stream_record_max_bytes,
+                c.stream_max_services
+            ),
+            (2, 4_194_304, 1000)
+        );
         assert_eq!(c.redeem_fee_per_byte, 0);
         assert_eq!(c.redeem_max_request_bytes, 15 * 1024 * 1024);
         assert_eq!(c.redeem_max_memo_bytes, 256);
@@ -1871,6 +1961,60 @@ mod tests {
         let problems = load(&dir, &no_env).unwrap_err();
         let want = format!("{key} = {value} is out of range: it must be from {range} (");
         assert!(problems.iter().any(|p| p.contains(&want)), "{problems:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_stream_settings_are_refused_outside_their_ranges() {
+        refused_at_load("stream.days_ahead", 0, "1 to 30");
+        refused_at_load("stream.days_ahead", 31, "1 to 30");
+        refused_at_load("stream.record_max_bytes", 1_048_575, "1048576 to 15728640");
+        refused_at_load("stream.record_max_bytes", 15_728_641, "1048576 to 15728640");
+        refused_at_load("stream.max_services", 0, "1 to 100000");
+        refused_at_load("stream.max_services", 100_001, "1 to 100000");
+    }
+
+    #[test]
+    fn the_stream_settings_come_from_the_file_and_the_environment_and_reload_live() {
+        let dir = scratch("stream-layers");
+        fs::write(
+            dir.join(FILE_NAME),
+            "[stream]\ndays_ahead = 5\nmax_services = 77\n",
+        )
+        .unwrap();
+        let loaded = load(&dir, &env_of(&[("ESP_STREAM_RECORD_MAX_BYTES", "2097152")])).unwrap();
+        assert_eq!(
+            loaded.config.stream_settings(),
+            crate::stream::Settings {
+                days_ahead: 5,
+                record_max_bytes: 2_097_152,
+                max_services: 77,
+                maturity_days: 365,
+            }
+        );
+        assert_eq!(
+            loaded.sources.get("stream.record_max_bytes"),
+            Some(&Source::Env("ESP_STREAM_RECORD_MAX_BYTES"))
+        );
+        assert_eq!(loaded.sources.get("stream.days_ahead"), Some(&Source::File));
+        for key in [
+            "stream.days_ahead",
+            "stream.record_max_bytes",
+            "stream.max_services",
+        ] {
+            let spec = SPECS.iter().find(|s| s.key == key).unwrap();
+            assert!(spec.reload, "{key} applies without a restart");
+        }
+        // the defaults
+        let defaults = Config::default().stream_settings();
+        assert_eq!(
+            (
+                defaults.days_ahead,
+                defaults.record_max_bytes,
+                defaults.max_services
+            ),
+            (2, 4_194_304, 1_000)
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
